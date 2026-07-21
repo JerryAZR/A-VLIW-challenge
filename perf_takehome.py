@@ -74,13 +74,23 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i):
+    def build_hash(self, val_hash_addr, tmp1, tmp2, round, i, vec_consts):
         slots = []
 
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
-            slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
-            slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
+            if op1 == "+" and op2 == "+":
+                # Linear stage: (a + K) + (a << s) == a * (1 + 2^s) + K.
+                # One multiply_add slot (valu) instead of three alu slots.
+                # val_hash_addr is lane 0 of a VLEN-word region; broadcast
+                # constants fill lanes 1..7 with junk we ignore.
+                mult = (1 << val3) + 1
+                slots.append(("valu", ("multiply_add", val_hash_addr, val_hash_addr,
+                                       vec_consts[mult], vec_consts[val1])))
+            else:
+                # Irreducible xor/add-shift stage (combine op is '^', not fusable).
+                slots.append(("alu", (op1, tmp1, val_hash_addr, self.scratch_const(val1))))
+                slots.append(("alu", (op3, tmp2, val_hash_addr, self.scratch_const(val3))))
+                slots.append(("alu", (op2, val_hash_addr, tmp1, tmp2)))
             slots.append(("debug", ("compare", val_hash_addr, (round, i, "hash_stage", hi))))
 
         return slots
@@ -125,11 +135,31 @@ class KernelBuilder:
 
         body = []  # array of slots
 
-        # Scalar scratch registers
+        # Scalar scratch registers. tmp_val lives in lane 0 of a VLEN-word
+        # vector region so the linear hash stages can use valu multiply_add on
+        # it (broadcast constants fill lanes 1..7 with junk we ignore).
         tmp_idx = self.alloc_scratch("tmp_idx")
-        tmp_val = self.alloc_scratch("tmp_val")
+        tmp_val = self.alloc_scratch("tmp_val", VLEN)
         tmp_node_val = self.alloc_scratch("tmp_node_val")
         tmp_addr = self.alloc_scratch("tmp_addr")
+
+        # Vector constants for linear hash stages (a*(1+2^s)+K via multiply_add).
+        # Each constant is broadcast into a full VLEN-word vector once at setup;
+        # reused across all 4096 hashes.
+        vec_consts = {}
+
+        def scratch_vec_const(val, name):
+            if val not in vec_consts:
+                scalar = self.scratch_const(val)
+                addr = self.alloc_scratch(name, VLEN)
+                self.add("valu", ("vbroadcast", addr, scalar))
+                vec_consts[val] = addr
+            return vec_consts[val]
+
+        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+            if op1 == "+" and op2 == "+":
+                scratch_vec_const((1 << val3) + 1, f"vec_mult_s{hi}")
+                scratch_vec_const(val1, f"vec_add_s{hi}")
 
         for round in range(rounds):
             for i in range(batch_size):
@@ -148,7 +178,7 @@ class KernelBuilder:
                 body.append(("debug", ("compare", tmp_node_val, (round, i, "node_val"))))
                 # val = myhash(val ^ node_val)
                 body.append(("alu", ("^", tmp_val, tmp_val, tmp_node_val)))
-                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i))
+                body.extend(self.build_hash(tmp_val, tmp1, tmp2, round, i, vec_consts))
                 body.append(("debug", ("compare", tmp_val, (round, i, "hashed_val"))))
                 # idx = 2*idx + (1 if val % 2 == 0 else 2)
                 body.append(("alu", ("%", tmp1, tmp_val, two_const)))

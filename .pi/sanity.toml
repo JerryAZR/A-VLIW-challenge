@@ -1,0 +1,10 @@
+# Project sanity config for the A-VLIW-challenge repo.
+#
+# The challenge's tests/ directory is frozen and must never be modified
+# (see Readme.md — editing tests is disallowed cheating). Deny writes
+# to it explicitly so nothing can touch those files, even by accident.
+
+[[permissions.write.overrides]]
+path = ["{{CWD}}/tests/**"]
+action = "deny"
+reason = "tests/ is frozen for this challenge and must not be modified"
