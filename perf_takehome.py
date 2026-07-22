@@ -49,20 +49,21 @@ class KernelBuilder:
         return DebugInfo(scratch_map=self.scratch_debug)
 
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False,
-              seed: int | None = None):
+              seed: int | None = None, picker: str = "fma_first"):
         """Convert a slot list into instruction bundles.
 
         vliw=False: one slot per bundle (the original sequential packing).
         vliw=True:  DAG-driven VLIW scheduler - builds a dependency DAG from
                     the slots and packs multiple independent slots per cycle
                     respecting per-engine slot limits and read-before-write.
+                    picker selects node ordering ("fma_first", "idx", "random").
         """
         if not vliw:
             return [{engine: [slot]} for engine, slot in slots]
         from scheduler import build_dag, schedule_dag
         nodes, frontier = build_dag(slots)
         cap = len(slots)  # worst case: 1 slot/cycle
-        return schedule_dag(nodes, frontier, seed=seed, cap=cap)
+        return schedule_dag(nodes, frontier, seed=seed, cap=cap, picker=picker)
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})

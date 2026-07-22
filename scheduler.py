@@ -456,13 +456,19 @@ def _vec_slot_to_alu_lanes(slot: tuple, lanes: list[int]) -> list[tuple]:
 def schedule_dag(nodes: list[DNode], frontier: set[int], *,
                  seed: int | None = None,
                  cap: int | None = None,
-                 greedy: bool = True) -> list[dict]:
+                 greedy: bool = True,
+                 picker: str = "fma_first") -> list[dict]:
     """VLIW scheduler. See notes/scheduler_design.md.
 
     greedy=False (v1): random pick one node per iteration, break on failure.
-    greedy=True  (v2): iterate entire frontier, skip failures, loop until
-                       no progress, then advance cycle. No instruction
-                       priority; vector ops prefer valu (spill to alu if full).
+    greedy=True  (v2+): iterate frontier in priority order, skip failures,
+                       loop until no progress, then advance cycle.
+
+    picker selects the node ordering within a cycle (greedy mode only):
+      "idx"        - program order (lowest idx first). [default for v2 greedy]
+      "fma_first"  - vec_fma before vec_elem before everything else;
+                     secondary: idx ascending. [default]
+      "random"     - shuffled each pass (uses seed).
 
     Returns a list of bundles (dict[engine, list[slot]]), one per scheduled
     cycle that emitted at least one non-debug slot.
@@ -475,6 +481,33 @@ def schedule_dag(nodes: list[DNode], frontier: set[int], *,
 
     if cap is None:
         cap = len(nodes) + 1
+
+    # ---- Picker: returns a sort key for a node index. Lower = higher priority. ----
+    _KIND_PRIORITY = {
+        _KIND_VEC_FMA: 0,     # valu-rigid: must get a valu slot or stall
+        _KIND_VEC_ELEM: 1,    # spillable: can fall back to alu
+        _KIND_LOAD: 2,
+        _KIND_STORE: 2,
+        _KIND_FLOW: 2,
+        _KIND_ATOMIC_SCALAR: 2,
+        _KIND_DEBUG: 3,       # free; schedule last so real work fills first
+    }
+    def _key_fma_first(idx):
+        n = nodes[idx]
+        return (_KIND_PRIORITY.get(n.kind, 9), idx)
+
+    def _key_idx(idx):
+        return idx
+
+    def _key_random(idx):
+        return rng.random()
+
+    pickers = {
+        "fma_first": _key_fma_first,
+        "idx": _key_idx,
+        "random": _key_random,
+    }
+    key_fn = pickers.get(picker, _key_fma_first)
 
     bundles: list[dict] = []
     C = 0
@@ -497,12 +530,12 @@ def schedule_dag(nodes: list[DNode], frontier: set[int], *,
         emitted_non_debug = False
 
         if greedy:
-            # ---- v2 greedy: iterate frontier in idx order; loop until no ----
-            # ---- progress (WAR unlocks reported by _commit via unlocked). ----
+            # ---- greedy: iterate frontier in priority order; loop until ----
+            # ---- no progress (WAR unlocks reported by _commit via unlocked). ----
             progress = True
             while progress:
                 progress = False
-                for idx in sorted(frontier):
+                for idx in sorted(frontier, key=key_fn):
                     n = nodes[idx]
                     if n.committed:
                         frontier.discard(idx)
