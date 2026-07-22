@@ -227,7 +227,45 @@ by 72 cyc / 3.3%). The fma-priority fix (v3d) is expected to clear 2164.
 
 ---
 
-## v3d - (next) instruction priority + gather dedup
+## v3d - Tree preload levels 0-2 + fma-first picker    ~2,049 cyc   72.1x
+
+Commit (pending). Two changes:
+
+1. **fma-first picker** (scheduler): `schedule_dag` gains `picker` param.
+   `fma_first` (default) sorts frontier by (kind_priority, idx): vec_fma >
+   vec_elem > other > debug. Rationale: fma is valu-rigid; elem is spillable
+   to alu. Preferring fma ensures it gets a valu slot before elem fills them.
+   No cycle improvement at this stage (scheduler was gather-bound, not
+   valu-bound), but correct for when gather wall is lowered.
+
+2. **Tree preload levels 0-2** (kernel): single `vload` reads tree[0..7]
+   (7 nodes = levels 0-2 + 1 bonus) into scratch at prologue. 7 `vbroadcast`s
+   create shared vector constants tree0_vec..tree6_vec. Rounds 0-2 replace
+   the 8-scalar-load gather with select-based node_val:
+   - Round 0 (level 0): all idx=0. `nv_g = tree0_vec ^ zero` (1 valu, 0 loads).
+   - Round 1 (level 1): idx in {1,2}. 1 `vselect` on idx bit 0 (1 valu + 1 flow).
+   - Round 2 (level 2): idx in {3,4,5,6}. Subtract base 3, 2-level select
+     on bits 0-1 (3 valu + 3 flow).
+   Total: 768 loads removed (3 rounds x 256 lanes). Body: ~2048 -> ~1664
+   load-bound. Total: ~2236 -> ~2049.
+
+Scratch additions: 8 (preload) + 56 (7 tree broadcast vecs) + 8 (three_vec) +
+16 (2 sel temp vecs) = 88 words. Free: 97 -> 9.
+
+Passes correctness (8 seeds) and 3/8 speed tiers: baseline, updated-starting,
+opus4-many-hours (< 2164). Fails 5 tiers below 2164 (1790/1579/1548/1487/1363).
+
+---
+
+## v3e - (next) further gather dedup / priority tuning
+
+Status: not started. The body is still gather-bound at ~1664 cyc (3328 loads
+from rounds 3-15 / 2 ports). Levers:
+1. Deeper preload (level 3-4) - diminishing returns per user's note.
+2. Cross-group gather sharing within a round (distinct idx broadcast).
+3. Instruction priority tuning (now that gather wall is partially lowered,
+   valu port pressure matters more).
+
 
 Status: not started. Two levers toward the ~1300 realistic target:
 

@@ -248,6 +248,7 @@ class KernelBuilder:
         # Literal constants (scratch_const emits `load const`).
         zero_const   = self.scratch_const(0, "zero")
         eight_const  = self.scratch_const(8, "eight")
+        three_const  = self.scratch_const(3, "three")  # level-2 base offset for select
         addr_a       = self.alloc_scratch("addr_a", 1)   # vload/vstore pointer
 
         # fma / irr split so literal `9` (mult in stage 4 vs shift in stage 3)
@@ -263,6 +264,28 @@ class KernelBuilder:
         }
 
         assert self.scratch_ptr <= SCRATCH_SIZE, "scratch overflow"
+
+        # ---- Phase 3b: tree preload for levels 0-2 (gather dedup) ----
+        # Single vload reads mem[forest_values_p + 0..7] (7 nodes = levels 0-2,
+        # plus 1 bonus). Then 7 vbroadcasts create shared vector constants
+        # tree0_vec..tree6_vec so any group can select its node_val without
+        # gathering from mem for rounds 0-2.
+        tree_preload = self.alloc_scratch("tree_preload", VLEN)  # 8 words: tree[0..7]
+        tree0_vec = self.alloc_scratch("tree0_vec", VLEN)
+        tree1_vec = self.alloc_scratch("tree1_vec", VLEN)
+        tree2_vec = self.alloc_scratch("tree2_vec", VLEN)
+        tree3_vec = self.alloc_scratch("tree3_vec", VLEN)
+        tree4_vec = self.alloc_scratch("tree4_vec", VLEN)
+        tree5_vec = self.alloc_scratch("tree5_vec", VLEN)
+        tree6_vec = self.alloc_scratch("tree6_vec", VLEN)
+        # Temp vectors for vselect intermediates (shared, reused across groups).
+        sel_lo_vec = self.alloc_scratch("sel_lo_vec", VLEN)
+        sel_hi_vec = self.alloc_scratch("sel_hi_vec", VLEN)
+        tree_vecs = [tree0_vec, tree1_vec, tree2_vec,
+                     tree3_vec, tree4_vec, tree5_vec, tree6_vec]
+        three_vec = self.alloc_scratch("three_vec", VLEN)  # broadcast of 3 for level-2 select
+
+        assert self.scratch_ptr <= SCRATCH_SIZE, "scratch overflow (tree preload)"
 
         # =====================================================================
         # Prologue: load header; vload val[256]; broadcast consts; pause
@@ -286,6 +309,14 @@ class KernelBuilder:
             s = self.scratch_const(value)         # deduped by value; emits load const
             self.add("valu", ("vbroadcast", vec_addr, s))
 
+        # vload tree[0..7] (levels 0-2 = 7 nodes + 1 bonus) into tree_preload.
+        self.add("alu", ("+", addr_a, self.scratch["forest_values_p"], zero_const))
+        self.add("load", ("vload", tree_preload, addr_a))
+        # Broadcast tree[0..6] into shared vector constants.
+        for i in range(7):
+            self.add("valu", ("vbroadcast", tree_vecs[i], tree_preload + i))
+        self.add("valu", ("vbroadcast", three_vec, three_const))
+
         # Pause 1 -- match reference_kernel2's first yield (initial mem).
         self.add("flow", ("pause",))
 
@@ -308,15 +339,31 @@ class KernelBuilder:
                 keyhv   = [(r, base_i + j, "hashed_val") for j in range(VLEN)]
                 keywr   = [(r, base_i + j, "wrapped_idx") for j in range(VLEN)]
 
-                # --- gather addresses: addr_vec = idx_vec + forest_p_vec (1 valu) ---
-                body.append(("valu", ("+", addr_vec, idx_vec, forest_p_vec)))
-
-                # --- 8 scalar gathers (non-contiguous; no vgather in ISA) ---
-                # naive loader: one load per lane, landing into the per-lane nv
-                # plane so each group has its own node_val vector (future-proof
-                # for VLIW: distinct groups' gathers won't alias).
-                for j in range(VLEN):
-                    body.append(("load", ("load", nv_g + j, addr_vec + j)))
+                # --- node_val gather or preload-select (rounds 0-2 use preloaded) ---
+                if r == 0:
+                    # Level 0: all lanes at idx=0. node_val = tree[0].
+                    body.append(("valu", ("^", nv_g, tree0_vec, zero_vec)))
+                elif r == 1:
+                    # Level 1: idx in {1,2}. 1 vselect on idx bit 0.
+                    # idx=1 (bit0=1) -> tree[1]; idx=2 (bit0=0) -> tree[2].
+                    body.append(("valu", ("&", t1_g, idx_vec, one_vec)))   # cond = idx & 1
+                    body.append(("flow", ("vselect", nv_g, t1_g, tree1_vec, tree2_vec)))
+                elif r == 2:
+                    # Level 2: idx in {3,4,5,6}. Subtract level base (3), then
+                    # 2-level select on bits 0-1 of (idx-3).
+                    # idx-3=0->tree3, 1->tree4, 2->tree5, 3->tree6
+                    body.append(("valu", ("-", t1_g, idx_vec, three_vec)))   # idx - 3
+                    body.append(("valu", ("&", t2_g, t1_g, one_vec)))        # bit 0 of (idx-3)
+                    body.append(("flow", ("vselect", sel_lo_vec, t2_g, tree4_vec, tree3_vec)))
+                    body.append(("flow", ("vselect", sel_hi_vec, t2_g, tree6_vec, tree5_vec)))
+                    body.append(("valu", (">>", t2_g, t1_g, one_vec)))       # (idx-3) >> 1
+                    body.append(("valu", ("&", t2_g, t2_g, one_vec)))        # bit 1 of (idx-3)
+                    body.append(("flow", ("vselect", nv_g, t2_g, sel_hi_vec, sel_lo_vec)))
+                else:
+                    # Rounds 3+: gather from mem (naive scalar loads).
+                    body.append(("valu", ("+", addr_vec, idx_vec, forest_p_vec)))
+                    for j in range(VLEN):
+                        body.append(("load", ("load", nv_g + j, addr_vec + j)))
 
                 body.append(("debug", ("vcompare", nv_g, keynv)))
                 body.append(("debug", ("vcompare", val_vec, keyval)))  # val before xor
