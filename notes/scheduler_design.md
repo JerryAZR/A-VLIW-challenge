@@ -194,3 +194,142 @@ nodes, which is the conceptually cleaner model).
   scheduler, ~830 distinct tree values total → ~415 cyc of loads + ~500–700
   cyc distribute): ~600–800 cyc gather + ~864 cyc hash compute → ~1500–1700
   cyc, the 1579/1487 band. (See `architecture.md` roofline.)
+
+---
+
+# V1 random scheduler — pinned spec (implementation-bound)
+
+## Node classification (`_classify`)
+
+| kind         | atomic | lanes_total | native_engine | spill?              |
+|--------------|--------|-------------|---------------|---------------------|
+| `alu_scalar` | yes    | 1           | alu           | no (already scalar) |
+| `load`       | yes    | 1           | load          | no (one word)       |
+| `store`      | yes    | 1           | store         | no                  |
+| `flow`       | yes    | 1           | flow          | no                  |
+| `debug`      | yes    | **0**       | (free / rides along) | no            |
+| `vec_fma`    | yes    | 1           | **valu**      | **NO** (no scalar fma in the ISA) |
+| `vec_elem`   | **no** | 8           | valu          | yes — spills to alu, splittable |
+
+`atomic = False` only for `vec_elem` (the xor/add-shift elementwise stages of
+the hash; these are the ops that can run on either `valu` or `alu`). `vec_fma`
+is atomic because `multiply_add` has no scalar form on `alu` — picked as one
+`valu` slot or break the cycle.
+
+`lanes_total = 0` for debug: debug emits no slot, consumes no port, "completes"
+the moment it's placed and just commits. A cycle that emits only debug slots is
+an empty cycle (`debug` rides along free in cycles that already have non-debug
+work) → panic per the "no bubbles" rule.
+
+## Spill rule (simplified — sticky alu, no self-RW carve-out)
+
+Once a `vec_elem` node has spilled any lanes to `alu`, **all remaining lanes
+must go to alu** on subsequent cycles — no re-issue on `valu`. Rationale: a
+self-RW vector op (`dest ∈ reads`, e.g. our fma-on-`val_vec` or the entry
+`val ^= node_val`) sees its source corrupted after the first partial-alu write
+(already-written lanes hold the NEW value; valu would re-read them as inputs
+and compute the wrong result). Avoids per-node self-RW tracking by making
+stickiness universal. Non-self-RW (e.g. `t1 = val ^ K1`) could be safely
+refilled on valu, but it wastes compute and adds a classifier; pre-emptively
+forbidden by the sticky rule.
+
+## V1 placement algorithm
+
+```
+schedule_dag(nodes, frontier, *, seed=None) -> list[Instruction]:
+
+  cap = sequential body cycle count
+        (run build(body, vliw=False) through the simulator; record machine.cycle.
+         The unscheduled body is the worst case: every slot its own bundle.
+         Exceeding this cap means the placer has regressed below the baseline —
+         bug, panic.)
+
+  bundles = []
+  C = 0
+  while not all nodes committed:
+    # Per-cycle queue: random pick from the frontier (including partially-
+    # completed nodes — they sit in frontier with lanes_done > 0).
+    while frontier non-empty:
+      n = random.choice(frontier)           # uniform, no priority
+      
+      if n already committed: discard; continue
+      
+      # Compute take (lanes this placement can grab).
+      if n.kind == 'debug':
+        commit(n)                            # no slot emitted, no port consumed
+        continue                             # does NOT break the cycle loop; debug commit
+                                               may unlock same-cycle WAR children for non-debug placement
+      elif lanes_total == 1 (atomic):        # alu/load/store/flow/vec_fma
+        eng = native_engine
+        if free[eng] == 0:
+          break                              # no retry; advance cycle
+        emit 1 (eng, n.slot); free[eng] -= 1
+        n.lanes_done = lanes_total
+        commit(n)
+      else:                                   # vec_elem (spillable)
+        if n.lanes_done > 0:                  # partial → sticky alu (no re-spill to valu)
+          take = min(8 - n.lanes_done, free.alu)
+          if take == 0: break
+          emit take alu slots (dest+lane, a+lane, b+lane, ...)
+          n.lanes_done += take; free.alu -= take
+          if n.lanes_done == 8: commit(n)    # else leave in frontier (partial)
+        elif free.valu > 0:                   # fresh & valu available → atomic
+          emit 1 ('valu', n.slot)
+          n.lanes_done = 8; free.valu -= 1
+          commit(n)
+        else:                                  # fresh, valu saturated → spill
+          take = min(8, free.alu)
+          if take == 0: break
+          emit take alu slots (lane-split from original vec slot tuple)
+          n.lanes_done += take; free.alu -= take
+          n.engine_choice = 'alu'             # sticky marker
+          if n.lanes_done == 8: commit(n)    # possible only if alu_free >= 8
+      # never implicit break — explicit in each path've done above
+      
+    # Cycle done — check for empty cycle:
+    if this cycle emitted zero non-debug slots:
+      panic("empty cycle — scheduler stuck; cyclic DAG or counter bug")
+    # Apply end-of-cycle RAW resolutions:
+    advance()
+    # Record this cycle's bundle:
+    bundles.append(this_cycle_bundle)        # dict[engine, list[slot]]
+    C += 1
+    if C > cap: panic("scheduler regressed below unscheduled baseline")
+  return bundles
+```
+
+## `commit(n)` semantics
+
+- `n.committed = True; n.commit_cycle = C; n.in_frontier = False; frontier.discard(n)`
+- For each `(dst_idx, w) in n.out_edges`:
+  - `w == 0` (WAR, same-cycle-safe): `dst.war_blockers -= 1`. If now `dst.raw_blockers + dst.war_blockers == 0` and not `dst.in_frontier`: add to frontier.
+  - `w == 1` (RAW, deferred): `dst.incoming += 1`. Apply at `advance()`.
+
+A node that completes same-cycle fires WAR into its children immediately — so a
+WAR-only child can become frontier-eligible *this same cycle* (the inner while
+will see it next iteration).
+
+## `advance()` — at end of every cycle
+
+```
+advance():
+  for every node n with n.incoming > 0:
+    n.raw_blockers -= n.incoming
+    n.incoming = 0
+    if n.raw_blockers + n.war_blockers == 0 and not n.in_frontier and not n.committed:
+      frontier.add(n.idx); n.in_frontier = True
+```
+
+This is the only place `raw_blockers` decreases.
+
+## Panic conditions (any one = bug, raise)
+
+1. Frontier empty while some node is uncommitted (**cyclic DAG or wrong counts**).
+2. About to emit a bundle with zero non-debug slots (**stuck** / would never land because debug rides along free).
+3. `C > cap` (regressed below unscheduled baseline).
+
+## Three todos this version does NOT do (future v2+)
+
+- No priority (no critical-path, no port-pressure-aware greedy). Random pick.
+- No "use alu for spillable vector work even when valu is free" — partial spills stuck on alu forever; valu idle-side filling deferred to v2.
+- No gather-sharing / broadcast IR transformation (the gather-wall still bites; land ~2100 cyc with naive gather).

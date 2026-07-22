@@ -68,6 +68,10 @@ class DNode:
     lanes_total: int = 0        # 1 for atomic (alu/load/store/flow/fma-vec); 8 for
                                  # spillable elementwise valu; 0 for debug
     engine_choice: str | None = None  # None until first lane; sticky
+    # ---- Classification (set by _classify_node in the scheduler): ----
+    kind: str = ""             # _KIND_* tag
+    atomic: bool = True        # False only for vec_elem (splittable)
+    native_engine: str = ""    # 'alu'/'load'/'store'/'flow'/'valu'/'debug'
 
 
 def slot_io(engine: str, slot: tuple) -> tuple[list[tuple[int, bool]], list[tuple[int, bool]]]:
@@ -365,3 +369,267 @@ def build_dag(slots: list[tuple[str, tuple]]) -> tuple[list[DNode], set[int]]:
             frontier.add(n.idx)
 
     return nodes, frontier
+
+# ---------------------------------------------------------------------------
+# v1 random scheduler — see notes/scheduler_design.md "V1 random scheduler"
+# for the pinned spec.
+# ---------------------------------------------------------------------------
+
+from problem import SLOT_LIMITS
+
+# Node classification tags.
+_KIND_ATOMIC_SCALAR = "alu_scalar"
+_KIND_LOAD = "load"
+_KIND_STORE = "store"
+_KIND_FLOW = "flow"
+_KIND_DEBUG = "debug"
+_KIND_VEC_FMA = "vec_fma"
+_KIND_VEC_ELEM = "vec_elem"
+
+
+def _classify_node(n: DNode) -> None:
+    """Set n.kind, n.atomic, n.lanes_total, n.native_engine in-place."""
+    eng = n.engine
+    slot_op = n.slot[0] if n.slot else ""
+    if eng == "alu":
+        n.kind = _KIND_ATOMIC_SCALAR
+        n.atomic = True
+        n.lanes_total = 1
+        n.native_engine = "alu"
+    elif eng == "load":
+        n.kind = _KIND_LOAD
+        n.atomic = True
+        n.lanes_total = 1
+        n.native_engine = "load"
+    elif eng == "store":
+        n.kind = _KIND_STORE
+        n.atomic = True
+        n.lanes_total = 1
+        n.native_engine = "store"
+    elif eng == "flow":
+        n.kind = _KIND_FLOW
+        n.atomic = True
+        n.lanes_total = 1
+        n.native_engine = "flow"
+    elif eng == "debug":
+        n.kind = _KIND_DEBUG
+        n.atomic = True
+        n.lanes_total = 0
+        n.native_engine = "debug"
+    elif eng == "valu":
+        if slot_op == "multiply_add":
+            n.kind = _KIND_VEC_FMA
+            n.atomic = True
+            n.lanes_total = 1            # 1 valu slot = full vector
+            n.native_engine = "valu"
+            # no spill path:-valu only
+        else:
+            # elementwise:
+            n.kind = _KIND_VEC_ELEM
+            n.atomic = False
+            n.lanes_total = VLEN
+            n.native_engine = "valu"
+    else:
+        raise NotImplementedError(f"Unknown engine: {eng}")
+
+
+def _vec_slot_to_alu_lanes(slot: tuple, lanes: list[int]) -> list[tuple]:
+    """Materialise one elementwise `valu` slot as per-lane `alu` slot tuples.
+
+    Forms handled:
+      (op, dest, a1, a2)  elementwise — for lane j: alu (op, dest+j, a1+j, a2+j)
+      (vbroadcast, dest, src) — one lane = scalar copy into one word.
+      (multiply_add, dest, a, b, c) — spill path is NOT taken (fma is atomic).
+    """
+    op = slot[0]
+    if op == "multiply_add":
+        raise NotImplementedError("multiply_add cannot spill to alu (no scalar fma)")
+    if op == "vbroadcast":
+        # broadcast one scalar to lanes[j]; only call with the needed lanes.
+        _, dest, src = slot
+        return [("+", dest + j, src, 0) for j in lanes]   # dest+j = src + 0; uses zero const
+    # elementwise:
+    _, dest, a1, a2 = slot
+    return [(op, dest + j, a1 + j, a2 + j) for j in lanes]
+
+
+def schedule_dag(nodes: list[DNode], frontier: set[int], *,
+                 seed: int | None = None,
+                 cap: int | None = None) -> list[dict]:
+    """V1 random scheduler. See notes/scheduler_design.md.
+
+    Returns a list of bundles (dict[engine, list[slot]]), one per scheduled
+    cycle that emitted at least one non-debug slot.
+    """
+    import random as _random
+    rng = _random.Random(seed)
+
+    # Classify nodes.
+    for n in nodes:
+        _classify_node(n)
+
+    # Debug nodes are committed lazily when picked; classify ensures
+    # lanes_total=0 so commit-on-pick works.
+
+    # Hard upper bound: the unscheduled body's cycle count (cap). If None,
+    # fall back to a generous default = 4 * len(nodes) (cannot be tighter
+    # than ~16k for our body; but the caller should pass the real cap).
+    if cap is None:
+        cap = len(nodes) + 1    # very loose; caller is expected to pass real cap
+
+    bundles: list[dict] = []
+    C = 0
+
+    # Per-engine free slot counters reset each cycle.
+    def reset_free():
+        return {eng: SLOT_LIMITS[eng] for eng in
+                ("alu", "valu", "load", "store", "flow")}
+
+    total = len(nodes)
+    committed_count = 0
+
+    while committed_count < total:
+        if not frontier:
+            raise RuntimeError(
+                f"v1 scheduler: frontier empty with {total - committed_count} "
+                f"uncommitted nodes at C={C} — cyclic DAG or counter bug")
+
+        free = reset_free()
+        cycle_bundle: dict = {}
+        emitted_non_debug = False
+
+        # Inner cycle loop: random pick until we can't place.
+        # Iterate on a list snapshot of frontier (rng.choice needs a list).
+        fr_list = list(frontier)
+        # We will modify frontier inside the loop (commit may add WAR children).
+        # Re-fetch fr_list each iteration before picking.
+        while frontier:
+            fr_list = list(frontier)
+            n = nodes[rng.choice(fr_list)]
+
+            if n.committed:
+                frontier.discard(n.idx)
+                n.in_frontier = False
+                continue
+
+            kind = n.kind
+            if kind == _KIND_DEBUG:
+                # Free placement: emit the debug slot into the bundle (0-cycle,
+                # rides along), commit. Does not consume any engine port.
+                cycle_bundle.setdefault("debug", []).append(n.slot)
+                committed_count = _commit(n, nodes, frontier, committed_count)
+                # Debug commit may unlock same-cycle WAR children for non-debug
+                # placement - continue the inner loop without breaking.
+                continue
+
+            if kind == _KIND_VEC_ELEM and n.lanes_done > 0:
+                # Partial spill — sticky alu; no re-spill to valu.
+                take = min(n.lanes_total - n.lanes_done, free["alu"])
+                if take == 0:
+                    break      # no retry; advance cycle
+                lanes = list(range(n.lanes_done, n.lanes_done + take))
+                for alu_slot in _vec_slot_to_alu_lanes(n.slot, lanes):
+                    cycle_bundle.setdefault("alu", []).append(alu_slot)
+                free["alu"] -= take
+                n.lanes_done += take
+                emitted_non_debug = True
+                if n.lanes_done == n.lanes_total:
+                    committed_count = _commit(n, nodes, frontier, committed_count)
+                continue
+
+            if kind == _KIND_VEC_ELEM:
+                # Fresh vec_elem: valu-atomic if free, else spill to alu.
+                if free["valu"] > 0:
+                    cycle_bundle.setdefault("valu", []).append(n.slot)
+                    free["valu"] -= 1
+                    n.lanes_done = n.lanes_total
+                    n.engine_choice = "valu"
+                    emitted_non_debug = True
+                    committed_count = _commit(n, nodes, frontier, committed_count)
+                else:
+                    take = min(n.lanes_total, free["alu"])
+                    if take == 0:
+                        break
+                    lanes = list(range(0, take))
+                    for alu_slot in _vec_slot_to_alu_lanes(n.slot, lanes):
+                        cycle_bundle.setdefault("alu", []).append(alu_slot)
+                    free["alu"] -= take
+                    n.lanes_done += take
+                    n.engine_choice = "alu"
+                    emitted_non_debug = True
+                    if n.lanes_done == n.lanes_total:
+                        committed_count = _commit(n, nodes, frontier, committed_count)
+                continue
+
+            # Atomic scalar / load / store / flow / vec_fma
+            eng = n.native_engine
+            if free[eng] == 0:
+                break
+            cycle_bundle.setdefault(eng, []).append(n.slot)
+            free[eng] -= 1
+            n.lanes_done = n.lanes_total
+            n.engine_choice = eng
+            emitted_non_debug = True
+            committed_count = _commit(n, nodes, frontier, committed_count)
+
+        if committed_count >= total:
+            break   # all done - last cycle may have had only debug commits
+        if not emitted_non_debug:
+            raise RuntimeError(
+                f"v1 scheduler: empty cycle at C={C} - stuck "
+                f"(frontier had {len(frontier)} nodes but none were placeable)")
+
+        # End-of-cycle: apply deferred RAW resolutions.
+        _advance(nodes, frontier)
+
+        bundles.append(cycle_bundle)
+        C += 1
+        if C > cap:
+            raise RuntimeError(
+                f"v1 scheduler: cycle count {C} exceeded cap {cap} — "
+                f"regressed below unscheduled baseline")
+
+    return bundles
+
+
+def _commit(n: DNode, nodes: list[DNode], frontier: set[int],
+            committed_count: int) -> int:
+    """Mark n committed; relax its out-edges into consumers.
+
+    WAR (w=0) is applied immediately; the child may become frontier-eligible
+    this same cycle. RAW (w=1) is deferred — increments dst.incoming, which
+    `advance()` applies at end-of-cycle (so the child becomes eligible next
+    cycle, reflecting read-before-write's +1 latency).
+    """
+    n.committed = True
+    n.in_frontier = False
+    frontier.discard(n.idx)
+    committed_count += 1
+    for dst_idx, w in n.out_edges:
+        dst = nodes[dst_idx]
+        if dst.committed:
+            continue
+        if w == 0:
+            # WAR: same-cycle-safe
+            dst.war_blockers -= 1
+            if (dst.raw_blockers + dst.war_blockers == 0
+                    and not dst.in_frontier):
+                frontier.add(dst.idx)
+                dst.in_frontier = True
+        else:
+            # RAW: deferred to advance()
+            dst.incoming += 1
+    return committed_count
+
+
+def _advance(nodes: list[DNode], frontier: set[int]) -> None:
+    """Apply end-of-cycle RAW resolutions: raw_blockers -= incoming; clear."""
+    for n in nodes:
+        if n.incoming > 0:
+            n.raw_blockers -= n.incoming
+            n.incoming = 0
+            if (n.raw_blockers + n.war_blockers == 0
+                    and not n.in_frontier
+                    and not n.committed):
+                frontier.add(n.idx)
+                n.in_frontier = True
