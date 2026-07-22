@@ -168,69 +168,79 @@ class KernelBuilder:
         WRAP_ROUND = forest_height   # verified: all lanes at leaf on round=h -> wrap to root
 
         # =====================================================================
-        # Scratch layout (hard rule): 256 words shared, then 5 words per lane
-        # across V=256 lanes (= 1280), exhausting the 1536-word file.
+        # Scratch layout: planes first (8-aligned), shared sector last.
         #
-        # Shared sector  : header + scalar consts + broadcast vector consts +
-        #                 shared transients (vload/vstore pointer addr_a;
-        #                 gather-address vector addr_vec; forest_p broadcast).
-        #                 Under one-slot-per-bundle only one group is mid-flight
-        #                 per stage, so <=1-cycle-live transients (addr_vec) stay
-        #                 shared. When we VLIW-pack several groups, the per-lane
-        #                 planes below already give each lane private t1/t2/nv,
-        #                 so stage scratch never renames regardless.
+        #   [   0.. 255]  plane 0 : val[256]   (running hash + carried state)
+        #   [ 256.. 511]  plane 1 : idx[256]   (tree index, zero-init)
+        #   [ 512.. 767]  plane 2 : t1[256]    (per-lane stage scratch)
+        #   [ 768..1023]  plane 3 : t2[256]    (per-lane stage scratch)
+        #   [1024..1279]  plane 4 : nv[256]    (node_val landing / spare)
+        #   [1280..1535]  shared sector (256 words):
+        #                   8-word vector regions first  (forest_p_vec, addr_vec,
+        #                     12 hash-const vecs, two/one/zero_vec = 17 vecs)
+        #                   then 1-word scalars (header 7, zero/eight/addr_a,
+        #                     _src scalars for broadcasts)
         #
-        # Per-lane sector: 5 contiguous planes of V=256 words (SoA). Lane i
-        #                 owns one word per plane at plane_k_base + i, so group
-        #                 g (lanes 8g..8g+7) forms a VLEN=8 contiguous vector at
-        #                 plane_k_base + 8g -- vectorizable, zero gather cost.
-        #                   plane 0 : val[i]  (resident + running hash register)
-        #                   plane 1 : idx[i]  (resident; zero-initialized)
-        #                   plane 2 : t1[i]   (per-lane stage scratch)
-        #                   plane 3 : t2[i]   (per-lane stage scratch)
-        #                   plane 4 : nv[i]   (per-lane node_val landing / spare)
+        # Planes-first guarantees every val_vec = base + 8g is 8-aligned so a
+        # vector write covers exactly one region — essential for the DAG builder's
+        # region-keyed last_writer/readers_since bookkeeping.
         # =====================================================================
 
-        # ---- Shared sector (<= 256 words) ----
         init_vars = [
             "rounds", "n_nodes", "batch_size", "forest_height",
             "forest_values_p", "inp_indices_p", "inp_values_p",
         ]
+
+        # ---- Phase 1: planes (5 × V=256 = 1280 words, 8-aligned) ----
+        val_base = self.alloc_scratch("val", V)   # plane 0
+        idx_base = self.alloc_scratch("idx", V)   # plane 1
+        t1_base  = self.alloc_scratch("t1",  V)   # plane 2
+        t2_base  = self.alloc_scratch("t2",  V)   # plane 3
+        nv_base  = self.alloc_scratch("nv",  V)   # plane 4
+
+        # ---- Phase 2: 8-word vector regions (shared sector, 8-aligned) ----
+        # No instructions emitted yet — broadcasts happen in prologue.
+        addr_vec     = self.alloc_scratch("addr_vec", VLEN)
+        forest_p_vec = self.alloc_scratch("forest_p_vec", VLEN)
+        mult4097_vec = self.alloc_scratch("mult4097_vec", VLEN)
+        K0_vec       = self.alloc_scratch("K0_vec", VLEN)
+        mult33_vec   = self.alloc_scratch("mult33_vec", VLEN)
+        K2_vec       = self.alloc_scratch("K2_vec", VLEN)
+        mult9_vec    = self.alloc_scratch("mult9_vec", VLEN)
+        K4_vec       = self.alloc_scratch("K4_vec", VLEN)
+        K1_vec       = self.alloc_scratch("K1_vec", VLEN)
+        K3_vec       = self.alloc_scratch("K3_vec", VLEN)
+        K5_vec       = self.alloc_scratch("K5_vec", VLEN)
+        shift19_vec  = self.alloc_scratch("shift19_vec", VLEN)
+        shift9_vec   = self.alloc_scratch("shift9_vec", VLEN)
+        shift16_vec  = self.alloc_scratch("shift16_vec", VLEN)
+        two_vec      = self.alloc_scratch("two_vec", VLEN)
+        one_vec     = self.alloc_scratch("one_vec", VLEN)
+        zero_vec     = self.alloc_scratch("zero_vec", VLEN)
+
+        # Collect (vec_addr, value) pairs for deferred broadcasts (prologue).
+        vec_bcasts = [
+            (mult4097_vec, 4097),        (K0_vec, 0x7ED55D16),
+            (mult33_vec,  33),            (K2_vec, 0x165667B1),
+            (mult9_vec,   9),             (K4_vec, 0xFD7046C5),
+            (K1_vec,      0xC761C23C),   (K3_vec, 0xD3A2646C),
+            (K5_vec,      0xB55A4F09),
+            (shift19_vec, 19),            (shift9_vec, 9),
+            (shift16_vec, 16),
+            (two_vec,     2),             (one_vec,  1),
+            (zero_vec,    0),
+        ]
+
+        # ---- Phase 3: 1-word scalars (after all 8-word vec regions) ----
+        # Header vars (loaded from mem, not const — just reserve space).
         for v in init_vars:
             self.alloc_scratch(v, 1)
-
+        # Literal constants (scratch_const emits `load const`).
         zero_const   = self.scratch_const(0, "zero")
         eight_const  = self.scratch_const(8, "eight")
-        addr_a       = self.alloc_scratch("addr_a", 1)        # vload/vstore pointer
-        addr_vec     = self.alloc_scratch("addr_vec", VLEN)   # gather addr (<=1-cyc live)
-        forest_p_vec = self.alloc_scratch("forest_p_vec", VLEN)  # broadcast tree ptr
+        addr_a       = self.alloc_scratch("addr_a", 1)   # vload/vstore pointer
 
-        def vec_const(value, name):
-            scalar = self.scratch_const(value, name + "_src")
-            addr = self.alloc_scratch(name, VLEN)
-            self.add("valu", ("vbroadcast", addr, scalar))
-            return addr
-
-        # fma stages (0/2/4): a*(1+2^s) + K   (3 multipliers + 3 addends)
-        mult4097_vec = vec_const(4097,        "mult4097_vec")
-        K0_vec       = vec_const(0x7ED55D16,  "K0_vec")
-        mult33_vec   = vec_const(33,          "mult33_vec")
-        K2_vec       = vec_const(0x165667B1,  "K2_vec")
-        mult9_vec    = vec_const(9,           "mult9_vec")
-        K4_vec       = vec_const(0xFD7046C5,  "K4_vec")
-        # irreducible stages (1/3/5): (a OP1 K) OP2 (a OP3 shift)  (3 K + 3 shift)
-        K1_vec       = vec_const(0xC761C23C,  "K1_vec")
-        K3_vec       = vec_const(0xD3A2646C,  "K3_vec")
-        K5_vec       = vec_const(0xB55A4F09,  "K5_vec")
-        shift19_vec  = vec_const(19,          "shift19_vec")
-        shift9_vec   = vec_const(9,           "shift9_vec")
-        shift16_vec  = vec_const(16,          "shift16_vec")
-        # idx-update helpers / wrap  (branchless base = 2*idx + 1; parity = v&1)
-        two_vec      = vec_const(2,           "two_vec")
-        one_vec      = vec_const(1,           "one_vec")
-        zero_vec     = vec_const(0,           "zero_vec")   # wrap: idx := 0
-
-        # fma / irr split so the literal `9` (mult in stage 4 vs shift in stage 3)
+        # fma / irr split so literal `9` (mult in stage 4 vs shift in stage 3)
         # doesn't collide as a dict key.
         fma_vec_consts = {
             4097: mult4097_vec, 0x7ED55D16: K0_vec,
@@ -242,19 +252,10 @@ class KernelBuilder:
             19: shift19_vec, 9: shift9_vec, 16: shift16_vec,
         }
 
-        shared_used = self.scratch_ptr
-        assert shared_used <= 256, f"shared sector over budget: {shared_used} > 256"
-
-        # ---- Per-lane sector: 5 planes of V=256 words (SoA, vectorizable) ----
-        val_base = self.alloc_scratch("val", V)   # plane 0: running hash + carried state
-        idx_base = self.alloc_scratch("idx", V)   # plane 1: tree index (zero-init)
-        t1_base  = self.alloc_scratch("t1",  V)   # plane 2: per-lane stage scratch
-        t2_base  = self.alloc_scratch("t2",  V)   # plane 3: per-lane stage scratch
-        nv_base  = self.alloc_scratch("nv",  V)   # plane 4: node_val landing / spare
         assert self.scratch_ptr <= SCRATCH_SIZE, "scratch overflow"
 
         # =====================================================================
-        # Prologue: load header; vload val[256]; broadcast forest pointer
+        # Prologue: load header; vload val[256]; broadcast consts; pause
         # =====================================================================
         for i, v in enumerate(init_vars):
             self.add("load", ("const", addr_a, i))                  # addr_a := i
@@ -267,8 +268,13 @@ class KernelBuilder:
             if k < n_groups - 1:
                 self.add("alu", ("+", addr_a, addr_a, eight_const))
 
-        # broadcast forest_values_p so all 8 gather addrs derive from one valu op
+        # Broadcast forest_values_p (from a header var, not a literal).
         self.add("valu", ("vbroadcast", forest_p_vec, self.scratch["forest_values_p"]))
+
+        # Broadcast all hash-const / idx-helper vectors from literal scratch_consts.
+        for vec_addr, value in vec_bcasts:
+            s = self.scratch_const(value)         # deduped by value; emits load const
+            self.add("valu", ("vbroadcast", vec_addr, s))
 
         # Pause 1 -- match reference_kernel2's first yield (initial mem).
         self.add("flow", ("pause",))
