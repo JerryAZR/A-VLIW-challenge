@@ -48,12 +48,21 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False):
-        # Simple slot packing that just uses one slot per instruction bundle
-        instrs = []
-        for engine, slot in slots:
-            instrs.append({engine: [slot]})
-        return instrs
+    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False,
+              seed: int | None = None):
+        """Convert a slot list into instruction bundles.
+
+        vliw=False: one slot per bundle (the original sequential packing).
+        vliw=True:  DAG-driven VLIW scheduler - builds a dependency DAG from
+                    the slots and packs multiple independent slots per cycle
+                    respecting per-engine slot limits and read-before-write.
+        """
+        if not vliw:
+            return [{engine: [slot]} for engine, slot in slots]
+        from scheduler import build_dag, schedule_dag
+        nodes, frontier = build_dag(slots)
+        cap = len(slots)  # worst case: 1 slot/cycle
+        return schedule_dag(nodes, frontier, seed=seed, cap=cap)
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
@@ -333,7 +342,7 @@ class KernelBuilder:
                     body.append(("valu", ("+", idx_vec, t2_g, t1_g)))          # next = base + parity
                 body.append(("debug", ("vcompare", idx_vec, keywr)))
 
-        body_instrs = self.build(body)
+        body_instrs = self.build(body, vliw=True, seed=42)
         self.instrs.extend(body_instrs)
 
         # =====================================================================

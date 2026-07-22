@@ -168,4 +168,53 @@ Status: not started. Two complementary levers, both targeting the gather
 Roofline reminders (see `notes/architecture.md`): compute floor ~1280–1600
 yc (12-slot hash × 4096 lane-rounds over 6 valu + 12 alu/cyc); the Opus-4.5
 1487 score sits in that band. Scratch-tree tricks are N/A (scratch has no
+indirect addressing; tree 2047 > scratch 1536)## v3b - V1 random VLIW scheduler                      ~2,394 cyc   61.7x
+
+Commit (pending). DAG-driven VLIW packing replaces one-slot-per-bundle
+with a scheduler that packs multiple independent slots per cycle.
+
+- **`scheduler.py`**: `slot_io` (full ISA dispatch -> reads/writes as
+  `(addr, is_vector)` pairs), `build_dag` (program-order walk with per-lane
+  `readers_since`, tagged-union `last_writer` (vec_node | list[Node|None]x8),
+  deduped RAW weight-1 + WAR weight-0 edges, bidirectional invariant
+  asserts, dead-write warning).
+- **`schedule_dag`**: v1 random placer. Random pick from frontier (including
+  partially-completed spillable nodes; no priority). Native engine first;
+  spillable `vec_elem` ops try `valu`-atomic, else spill to `alu` (sticky-alu
+  once spilled). WAR resolutions immediate (same-cycle unlock); RAW deferred
+  to end-of-cycle `advance()` (reflects read-before-write +1 latency). Debug
+  slots ride free (0-cycle). Panic on empty frontier with uncommitted nodes,
+  empty cycle, or cap exceeded.
+- **Scratch reorder**: planes first `[0..1279]` (8-aligned so every
+  `val_vec=base+8g` covers exactly one region), shared sector `[1280..1535]`
+  with 8-word vector regions before 1-word scalars. Required for the DAG's
+  region-keyed `last_writer`/`readers_since` bookkeeping.
+- **`build(vliw=True, seed=42)`** wired into `build_kernel` - the body is
+  scheduled; prologue/epilogue stay linear (one slot per bundle); the two
+  `pause`s bracket the scheduled body as hard start/end barriers.
+
+Cycle breakdown: prologue ~111 + body ~2219 + epilogue ~65 = ~2394.
+
+Passes `submission_tests.py` correctness (8 seeds) and the first **3** tiers:
+`baseline < 147734`, `updated-starting-point < 18532`, `opus4-many-hours
+< 2164`. Fails the 5 tiers below 2164 (1790/1579/1548/1487/1363).
+
+---
+
+## v3c - (next) v2 greedy scheduler + gather dedup
+
+Status: not started. Two levers toward the ~1300 realistic target:
+
+1. **v2 greedy scheduler** - replace random pick with critical-path /
+  port-pressure-aware priority. Prefers `valu` (8x efficient); spills to `alu`
+  only under pressure. Fills both ports when possible. Estimated ~1700 cyc.
+2. **Gather dedup** - exploit level-determinism (all lanes at same level per
+  round; verified). Early rounds have few distinct idx (round 0: 1, round 1:
+  2, ...). Broadcast shared loads; total distinct gathers ~899 (vs 4096 naive)
+  / 2 load ports ~ 450 cyc gather, overlapped with ~1024 cyc compute.
+  Estimated ~1300 cyc.
+
+Roofline reminders (see `notes/architecture.md`): compute floor ~1280-1600
+cyc (12-slot hash x 4096 lane-rounds over 6 valu + 12 alu/cyc); the Opus-4.5
+1487 score sits in that band. Scratch-tree tricks are N/A (scratch has no
 indirect addressing; tree 2047 > scratch 1536).
