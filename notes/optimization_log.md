@@ -201,7 +201,50 @@ Passes `submission_tests.py` correctness (8 seeds) and the first **3** tiers:
 
 ---
 
-## v3c - (next) v2 greedy scheduler + gather dedup
+## v3c - V2 greedy VLIW scheduler                     ~2,236 cyc   66.1x
+
+Commit (pending). Replaces v1 random pick with greedy: iterate the entire
+frontier in idx order, skip nodes that can't be placed (don't break), loop
+until no progress (WAR unlocks may add new placeable nodes), then advance.
+
+- No instruction priority (by design - future v3d). Vector ops still prefer
+  `valu`; spill to `alu` if `valu` full. Known limitation: `vec_elem` ops
+  (xor-shift stages) can greedily fill `valu` slots, blocking `vec_fma`
+  (`multiply_add`, valu-only) from scheduling. Priority (fma-first) would
+  fix this but is deferred.
+- `_try_place` refactored out of the inline loop; returns
+  (committed_count, emitted_non_debug) tuple or None. Shared by both v1
+  random and v2 greedy paths.
+- `schedule_dag` gains `greedy: bool = True` parameter; v1 random preserved
+  as `greedy=False` for testing.
+
+Cycle count: 2394 (v1 random) -> 2236 (v2 greedy). Improvement from filling
+all engine slots each cycle instead of breaking on first failure.
+
+Passes `submission_tests.py` correctness (8 seeds). Passes first 3 tiers
+(baseline, updated-starting, opus4-many-hours < 2164 is FAIL - 2236 > 2164
+by 72 cyc / 3.3%). The fma-priority fix (v3d) is expected to clear 2164.
+
+---
+
+## v3d - (next) instruction priority + gather dedup
+
+Status: not started. Two levers toward the ~1300 realistic target:
+
+1. **Instruction priority** - prefer `vec_fma` (valu-only, rigid) over
+   `vec_elem` (spillable to alu) when both are in the frontier. Prevents
+   elementwise ops from saturating valu before fma gets a slot. Estimated
+   ~2000 cyc (clears < 2164).
+2. **Gather dedup** - exploit level-determinism (all lanes at same level per
+   round; verified). Early rounds have few distinct idx (round 0: 1, round 1:
+   2, ...). Broadcast shared loads; total distinct gathers ~899 (vs 4096 naive)
+   / 2 load ports ~ 450 cyc gather, overlapped with ~1024 cyc compute.
+   Estimated ~1300 cyc.
+
+Roofline reminders (see `notes/architecture.md`): compute floor ~1280-1600
+cyc (12-slot hash x 4096 lane-rounds over 6 valu + 12 alu/cyc); the Opus-4.5
+1487 score sits in that band. Scratch-tree tricks are N/A (scratch has no
+indirect addressing; tree 2047 > scratch 1536).
 
 Status: not started. Two levers toward the ~1300 realistic target:
 
