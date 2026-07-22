@@ -93,17 +93,79 @@ regime).
 
 ---
 
-## v3 — (next) gather prefetch / VLIW packing / cross-lane vectorization
+## v3a — cross-lane vectorization (8 lanes/group on `valu`)   12 911 cyc   11.44×
 
-Status: not started. Design discussion points documented in
-`notes/architecture.md`, `notes/scratch_map_canonical.md`, `notes/hash_dag.md`.
+First vectorization chunk: run `myhash` elementwise across VLEN=8 lanes per
+`valu` slot, 32 groups of 8. Still one slot per instruction bundle
+(`vliw=False`) — sophisticated VLIW packing is deliberately postponed; this
+pass is the functional 8-lane chunk ("naive loader" gather + full-vector hash).
 
-Approximate targets from the roofline analysis:
-- gather prefetch alone : ~77k → ~50k (modest; load hidden behind compute)
-- VLIW packing of the hash : ~50k → ~8–10k (large; ~9-cycle critical path
-  per lane, port-pressure bound)
-- cross-lane vectorization (8 lanes per valu) : ~8–10k → ~1500 (lands at
-  the Opus-4.5 tier; the verified per-lane compute-floor regime)
-- cache-swap / scratch-tree tricks : N/A — scratch has no indirect
-  addressing, tree must stay in mem; only load-port sharing via broadcast
-  of coincident idx values helps (and even then ~450 cyc, mostly hidden)
+- **Scratch reorg to a hard rule**: 256 words shared, then 5 words per lane
+  across 256 lanes (= 1280), exhausting the 1536-word file. The per-lane
+  sector is 5 contiguous planes of 256 (SoA): lane `i` owns one word per
+  plane at `plane_base + i`, so group `g` (lanes 8g..8g+7) forms an
+  8-word contiguous vector at `plane_base + 8g` — vectorizable at zero
+  gather cost. Planes: `val`, `idx`, `t1`, `t2`, `nv` (node_val landing).
+  Shared sector (159/256 words used, 97 free) holds header, scalar consts,
+  broadcast vector consts, and the few genuinely-shared transients
+  (`addr_a` pointer; `addr_vec` gather-address vector, ≤1-cycle live;
+  `forest_p_vec` broadcast).
+- **Per-lane `t1`/`t2`/`nv`** (not shared) so distinct groups' in-flight stages
+  never alias — VLIW-packable without rename management later. The old v2
+  "single shared pair of stage temps" is gone; this costs 768 words of
+  scratch but removes a whole class of inter-group hazards ` la headroom
+  cost nothing (97 + 256×0 free).
+- **Hash fully on `valu`** (8 lanes/slot): 3 `multiply_add` fma stages + 3
+  irreducible xor/add-shift stages (2 parallel elementwise transforms + `^`
+  combine). `val_vec` doubles as the running hash reg; the final stage
+  leaves `v` there — zero copy-out (same dual-role trick as v2, now vector).
+- **Gather** is the one non-vectorizable op (ISA has no scatter/gather): per
+  group, one `valu +` computes all 8 addresses (`addr_vec = idx_vec +
+  forest_p_vec`), then 8 scalar `load`s land into the per-lane `nv` plane.
+  This is the "naive loader" — prefetch / dual-port packing / speculative
+  both-branch loads deferred (see v3b notes).
+- **Branchless idx** on `valu`: `parity = v & 1`; `base = 2*idx + 1` (fma);
+  `next = base + parity`. Wrap round (10): `idx &= zero_vec` in one slot.
+- **Entry XOR** is also `valu` (not `alu`): `val_vec = val_vec ^ nv_g`,
+  8 lanes in one slot. `alu` would need 8 scalar slots/lane and forfeit
+  the whole vectorization.
+- Const-key collision handled: the literal `9` is both a multiplier (stage 4
+  fma) and a shift amount (stage 3), so hash constants are split into
+  `fma_vec_consts` vs `irr_vec_consts` dicts keyed by raw value.
+
+Per group per round (one slot/bundle): 1 addr valu + 8 loads + 1 xor +
+12 hash + 3 idx = 25 bundles (13 on the wrap round). The 8 scalar gathers
+are now the dominant cost — the load-port / prefetch lever is the clear
+next move.
+
+PMU (fires): valu 8656, load 4157 (4096 gathers + 32 vload + ~29 prologue),
+store 32, flow 2. `alu` reported counts are inflated by an artifact: the
+simulator's `valu` elementwise form internally calls `self.alu` per lane,
+so the PMU double-counts those as `alu` fires on every valu cycle — the
+scheduler-visible body work is all on the `valu` engine.
+
+Passes `submission_tests.py` correctness (8 seeds) and the first two tiers
+(`baseline < 147734`, `updated-starting-point < 18532`). Next target: `< 2164`.
+
+---
+
+## v3b — (next) gather prefetch / VLIW packing
+
+Status: not started. Two complementary levers, both targeting the gather
+(that's now the dominant 8-cyc/group/round):
+
+1. **Dual-port prefetch / speculative both-branch loads** — the 2 load
+   ports/cyc are wasted at one-slot-per-bundle. Issue both possible next
+   node values (left & right child) ahead of the hash finishing, then select
+   the correct one after the parity bit is known. Trades 1 extra load +
+   1 select for hiding the gather latency entirely behind the hash compute.
+2. **VLIW packing** (`build(..., vliw=True)` exists but is unused) — pack the
+   hash's 12 valu slots into parallel bundles. Critical path is 9 cyc/lane
+   (6-stage chain 1+2+1+2+1+2), port-pressure bound (6 valu/cyc). Idealized
+   body ~7 cyc/group/round vs current 25 → ~2200 cyc, landing the `< 2164`
+   tier.
+
+Roofline reminders (see `notes/architecture.md`): compute floor ~1280–1600
+yc (12-slot hash × 4096 lane-rounds over 6 valu + 12 alu/cyc); the Opus-4.5
+1487 score sits in that band. Scratch-tree tricks are N/A (scratch has no
+indirect addressing; tree 2047 > scratch 1536).

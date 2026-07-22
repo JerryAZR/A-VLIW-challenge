@@ -1,5 +1,14 @@
 # Scratch Memory Map (1536 words) — v2, per-lane private temps
 
+> **SUPERSEDED** by `scratch_map_canonical.md` (v3a, the implemented layout).
+> This file is retained for history only: it describes the v2 sequential
+> kernel's `[t0,t1,t2]` triple layout (768 words of per-lane temps), the
+> runtime-temp sector 2 slots (`addr_b`, `node_val_b`, `cnt_round`,
+> `cnt_lane`) that were never used, and the shared-single-pair stage-scratch
+> idea. v3a replaced all of this with the 256-shared + 5-per-lane SoA rule.
+
+---
+
 Key insight vs. v1: with 864 words free and a verified live-range structure
 (t0 = current hash value, always live; t1, t2 = stage scratch, live only
 within a xor/add-shift stage and dead between stages), we give each lane its

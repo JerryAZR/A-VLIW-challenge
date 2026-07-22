@@ -74,86 +74,124 @@ class KernelBuilder:
             self.const_map[val] = addr
         return self.const_map[val]
 
-    def build_hash(self, work_vec_base, t1, t2, final_dest, round, i,
-                   vec_consts, scalar_consts):
-        """Emit the 12-slot reduced myhash in-place on `work_vec_base`.
+    def build_vec_hash(self, val_vec, t1_vec, t2_vec, r, base_i,
+                        fma_vec_consts, irr_vec_consts):
+        """Emit the 12-slot reduced myhash fully on the `valu` unit, operating
+        elementwise on all VLEN=8 lanes of `val_vec` in parallel.
 
-        work_vec_base : scratch base address of an 8-word region whose lane 0
-            holds `a = val ^ node_val`. All fma and irreducible-stage ops
-            write to this lane 0; lanes 1..7 are junk we ignore (sequential
-            mode). The final stage's combine writes its result to
-            `final_dest` (typically the lane's persistent `val[i]` slot) so
-            the lane's carried `val` is updated with no separate copy op.
-        t1, t2 : single-word scratch addresses used as in-stage parallel-
-            transform scratch. Live within a single xor/add-shift stage,
-            dead between stages (overwritten by the next stage's first ops).
-        final_dest : scratch address that receives the stage-5 output `v`.
-            For the main loop this is `val[i]`, so the next round's entry XOR
-            reads `val[i]` directly.
-        vec_consts : {value: addr} of broadcast vectors for fma stages
-            (3 multipliers + 3 addends for the linear stages 0/2/4).
-        scalar_consts : {value: addr} of scalar constants for the irreducible
-            xor-shift / add-shift stages 1/3/5 (K1/K3/K5 and shift amounts).
+        `val_vec` is both the input `a = val ^ node_val` and the persistent
+        lane-state vector: each stage writes back into it, and the final
+        stage leaves the new `val` there (no copy-out needed).
+        t1_vec / t2_vec : 8-word stage-scratch vectors. Live only within a
+            single irreducible xor/add-shift stage (2 parallel transforms +
+            `^` combine), dead between stages. After the hash they are reused
+            for the branchless idx update (they're dead post-final-combine).
+        fma_vec_consts : {value: addr} of broadcast vectors for the 3 linear
+            stages (0/2/4): keys are the multiplier (1+2^s) and the addend K.
+        irr_vec_consts : {value: addr} of broadcast vectors for the 3
+            irreducible stages (1/3/5): keys are K (val1) and the shift amount
+            (val3). Kept separate from fma_vec_consts so the literal `9` does
+            not collide (mult 9 in stage 4 vs shift 9 in stage 3).
         """
         slots = []
         for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
-            is_final_stage = (hi == len(HASH_STAGES) - 1)
-            stage_dest = final_dest if is_final_stage else work_vec_base
             if op1 == "+" and op2 == "+":
-                # Linear stage: (a + K) + (a << s) == a*(1+2^s) + K, one fma slot.
-                # Operates on lane 0 of work_vec_base (broadcast constants fill
-                # lanes 1..7 with junk we ignore in sequential mode).
+                # Linear stage: (a + K) + (a << s) == a*(1+2^s) + K, one fma.
                 mult = (1 << val3) + 1
-                slots.append(("valu", ("multiply_add", work_vec_base, work_vec_base,
-                                       vec_consts[mult], vec_consts[val1])))
+                slots.append(("valu", ("multiply_add", val_vec, val_vec,
+                                       fma_vec_consts[mult], fma_vec_consts[val1])))
             else:
-                # Irreducible xor/add-shift stage: 2 parallel transforms of
-                # work_vec_base (lane 0), then a ^ combine. Run as alu scalar
-                # on single-word temps (no fma needed here).
-                slots.append(("alu", (op1, t1, work_vec_base, scalar_consts[val1])))
-                slots.append(("alu", (op3, t2, work_vec_base, scalar_consts[val3])))
-                slots.append(("alu", (op2, stage_dest, t1, t2)))
-            slots.append(("debug", ("compare", stage_dest, (round, i, "hash_stage", hi))))
+                # Irreducible xor/add-shift stage: 2 parallel elementwise
+                # transforms of val_vec, then a `^` (or `+`) combine.
+                slots.append(("valu", (op1, t1_vec, val_vec, irr_vec_consts[val1])))
+                slots.append(("valu", (op3, t2_vec, val_vec, irr_vec_consts[val3])))
+                slots.append(("valu", (op2, val_vec, t1_vec, t2_vec)))
+            keys = [(r, base_i + j, "hash_stage", hi) for j in range(VLEN)]
+            slots.append(("debug", ("vcompare", val_vec, keys)))
         return slots
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
     ):
-        """v2: sequential-across-lanes kernel. Still one slot per bundle, but
-        with the corrected plumbing from notes/scratch_map_canonical.md:
+        """v3a: 8-lane-per-group kernel. Cross-lane vectorization over the
+        `valu` unit (VLEN=8 lanes per group, 32 groups), still one slot per
+        bundle (vliw=False) -- sophisticated VLIW packing is deliberately
+        postponed; this pass is the functional 8-lane-vectorization chunk.
 
-          - lane state (val[256], idx[256]) resident in scratch across all
-            rounds; no per-round mem round-trips for lane state.
-          - val[i] is updated directly by the hash's final-stage combine
-            (no separate copy-back op); the running hash register is a shared
-            transient 8-word work vector (lane 0 active) used for fma.
-          - constants properly mapped (scalar consts + vector broadcast consts
-            initialized once at prologue; reused across all 4096 hashes).
-          - branchless idx update: base = (idx << 1) | 1; idx_next = base + (v & 1).
-            No `%`, no `select`, no flow port used.
-          - wrap is a build-time-known per-round decision (verified uniform
-            wrap on round=height for the canonical shape): on that round we
-            skip the idx update entirely and write idx[i] := 0 in one op.
+        Layout (all pipeline state resident in scratch across all rounds;
+        see notes/scratch_map_canonical.md for the rationale):
+          - val[256] : plane 0 of the per-lane sector; carried across rounds
+            AND the running hash register during each round's hash (entry XOR
+            writes `a` into it; the final hash stage leaves `v` there for the
+            next round -- zero copy-out ops). Stored as 32 contiguous VLEN=8
+            vectors.
+          - idx[256] : plane 1; zero-initialized (scratch clears to 0, initial
+            idx is 0 -> no init).
+          - consts : the 6 hash constants + shift amounts + idx helper
+            constants broadcast once at prologue as VLEN=8 vectors and reused
+            across all 32 groups x 16 rounds of hashes.
 
-        Still sequential: no VLIW packing, no cross-lane vectorization. The win
-        over v1 (123165 cyc) comes purely from eliminating per-round mem
-        round-trips and dead state, plus branchless idx, plus the per-lane val
-        copy-back merged into the hash's final combine.
+        Each group's 8 per-lane scratch words live in per-lane SoA planes
+        (see layout below): val/idx persistent state + t1/t2 per-lane stage
+        scratch + a per-lane node_val landing plane. Per-lane t1/t2/nv means
+        distinct groups' in-flight stages never alias -- VLIW-packable without
+        rename management.
+
+        Gather (non-contiguous tree.values[idx[i]]) is the one operation that
+        cannot be vectorized (the ISA has no scatter/gather): for each group of
+        8 lanes we compute all 8 gather addresses in one `valu` `+` (idx plus
+        the broadcast forest pointer), then issue 8 scalar `load`s landing in
+        the per-lane nv plane. This is the "naive loader" stage -- prefetch /
+        dual-port packing / speculative both-branch loads are deferred. With
+        one slot per bundle the gather is 1 (addr) + 8 (loads) = 9 cycles, then
+        entry XOR (1) + 12-slot hash + idx (3, or 1 on the uniform wrap round).
+
+        Branchless idx update: parity = v & 1; base = idx*2 + 1 (valu fma);
+        next = base + parity (valu `+`). Equals the reference's
+        `2*idx + (1 if even else 2)` bit-exactly (parity=0 -> +1, parity=1 -> +2).
+
+        Wrap is a build-time-known per-round decision (verified uniform wrap
+        on round=height for the canonical shape): on that round we skip the
+        branchless idx update and write idx := 0 for all lanes (one `valu`
+        `& idx,zero`).
 
         Canonical shape assumed: forest_height=10, n_nodes=2047, batch_size=256.
         """
-        assert batch_size == 256, f"v2 supports only batch_size=256 (got {batch_size})"
+        assert batch_size == 256, f"v3 supports only batch_size=256 (got {batch_size})"
         assert batch_size % VLEN == 0, "batch_size must be a multiple of VLEN=8"
         assert forest_height == 10, (
-            f"v2 hardcodes wrap round tied to height 10 (got {forest_height})")
+            f"v3 hardcodes wrap round tied to height 10 (got {forest_height})")
         assert n_nodes == (2 ** (forest_height + 1) - 1), "n_nodes / height mismatch"
 
         V = batch_size
+        n_groups = V // VLEN
         WRAP_ROUND = forest_height   # verified: all lanes at leaf on round=h -> wrap to root
 
         # =====================================================================
-        # Sector 1: header + scalar constants
+        # Scratch layout (hard rule): 256 words shared, then 5 words per lane
+        # across V=256 lanes (= 1280), exhausting the 1536-word file.
+        #
+        # Shared sector  : header + scalar consts + broadcast vector consts +
+        #                 shared transients (vload/vstore pointer addr_a;
+        #                 gather-address vector addr_vec; forest_p broadcast).
+        #                 Under one-slot-per-bundle only one group is mid-flight
+        #                 per stage, so <=1-cycle-live transients (addr_vec) stay
+        #                 shared. When we VLIW-pack several groups, the per-lane
+        #                 planes below already give each lane private t1/t2/nv,
+        #                 so stage scratch never renames regardless.
+        #
+        # Per-lane sector: 5 contiguous planes of V=256 words (SoA). Lane i
+        #                 owns one word per plane at plane_k_base + i, so group
+        #                 g (lanes 8g..8g+7) forms a VLEN=8 contiguous vector at
+        #                 plane_k_base + 8g -- vectorizable, zero gather cost.
+        #                   plane 0 : val[i]  (resident + running hash register)
+        #                   plane 1 : idx[i]  (resident; zero-initialized)
+        #                   plane 2 : t1[i]   (per-lane stage scratch)
+        #                   plane 3 : t2[i]   (per-lane stage scratch)
+        #                   plane 4 : nv[i]   (per-lane node_val landing / spare)
         # =====================================================================
+
+        # ---- Shared sector (<= 256 words) ----
         init_vars = [
             "rounds", "n_nodes", "batch_size", "forest_height",
             "forest_values_p", "inp_indices_p", "inp_values_p",
@@ -161,127 +199,133 @@ class KernelBuilder:
         for v in init_vars:
             self.alloc_scratch(v, 1)
 
-        zero_const  = self.scratch_const(0, "zero")
-        one_const   = self.scratch_const(1, "one")
-        two_const   = self.scratch_const(2, "two")
-        shift_19    = self.scratch_const(19, "shift_19")
-        shift_9     = self.scratch_const(9,  "shift_9")
-        shift_16    = self.scratch_const(16, "shift_16")
-        K1_const    = self.scratch_const(0xC761C23C, "K1")
-        K3_const    = self.scratch_const(0xD3A2646C, "K3")
-        K5_const    = self.scratch_const(0xB55A4F09, "K5")
-        eight_const = self.scratch_const(8, "eight")
+        zero_const   = self.scratch_const(0, "zero")
+        eight_const  = self.scratch_const(8, "eight")
+        addr_a       = self.alloc_scratch("addr_a", 1)        # vload/vstore pointer
+        addr_vec     = self.alloc_scratch("addr_vec", VLEN)   # gather addr (<=1-cyc live)
+        forest_p_vec = self.alloc_scratch("forest_p_vec", VLEN)  # broadcast tree ptr
 
-        scalar_consts = {
-            19: shift_19, 9: shift_9, 16: shift_16,
-            0xC761C23C: K1_const, 0xD3A2646C: K3_const, 0xB55A4F09: K5_const,
-        }
-
-        # =====================================================================
-        # Sector 2: transient helpers (single shared; sequential-mode safe)
-        # =====================================================================
-        addr_a       = self.alloc_scratch("addr_a", 1)          # mem pointer, transient
-        node_val_buf = self.alloc_scratch("node_val_buf", 1)    # gather landing, transient
-        work_vec     = self.alloc_scratch("work_vec", VLEN)     # lane 0 = current hash reg
-
-        # =====================================================================
-        # Sector 3: vector constants (broadcast once at prologue)
-        # =====================================================================
         def vec_const(value, name):
             scalar = self.scratch_const(value, name + "_src")
             addr = self.alloc_scratch(name, VLEN)
             self.add("valu", ("vbroadcast", addr, scalar))
             return addr
 
+        # fma stages (0/2/4): a*(1+2^s) + K   (3 multipliers + 3 addends)
         mult4097_vec = vec_const(4097,        "mult4097_vec")
         K0_vec       = vec_const(0x7ED55D16,  "K0_vec")
         mult33_vec   = vec_const(33,          "mult33_vec")
         K2_vec       = vec_const(0x165667B1,  "K2_vec")
         mult9_vec    = vec_const(9,           "mult9_vec")
         K4_vec       = vec_const(0xFD7046C5,  "K4_vec")
+        # irreducible stages (1/3/5): (a OP1 K) OP2 (a OP3 shift)  (3 K + 3 shift)
+        K1_vec       = vec_const(0xC761C23C,  "K1_vec")
+        K3_vec       = vec_const(0xD3A2646C,  "K3_vec")
+        K5_vec       = vec_const(0xB55A4F09,  "K5_vec")
+        shift19_vec  = vec_const(19,          "shift19_vec")
+        shift9_vec   = vec_const(9,           "shift9_vec")
+        shift16_vec  = vec_const(16,          "shift16_vec")
+        # idx-update helpers / wrap  (branchless base = 2*idx + 1; parity = v&1)
         two_vec      = vec_const(2,           "two_vec")
         one_vec      = vec_const(1,           "one_vec")
+        zero_vec     = vec_const(0,           "zero_vec")   # wrap: idx := 0
 
-        vec_consts = {
+        # fma / irr split so the literal `9` (mult in stage 4 vs shift in stage 3)
+        # doesn't collide as a dict key.
+        fma_vec_consts = {
             4097: mult4097_vec, 0x7ED55D16: K0_vec,
             33:   mult33_vec,   0x165667B1: K2_vec,
             9:    mult9_vec,    0xFD7046C5: K4_vec,
         }
+        irr_vec_consts = {
+            0xC761C23C: K1_vec, 0xD3A2646C: K3_vec, 0xB55A4F09: K5_vec,
+            19: shift19_vec, 9: shift9_vec, 16: shift16_vec,
+        }
+
+        shared_used = self.scratch_ptr
+        assert shared_used <= 256, f"shared sector over budget: {shared_used} > 256"
+
+        # ---- Per-lane sector: 5 planes of V=256 words (SoA, vectorizable) ----
+        val_base = self.alloc_scratch("val", V)   # plane 0: running hash + carried state
+        idx_base = self.alloc_scratch("idx", V)   # plane 1: tree index (zero-init)
+        t1_base  = self.alloc_scratch("t1",  V)   # plane 2: per-lane stage scratch
+        t2_base  = self.alloc_scratch("t2",  V)   # plane 3: per-lane stage scratch
+        nv_base  = self.alloc_scratch("nv",  V)   # plane 4: node_val landing / spare
+        assert self.scratch_ptr <= SCRATCH_SIZE, "scratch overflow"
 
         # =====================================================================
-        # Sector 4: lane state (resident across all rounds)
-        # =====================================================================
-        val_base = self.alloc_scratch("val", V)   # prologue vload / epilogue vstore
-        idx_base = self.alloc_scratch("idx", V)   # zero-initialized (scratch=0); initial
-                                                  # idx is 0 -> no init needed
-        # =====================================================================
-        # Sector 5: per-lane stage temps (single word each)
-        # =====================================================================
-        temps_base = self.alloc_scratch("temps", 2 * V)  # t1[i] @ temps+2i, t2[i] @ temps+2i+1
-
-        # =====================================================================
-        # Prologue: load header; vload val[256]
+        # Prologue: load header; vload val[256]; broadcast forest pointer
         # =====================================================================
         for i, v in enumerate(init_vars):
             self.add("load", ("const", addr_a, i))                  # addr_a := i
             self.add("load", ("load",  self.scratch[v], addr_a))     # scratch[v] := mem[i]
 
         # vload val[256] as 32 vectors of 8 contiguous words from mem[inp_values_p..].
-        # Stride addr_a by 8 between vectors; init addr_a to inp_values_p first.
         self.add("alu", ("+", addr_a, self.scratch["inp_values_p"], zero_const))
-        n_vec = V // VLEN
-        for k in range(n_vec):
+        for k in range(n_groups):
             self.add("load", ("vload", val_base + k * VLEN, addr_a))
-            if k < n_vec - 1:
+            if k < n_groups - 1:
                 self.add("alu", ("+", addr_a, addr_a, eight_const))
+
+        # broadcast forest_values_p so all 8 gather addrs derive from one valu op
+        self.add("valu", ("vbroadcast", forest_p_vec, self.scratch["forest_values_p"]))
 
         # Pause 1 -- match reference_kernel2's first yield (initial mem).
         self.add("flow", ("pause",))
 
         # =====================================================================
-        # Body -- unrolled rounds x 256 lanes, one slot per bundle.
+        # Body -- unrolled rounds x 32 groups, one slot per bundle.
         # =====================================================================
         body = []
         for r in range(rounds):
             is_wrap = (r == WRAP_ROUND)
-            for i in range(V):
-                val_i = val_base + i
-                idx_i = idx_base + i
-                t1_i  = temps_base + 2 * i
-                t2_i  = temps_base + 2 * i + 1
+            for g in range(n_groups):
+                # per-group vectors into the SoA per-lane planes (8 contiguous words each)
+                val_vec = val_base + g * VLEN
+                idx_vec = idx_base + g * VLEN
+                t1_g    = t1_base  + g * VLEN
+                t2_g    = t2_base  + g * VLEN
+                nv_g    = nv_base  + g * VLEN
+                base_i  = g * VLEN
+                keyval  = [(r, base_i + j, "val") for j in range(VLEN)]
+                keynv   = [(r, base_i + j, "node_val") for j in range(VLEN)]
+                keyhv   = [(r, base_i + j, "hashed_val") for j in range(VLEN)]
+                keywr   = [(r, base_i + j, "wrapped_idx") for j in range(VLEN)]
 
-                # --- gather tree.values[idx[i]] ---
-                body.append(("alu", ("+", addr_a, self.scratch["forest_values_p"], idx_i)))
-                body.append(("load", ("load", node_val_buf, addr_a)))
-                # debug: pre-state + node_val
-                body.append(("debug", ("compare", idx_i,       (r, i, "idx"))))
-                body.append(("debug", ("compare", val_i,       (r, i, "val"))))
-                body.append(("debug", ("compare", node_val_buf, (r, i, "node_val"))))
+                # --- gather addresses: addr_vec = idx_vec + forest_p_vec (1 valu) ---
+                body.append(("valu", ("+", addr_vec, idx_vec, forest_p_vec)))
 
-                # --- entry XOR (also in-marshal; lane 0 = a) ---
-                body.append(("alu", ("^", work_vec, val_i, node_val_buf)))
+                # --- 8 scalar gathers (non-contiguous; no vgather in ISA) ---
+                # naive loader: one load per lane, landing into the per-lane nv
+                # plane so each group has its own node_val vector (future-proof
+                # for VLIW: distinct groups' gathers won't alias).
+                for j in range(VLEN):
+                    body.append(("load", ("load", nv_g + j, addr_vec + j)))
 
-                # --- 12-slot hash (lane 0 active for fma); stage 5 combine -> val_i ---
-                body.extend(self.build_hash(work_vec, t1_i, t2_i, val_i,
-                                            r, i, vec_consts, scalar_consts))
+                body.append(("debug", ("vcompare", nv_g, keynv)))
+                body.append(("debug", ("vcompare", val_vec, keyval)))  # val before xor
 
-                # debug: hashed_val == v == val_i after hash
-                body.append(("debug", ("compare", val_i, (r, i, "hashed_val"))))
+                # --- entry XOR: val_vec = val_vec ^ nv_g  (a) ---
+                body.append(("valu", ("^", val_vec, val_vec, nv_g)))
 
-                # --- post-hash: idx update or wrap ---
+                # --- 12-slot hash, fully on valu (8 lanes / slot) ---
+                body.extend(self.build_vec_hash(val_vec, t1_g, t2_g, r, base_i,
+                                                fma_vec_consts, irr_vec_consts))
+
+                # debug: hashed_val == v == val_vec after hash
+                body.append(("debug", ("vcompare", val_vec, keyhv)))
+
+                # --- post-hash: idx update or wrap (branchless, on valu) ---
                 if is_wrap:
-                    # Verified: on this round, all 256 lanes are at level=height (leaf),
+                    # Verified: on this round, all 256 lanes are at leaf,
                     # so next = 2*idx + 1 + parity >= n_nodes -> wrap to 0.
-                    body.append(("alu", ("+", idx_i, zero_const, zero_const)))
-                    body.append(("debug", ("compare", idx_i, (r, i, "wrapped_idx"))))
+                    body.append(("valu", ("&", idx_vec, idx_vec, zero_vec)))
                 else:
-                    # Branchless idx update: base = (idx<<1)|1; next = base + (v & 1).
-                    # (idx << 1) has low bit = 0, so `| 1` is a no-carry set ~= `+ 1`.
-                    body.append(("alu", ("<<", t2_i, idx_i, one_const)))   # idx << 1
-                    body.append(("alu", ("|",  t2_i, t2_i, one_const)))    # |= 1 -> base
-                    body.append(("alu", ("&",  t1_i, val_i, one_const)))    # v & 1 -> parity
-                    body.append(("alu", ("+",  idx_i, t2_i, t1_i)))        # next = base + parity
-                    body.append(("debug", ("compare", idx_i, (r, i, "wrapped_idx"))))
+                    body.append(("valu", ("&", t1_g, val_vec, one_vec)))        # parity = v & 1
+                    body.append(("valu", ("multiply_add", t2_g,
+                                           idx_vec, two_vec, one_vec)))         # base = 2*idx + 1
+                    body.append(("valu", ("+", idx_vec, t2_g, t1_g)))          # next = base + parity
+                body.append(("debug", ("vcompare", idx_vec, keywr)))
 
         body_instrs = self.build(body)
         self.instrs.extend(body_instrs)
@@ -290,9 +334,9 @@ class KernelBuilder:
         # Epilogue: vstore val[256] back to mem[inp_values_p .. +256]
         # =====================================================================
         self.add("alu", ("+", addr_a, self.scratch["inp_values_p"], zero_const))
-        for k in range(n_vec):
+        for k in range(n_groups):
             self.add("store", ("vstore", addr_a, val_base + k * VLEN))
-            if k < n_vec - 1:
+            if k < n_groups - 1:
                 self.add("alu", ("+", addr_a, addr_a, eight_const))
 
         # Pause 2 -- match reference_kernel2's final yield (final mem).
