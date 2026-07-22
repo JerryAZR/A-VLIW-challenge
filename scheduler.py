@@ -497,8 +497,8 @@ def schedule_dag(nodes: list[DNode], frontier: set[int], *,
         emitted_non_debug = False
 
         if greedy:
-            # ---- v2 greedy: try all frontier nodes, skip failures, ----
-            # ---- loop until no progress (WAR unlocks may add nodes). ----
+            # ---- v2 greedy: iterate frontier in idx order; loop until no ----
+            # ---- progress (WAR unlocks reported by _commit via unlocked). ----
             progress = True
             while progress:
                 progress = False
@@ -508,13 +508,15 @@ def schedule_dag(nodes: list[DNode], frontier: set[int], *,
                         frontier.discard(idx)
                         n.in_frontier = False
                         continue
+                    unlocked = []
                     result = _try_place(n, cycle_bundle, free, nodes,
-                                        frontier, committed_count)
+                                        frontier, committed_count, unlocked)
                     if result is not None:
                         committed_count, did_emit = result
                         if did_emit:
                             emitted_non_debug = True
-                        progress = True
+                        if unlocked:
+                            progress = True
         else:
             # ---- v1 random: pick one, break on failure. ----
             while frontier:
@@ -523,10 +525,11 @@ def schedule_dag(nodes: list[DNode], frontier: set[int], *,
                     frontier.discard(n.idx)
                     n.in_frontier = False
                     continue
+                unlocked = []
                 result = _try_place(n, cycle_bundle, free, nodes,
-                                    frontier, committed_count)
+                                    frontier, committed_count, unlocked)
                 if result is None:
-                    break          # can't place this node - advance cycle
+                    break
                 committed_count, did_emit = result
                 if did_emit:
                     emitted_non_debug = True
@@ -551,18 +554,23 @@ def schedule_dag(nodes: list[DNode], frontier: set[int], *,
 
 def _try_place(n: DNode, cycle_bundle: dict, free: dict,
                nodes: list[DNode], frontier: set[int],
-               committed_count: int) -> tuple[int, bool] | None:
+               committed_count: int,
+               unlocked: list[int] | None = None) -> tuple[int, bool] | None:
     """Try to place node n into the current cycle's bundle.
 
     Returns (updated_committed_count, emitted_non_debug) if placed (may be
     partial - committed_count unchanged but emitted_non_debug=True), or None
     if the node could not be placed at all (engine full).
+
+    If unlocked is provided, _commit appends newly-frontier-eligible child
+    node indices to it (WAR immediate unlocks). The scheduler uses this to
+    know which new candidates to try without diffing the frontier.
     """
     kind = n.kind
 
     if kind == _KIND_DEBUG:
         cycle_bundle.setdefault("debug", []).append(n.slot)
-        return (_commit(n, nodes, frontier, committed_count), False)
+        return (_commit(n, nodes, frontier, committed_count, unlocked), False)
 
     if kind == _KIND_VEC_ELEM and n.lanes_done > 0:
         # Partial spill - sticky alu.
@@ -575,7 +583,7 @@ def _try_place(n: DNode, cycle_bundle: dict, free: dict,
         free["alu"] -= take
         n.lanes_done += take
         if n.lanes_done == n.lanes_total:
-            return (_commit(n, nodes, frontier, committed_count), True)
+            return (_commit(n, nodes, frontier, committed_count, unlocked), True)
         return (committed_count, True)     # partial progress
 
     if kind == _KIND_VEC_ELEM:
@@ -585,7 +593,7 @@ def _try_place(n: DNode, cycle_bundle: dict, free: dict,
             free["valu"] -= 1
             n.lanes_done = n.lanes_total
             n.engine_choice = "valu"
-            return (_commit(n, nodes, frontier, committed_count), True)
+            return (_commit(n, nodes, frontier, committed_count, unlocked), True)
         take = min(n.lanes_total, free["alu"])
         if take == 0:
             return None
@@ -596,7 +604,7 @@ def _try_place(n: DNode, cycle_bundle: dict, free: dict,
         n.lanes_done += take
         n.engine_choice = "alu"
         if n.lanes_done == n.lanes_total:
-            return (_commit(n, nodes, frontier, committed_count), True)
+            return (_commit(n, nodes, frontier, committed_count, unlocked), True)
         return (committed_count, True)     # partial progress
 
     # Atomic scalar / load / store / flow / vec_fma
@@ -607,17 +615,22 @@ def _try_place(n: DNode, cycle_bundle: dict, free: dict,
     free[eng] -= 1
     n.lanes_done = n.lanes_total
     n.engine_choice = eng
-    return (_commit(n, nodes, frontier, committed_count), True)
+    return (_commit(n, nodes, frontier, committed_count, unlocked), True)
 
 
 def _commit(n: DNode, nodes: list[DNode], frontier: set[int],
-            committed_count: int) -> int:
+            committed_count: int,
+            unlocked: list[int] | None = None) -> int:
     """Mark n committed; relax its out-edges into consumers.
 
     WAR (w=0) is applied immediately; the child may become frontier-eligible
-    this same cycle. RAW (w=1) is deferred — increments dst.incoming, which
+    this same cycle. RAW (w=1) is deferred - increments dst.incoming, which
     `advance()` applies at end-of-cycle (so the child becomes eligible next
     cycle, reflecting read-before-write's +1 latency).
+
+    If unlocked is provided, appends newly-frontier-eligible child node
+    indices (from WAR immediate unlocks) so the scheduler knows exactly which
+    nodes to try next without diffing the frontier.
     """
     n.committed = True
     n.in_frontier = False
@@ -634,14 +647,22 @@ def _commit(n: DNode, nodes: list[DNode], frontier: set[int],
                     and not dst.in_frontier):
                 frontier.add(dst.idx)
                 dst.in_frontier = True
+                if unlocked is not None:
+                    unlocked.append(dst_idx)
         else:
             # RAW: deferred to advance()
             dst.incoming += 1
     return committed_count
 
 
-def _advance(nodes: list[DNode], frontier: set[int]) -> None:
-    """Apply end-of-cycle RAW resolutions: raw_blockers -= incoming; clear."""
+def _advance(nodes: list[DNode], frontier: set[int],
+            unlocked: list[int] | None = None) -> None:
+    """Apply end-of-cycle RAW resolutions: raw_blockers -= incoming; clear.
+
+    If unlocked is provided, appends newly-frontier-eligible node indices
+    (from RAW deferred unlocks) so the scheduler knows which nodes became
+    ready without diffing the frontier.
+    """
     for n in nodes:
         if n.incoming > 0:
             n.raw_blockers -= n.incoming
@@ -651,3 +672,5 @@ def _advance(nodes: list[DNode], frontier: set[int]) -> None:
                     and not n.committed):
                 frontier.add(n.idx)
                 n.in_frontier = True
+                if unlocked is not None:
+                    unlocked.append(n.idx)
