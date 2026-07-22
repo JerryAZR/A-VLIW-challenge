@@ -340,15 +340,15 @@ class KernelBuilder:
                 keywr   = [(r, base_i + j, "wrapped_idx") for j in range(VLEN)]
 
                 # --- node_val gather or preload-select (rounds 0-2 use preloaded) ---
-                if r == 0:
+                if r in (0, 11):
                     # Level 0: all lanes at idx=0. node_val = tree[0].
                     body.append(("valu", ("^", nv_g, tree0_vec, zero_vec)))
-                elif r == 1:
+                elif r in (1, 12):
                     # Level 1: idx in {1,2}. 1 vselect on idx bit 0.
                     # idx=1 (bit0=1) -> tree[1]; idx=2 (bit0=0) -> tree[2].
                     body.append(("valu", ("&", t1_g, idx_vec, one_vec)))   # cond = idx & 1
                     body.append(("flow", ("vselect", nv_g, t1_g, tree1_vec, tree2_vec)))
-                elif r == 2:
+                elif r in (2, 13):
                     # Level 2: idx in {3,4,5,6}. Subtract level base (3), then
                     # 2-level select on bits 0-1 of (idx-3).
                     # idx-3=0->tree3, 1->tree4, 2->tree5, 3->tree6
