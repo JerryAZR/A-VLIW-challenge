@@ -6,8 +6,27 @@ See notes/scheduler_design.md for the design. This module implements:
   WAR weight-0) with edge dedup per (src, dst, weight) and invariant
   asserts. Dead writes are warned, not eliminated.
 
-The scheduler proper (frontier + partial schedules + cycle placement) will
-be added in a follow-up. This module just builds and validates the DAG.
+Dependency model (see notes/scheduler_design.md for the full design):
+- RAW (weight 1): producer W -> consumer R; R must be >= W's cycle + 1.
+  Resolutions are DEFERRED: source placement increments the destination's
+  `incoming`, which is subtracted from `raw_blockers` at end-of-cycle
+  advance().
+- WAR (weight 0): old reader R -> new writer W'; W' must be >= R's cycle.
+  Same cycle is safe (read-before-write commits). Resolutions are IMMEDIATE:
+  placing the source decrements the destination's `war_blockers` and, if
+  zero blockers remain, adds it to the frontier this same cycle.
+
+Per-node counters (set by build_dag, mutated by the scheduler's place() /
+advance() helpers — to be implemented next):
+  war_blockers : remaining weight-0 in-edges unresolved
+  raw_blockers : remaining weight-1 in-edges unresolved (decremented by
+                 `incoming` at advance())
+  incoming     : RAW resolutions accumulated this cycle (cleared at advance)
+  in_frontier  : whether the node is currently in the frontier set
+
+The scheduler proper (cycle placement loop with partial-schedule spill
+handling for vector nodes) will be added in a follow-up. This module just
+builds and validates the DAG.
 """
 
 from dataclasses import dataclass, field
@@ -24,17 +43,31 @@ class DNode:
     idx: int                                     # program index
     engine: str                                  # alu / valu / load / store / flow / debug
     slot: tuple                                  # raw slot tuple
-    reads: list[int] = field(default_factory=list)
-    writes: list[tuple[int, bool]] = field(default_factory=list)  # (addr, is_vector)
+    reads: list[tuple[int, bool]] = field(default_factory=list)
+    writes: list[tuple[int, bool]] = field(default_factory=list)
     in_edges: list[tuple[int, int]] = field(default_factory=list)  # (src_idx, weight) deduped
     out_edges: list[tuple[int, int]] = field(default_factory=list) # (dst_idx, weight) deduped
-    unresolved: int = 0                          # == len(in_edges) at construction
-    ready_cycle: int = 0
-    commit_cycle: int = -1
-    # partial-schedule fields (used by the scheduler, not by build_dag):
-    lanes_done: int = 0
-    lanes_total: int = 0
-    engine_choice: str | None = None
+    # ---- Dependency counters (scheduler-facing; set by build_dag, mutated ----
+    # ---- by place()/advance() — see notes/scheduler_design.md for the model): ----
+    war_blockers: int = 0        # number of weight-0 in-edges not yet resolved
+    raw_blockers: int = 0        # number of weight-1 in-edges not yet resolved (set
+                                 # at; decremented by `incoming` at advance())
+    incoming: int = 0            # RAW resolutions accumulated THIS cycle (cleared
+                                 # at end-of-cycle via advance()).
+    # ---- Convenience / state flags: ----
+    in_frontier: bool = False   # node currently in the frontier set
+    in_flight: bool = False      # node currently mid-execution (partial alu spill)
+    committed: bool = False     # node has fired all its lanes (and RAW/WAR have
+                                 # been relaxed into consumers)
+    # ---- Scheduling results: ----
+    place_cycle: int = -1       # cycle where node was (first) placed
+    commit_cycle: int = -1      # cycle where node's last lane completed
+    ready_cycle: int = 0        # lower bound: earliest cycle node can be placed
+    # ---- Partial-schedule fields (for spillable vector nodes): ----
+    lanes_done: int = 0         # alu lanes landed so far (0..lanes_total)
+    lanes_total: int = 0        # 1 for atomic (alu/load/store/flow/fma-vec); 8 for
+                                 # spillable elementwise valu; 0 for debug
+    engine_choice: str | None = None  # None until first lane; sticky
 
 
 def slot_io(engine: str, slot: tuple) -> tuple[list[tuple[int, bool]], list[tuple[int, bool]]]:
@@ -240,9 +273,9 @@ def build_dag(slots: list[tuple[str, tuple]]) -> tuple[list[DNode], set[int]]:
                     node.in_edges.append((src_idx, 1))
                     nodes[src_idx].out_edges.append((idx, 1))
 
-        # ---- Step 2: frontier? ----
-        if not node.in_edges:
-            frontier.add(idx)
+        # ---- Step 2: frontier is computed after counters are set ----
+        # (no-op here; see post-loop initialization at the bottom)
+        _ = idx
 
         # ---- Step 3: append self to readers_since for each read (region, lane) ----
         for r, lane in read_lanes:
@@ -305,18 +338,30 @@ def build_dag(slots: list[tuple[str, tuple]]) -> tuple[list[DNode], set[int]]:
                         lw[lane] = node
                         last_writer[r] = lw
 
-        # ---- Final: recompute unresolved ----
-        node.unresolved = len(node.in_edges)
+        # No per-node `unresolved` recompute here — build_dag sets
+        # war_blockers / raw_blockers below from the edge lists.
+
+    # ---- Set dependency counters + bidirectional invariant asserts ----
+    for n in nodes:
+        n.raw_blockers = sum(1 for _, w in n.in_edges if w == 1)
+        n.war_blockers = sum(1 for _, w in n.in_edges if w == 0)
 
     # ---- Bidirectional invariant asserts ----
     for n in nodes:
-        assert n.unresolved == len(n.in_edges), (
-            f"Node {n.idx}: unresolved={n.unresolved} != len(in_edges)={len(n.in_edges)}")
+        assert n.raw_blockers + n.war_blockers == len(n.in_edges), (
+            f"Node {n.idx}: raw+war blockers={n.raw_blockers + n.war_blockers} "
+            f"!= len(in_edges)={len(n.in_edges)}")
         for src_idx, w in n.in_edges:
             assert (n.idx, w) in nodes[src_idx].out_edges, (
                 f"Node {n.idx}: in-edge ({src_idx},{w}) not in src out_edges")
         for dst_idx, w in n.out_edges:
             assert (n.idx, w) in nodes[dst_idx].in_edges, (
                 f"Node {n.idx}: out-edge ({dst_idx},{w}) not in dst in_edges")
+
+    # ---- Initialize frontier (nodes with zero unresolved blockers) ----
+    for n in nodes:
+        if n.raw_blockers == 0 and n.war_blockers == 0:
+            n.in_frontier = True
+            frontier.add(n.idx)
 
     return nodes, frontier
