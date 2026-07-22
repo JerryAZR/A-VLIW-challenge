@@ -5,20 +5,35 @@ Canonical workload: `forest_height=10, n_nodes=2047, batch_size=256,
 rounds=16`. Scored by simulated cycle count on a frozen copy of the
 simulator (`tests/submission_tests.py`).
 
-Each entry records intent, mechanism, cycle count, and PMU corroboration.
+Each entry records the commit, intent, mechanism, cycle count, and
+correctness/tier status.
+
+Speed tiers (lower is better; current step highlighted):
+
+| tier                     | threshold | 1    | 2     | 3      | 4    | 5    | 6    | **7** |
+|--------------------------|-----------|------|-------|--------|------|------|------|-------|
+| baseline                 | 147 734   | PASS | PASS  | PASS   | PASS | PASS | PASS | PASS  |
+| updated-starting         | 18 532    | -    | -     | PASS   | PASS | PASS | PASS | PASS  |
+| opus4-many-hours         | 2 164     | -    | -     | -      | -    | -    | PASS | PASS  |
+| opus45-casual            | 1 790     | -    | -     | -      | -    | -    | -    | FAIL  |
+| opus45-2hr               | 1 579     | -    | -     | -      | -    | -    | -    | FAIL  |
+| sonnet45                 | 1 548     | -    | -     | -      | -    | -    | -    | FAIL  |
+| opus45-11hr              | 1 487     | -    | -     | -      | -    | -    | -    | FAIL  |
+| opus45-improved-harness  | 1 363     | -    | -     | -      | -    | -    | -    | FAIL  |
 
 ---
 
-## Baseline (committed up-stream)               147 734 cyc   1.00×
+## Baseline                                          147 734 cyc   1.00×
 
-`KernelBuilder.build_kernel` as shipped, a deliberately-naive scalar program:
+Commit `f88c945`. `KernelBuilder.build_kernel` as shipped, a deliberately
+naive scalar program:
 
-- One slot per instruction bundle (no VLIW packing at all — `vliw=False`).
+- One slot per instruction bundle (no VLIW packing at all - `vliw=False`).
 - Fully unrolled `rounds × batch_size` (= 4096) iterations emitted statically.
 - Re-reads `idx[i]`, `val[i]` from **mem** every round (one `load` apiece),
   plus one `load` for `tree.values[idx]`.
 - Stores `idx[i]` AND `val[i]` back to **mem** every round (the `idx` writes
-  are entirely wasted — the grader checks only `val`).
+  are entirely wasted - the grader checks only `val`).
 - `myhash` taken literally: 6 stages × 3 alu ops = **18 ops/hash**.
 - Idx update `% 2`, `== 0`, `flow select`, `* 2`, `+`, `< n_nodes`,
   `flow select`. Wrap is fully per-lane branchy.
@@ -30,9 +45,10 @@ Every active engine sits at histogram k=1 (one-slot-per-bundle pathology).
 
 ---
 
-## v1 — fma via `valu` `multiply_add`         123 165 cyc   1.20×
+## Step 1 - fma via `valu` `multiply_add`          123 165 cyc   1.20×
 
-Commit `648da3d`. First reduction of `myhash`:
+Commit `648da3d`. Still sequential (one slot per bundle). First reduction of
+`myhash`:
 
 - Three linear stages `(a+K) + (a<<s) == a*(1+2^s) + K` collapse from three
   alu slots to **one `valu multiply_add` slot each** (verified bit-exact
@@ -40,29 +56,31 @@ Commit `648da3d`. First reduction of `myhash`:
   VLEN-word work region; broadcast constants fill lanes 1..7 with junk we
   ignore.
 - Three xor/add-shift stages (1, 3, 5) are irreducible at 3 slots each
-  — carries block fusing `+K` across the `^` combine (numerically falsified).
-- ⇒ `myhash` goes from 18 literal alu ops to **12 slots** (3 fma + 9 alu).
-- Everything else still sequential & bloated (per-round mem round-trips,
+  - carries block fusing `+K` across the `^` combine (numerically falsified).
+- `myhash` goes from 18 literal alu ops to **12 slots** (3 fma + 9 alu).
+- Everything else still sequential and bloated (per-round mem round-trips,
   branchy `%`/`select`/`<`/`select` idx/wrap, idx stored).
 
-Per-lane per-round slot count: 12 hash (vs 18) + ~6 idx/wrap = ~20 → ~18.
-PMU: alu 118784 → 81920, valu 0 → 12296, others unchanged.
+Per-lane per-round slot count: 12 hash (vs 18) + ~6 idx/wrap = ~18.
+PMU: alu 118784 -> 81920, valu 0 -> 12296, others unchanged.
+
+Passes correctness (8 seeds) and the `baseline < 147734` tier.
 
 ---
 
-## v2 — scratch-resident state + branchless idx
-                                                77 223 cyc   1.91×
+## Step 2 - scratch-resident state + branchless idx   77 223 cyc   1.91×
+
 Commit `ff00b76`. Plumbing fixes (no compute parallelism yet):
 
 - `val[256]`, `idx[256]` **resident in scratch** across all 16 rounds.
   Prologue `vload`s `val` once (32 vloads); `idx` starts at 0 (scratch is
-  zero-initialized → no init needed). Epilogue `vstore`s `val` once.
+  zero-initialized, no init needed). Epilogue `vstore`s `val` once.
   No per-round mem round-trips for lane state.
 - `val[i]` doubles as the running hash register via a shared transient
   8-word `work_vec` (lane 0 active for fma). Stage 5's final combine writes
-  `v` **directly into `val[i]`** — no separate copy-back op.
+  `v` **directly into `val[i]`** - no separate copy-back op.
 - Per-lane stage temps `t1[i]`, `t2[i]` (single-word, never shared across
-  lanes — no rename hazards when we later pack VLIW bundles).
+  lanes - no rename hazards when we later pack VLIW bundles).
 - **Branchless idx update**: `base = (idx<<1)|1`; `next = base + (v & 1)`.
   No `%`, no `select`, no flow port consumed.
 - **Wrap as build-time per-round decision**: verified that for the canonical
@@ -73,229 +91,217 @@ Commit `ff00b76`. Plumbing fixes (no compute parallelism yet):
 - Constants properly mapped: scalar (load const) + vector (vbroadcast) at
   prologue; reused across all 4096 hashes.
 - Pause-ordering fix: epilogue (vstore) BEFORE pause 2, so machine.mem holds
-  the final values when the test compares at the reference's final yield
-  (caught by `Incorrect result on round 1` during dev).
+  the final values when the test compares at the reference's final yield.
 
 PMU before/after:
 
-| engine   | v1 fires | v2 fires | delta |
-|----------|----------|----------|-------|
-| store    | 8192     | **32**   | −8160 (only final vstore) |
-| flow     | 8194     | **2**    | −8192 (branchless idx + build-time wrap) |
-| load     | 12565    | 4157     | −8408 (no idx/val re-reads) |
-| alu      | 81920    | 60736    | −21184 (dropped %/==/</select/* redundancies) |
-| valu     | 12294    | 12296    | unchanged (intrinsic fma count) |
+| engine | step 1   | step 2   | delta |
+|--------|----------|----------|-------|
+| store  | 8192     | **32**   | −8160 (only final vstore) |
+| flow   | 8194     | **2**    | −8192 (branchless idx + build-time wrap) |
+| load   | 12565    | 4157     | −8408 (no idx/val re-reads) |
+| alu    | 81920    | 60736    | −21184 (dropped %/==/</select/* redundancies) |
+| valu   | 12294    | 12296    | unchanged (intrinsic fma count) |
 
-Passes `submission_tests.py` correctness (8 seeds) and the first two speed
-tiers: baseline `< 147734`, updated-starting-point `< 18532`. Fails the
-`< 2164` tier (expected — that lives in the VLIW-packing + vectorization
-regime).
+Passes correctness (8 seeds) and two tiers: `baseline < 147734`,
+`updated-starting < 18532`.
 
 ---
 
-## v3a — cross-lane vectorization (8 lanes/group on `valu`)   12 911 cyc   11.44×
+## Step 3 - cross-lane vectorization (8 lanes/group)  12 911 cyc   11.44×
 
-First vectorization chunk: run `myhash` elementwise across VLEN=8 lanes per
-`valu` slot, 32 groups of 8. Still one slot per instruction bundle
-(`vliw=False`) — sophisticated VLIW packing is deliberately postponed; this
-pass is the functional 8-lane chunk ("naive loader" gather + full-vector hash).
+Commit `0a4b7b0`. Run `myhash` elementwise across VLEN=8 lanes per `valu`
+slot, 32 groups of 8. Still one slot per instruction bundle (`vliw=False`) -
+VLIW packing is deliberately postponed; this pass is the functional 8-lane
+chunk ("naive loader" gather + full-vector hash).
 
 - **Scratch reorg to a hard rule**: 256 words shared, then 5 words per lane
   across 256 lanes (= 1280), exhausting the 1536-word file. The per-lane
   sector is 5 contiguous planes of 256 (SoA): lane `i` owns one word per
   plane at `plane_base + i`, so group `g` (lanes 8g..8g+7) forms an
-  8-word contiguous vector at `plane_base + 8g` — vectorizable at zero
+  8-word contiguous vector at `plane_base + 8g` - vectorizable at zero
   gather cost. Planes: `val`, `idx`, `t1`, `t2`, `nv` (node_val landing).
   Shared sector (159/256 words used, 97 free) holds header, scalar consts,
-  broadcast vector consts, and the few genuinely-shared transients
-  (`addr_a` pointer; `addr_vec` gather-address vector, ≤1-cycle live;
-  `forest_p_vec` broadcast).
-- **Per-lane `t1`/`t2`/`nv`** (not shared) so distinct groups' in-flight stages
-  never alias — VLIW-packable without rename management later. The old v2
-  "single shared pair of stage temps" is gone; this costs 768 words of
-  scratch but removes a whole class of inter-group hazards ` la headroom
-  cost nothing (97 + 256×0 free).
+  broadcast vector consts, and the few genuinely-shared transients.
+- **Per-lane `t1`/`t2`/`nv`** (not shared) so distinct groups' in-flight
+  stages never alias - VLIW-packable without rename management later. Costs
+  768 words of scratch but removes a whole class of inter-group hazards.
 - **Hash fully on `valu`** (8 lanes/slot): 3 `multiply_add` fma stages + 3
   irreducible xor/add-shift stages (2 parallel elementwise transforms + `^`
   combine). `val_vec` doubles as the running hash reg; the final stage
-  leaves `v` there — zero copy-out (same dual-role trick as v2, now vector).
+  leaves `v` there - zero copy-out.
 - **Gather** is the one non-vectorizable op (ISA has no scatter/gather): per
   group, one `valu +` computes all 8 addresses (`addr_vec = idx_vec +
   forest_p_vec`), then 8 scalar `load`s land into the per-lane `nv` plane.
-  This is the "naive loader" — prefetch / dual-port packing / speculative
-  both-branch loads deferred (see v3b notes).
+  This is the "naive loader" - prefetch / dual-port packing / speculative
+  both-branch loads deferred.
 - **Branchless idx** on `valu`: `parity = v & 1`; `base = 2*idx + 1` (fma);
   `next = base + parity`. Wrap round (10): `idx &= zero_vec` in one slot.
 - **Entry XOR** is also `valu` (not `alu`): `val_vec = val_vec ^ nv_g`,
-  8 lanes in one slot. `alu` would need 8 scalar slots/lane and forfeit
-  the whole vectorization.
+  8 lanes in one slot.
 - Const-key collision handled: the literal `9` is both a multiplier (stage 4
   fma) and a shift amount (stage 3), so hash constants are split into
   `fma_vec_consts` vs `irr_vec_consts` dicts keyed by raw value.
 
 Per group per round (one slot/bundle): 1 addr valu + 8 loads + 1 xor +
 12 hash + 3 idx = 25 bundles (13 on the wrap round). The 8 scalar gathers
-are now the dominant cost — the load-port / prefetch lever is the clear
+are now the dominant cost - the load-port / prefetch lever is the clear
 next move.
 
 PMU (fires): valu 8656, load 4157 (4096 gathers + 32 vload + ~29 prologue),
-store 32, flow 2. `alu` reported counts are inflated by an artifact: the
-simulator's `valu` elementwise form internally calls `self.alu` per lane,
-so the PMU double-counts those as `alu` fires on every valu cycle — the
-scheduler-visible body work is all on the `valu` engine.
+store 32, flow 2. (`alu` counts are inflated by a simulator artifact: the
+`valu` elementwise form internally calls `self.alu` per lane, so the PMU
+double-counts those - the scheduler-visible body work is all on `valu`.)
 
-Passes `submission_tests.py` correctness (8 seeds) and the first two tiers
-(`baseline < 147734`, `updated-starting-point < 18532`). Next target: `< 2164`.
+Passes correctness (8 seeds) and two tiers (`baseline`, `updated-starting`).
 
 ---
 
-## v3b — (next) gather prefetch / VLIW packing
+## Step 4 - VLIW scheduler (random pick)              2 394 cyc   61.7×
 
-Status: not started. Two complementary levers, both targeting the gather
-(that's now the dominant 8-cyc/group/round):
+Commits `81d4efb`, `b443619`, `0e04a96`, `065f6d9`. DAG-driven VLIW packing
+replaces one-slot-per-bundle with a scheduler that packs multiple
+independent slots per cycle.
 
-1. **Dual-port prefetch / speculative both-branch loads** — the 2 load
-   ports/cyc are wasted at one-slot-per-bundle. Issue both possible next
-   node values (left & right child) ahead of the hash finishing, then select
-   the correct one after the parity bit is known. Trades 1 extra load +
-   1 select for hiding the gather latency entirely behind the hash compute.
-2. **VLIW packing** (`build(..., vliw=True)` exists but is unused) — pack the
-   hash's 12 valu slots into parallel bundles. Critical path is 9 cyc/lane
-   (6-stage chain 1+2+1+2+1+2), port-pressure bound (6 valu/cyc). Idealized
-   body ~7 cyc/group/round vs current 25 → ~2200 cyc, landing the `< 2164`
-   tier.
-
-Roofline reminders (see `notes/architecture.md`): compute floor ~1280–1600
-yc (12-slot hash × 4096 lane-rounds over 6 valu + 12 alu/cyc); the Opus-4.5
-1487 score sits in that band. Scratch-tree tricks are N/A (scratch has no
-indirect addressing; tree 2047 > scratch 1536)## v3b - V1 random VLIW scheduler                      ~2,394 cyc   61.7x
-
-Commit (pending). DAG-driven VLIW packing replaces one-slot-per-bundle
-with a scheduler that packs multiple independent slots per cycle.
-
-- **`scheduler.py`**: `slot_io` (full ISA dispatch -> reads/writes as
-  `(addr, is_vector)` pairs), `build_dag` (program-order walk with per-lane
-  `readers_since`, tagged-union `last_writer` (vec_node | list[Node|None]x8),
-  deduped RAW weight-1 + WAR weight-0 edges, bidirectional invariant
-  asserts, dead-write warning).
-- **`schedule_dag`**: v1 random placer. Random pick from frontier (including
-  partially-completed spillable nodes; no priority). Native engine first;
-  spillable `vec_elem` ops try `valu`-atomic, else spill to `alu` (sticky-alu
-  once spilled). WAR resolutions immediate (same-cycle unlock); RAW deferred
-  to end-of-cycle `advance()` (reflects read-before-write +1 latency). Debug
-  slots ride free (0-cycle). Panic on empty frontier with uncommitted nodes,
-  empty cycle, or cap exceeded.
-- **Scratch reorder**: planes first `[0..1279]` (8-aligned so every
-  `val_vec=base+8g` covers exactly one region), shared sector `[1280..1535]`
-  with 8-word vector regions before 1-word scalars. Required for the DAG's
-  region-keyed `last_writer`/`readers_since` bookkeeping.
-- **`build(vliw=True, seed=42)`** wired into `build_kernel` - the body is
-  scheduled; prologue/epilogue stay linear (one slot per bundle); the two
-  `pause`s bracket the scheduled body as hard start/end barriers.
+- **`scheduler.py`** (`81d4efb`, `b443619`): `slot_io` (full ISA dispatch ->
+  reads/writes as `(addr, is_vector)` pairs), `build_dag` (program-order walk
+  with per-lane `readers_since`, tagged-union `last_writer` (vec_node |
+  list[Node|None]×8), deduped RAW weight-1 + WAR weight-0 edges,
+  bidirectional invariant asserts, dead-write warning). Scratch reordered
+  plane-first (planes `[0..1279]`, shared sector `[1280..1535]` with
+  8-word vector regions before 1-word scalars) for the DAG's region-keyed
+  bookkeeping.
+- **`schedule_dag`** (`0e04a96`): v1 random placer. Random pick from
+  frontier (including partially-completed spillable nodes; no priority).
+  Native engine first; spillable `vec_elem` ops try `valu`-atomic, else
+  spill to `alu` (sticky-alu once spilled). WAR resolutions immediate
+  (same-cycle unlock); RAW deferred to end-of-cycle `advance()` (reflects
+  read-before-write +1 latency). Debug slots ride free (0-cycle).
+- **Wired into `build_kernel`** (`065f6d9`): `build(vliw=True, seed=42)`
+  routes the body through `build_dag + schedule_dag`. Prologue/epilogue stay
+  linear (one slot per bundle); the two `pause`s bracket the scheduled body
+  as hard start/end barriers.
 
 Cycle breakdown: prologue ~111 + body ~2219 + epilogue ~65 = ~2394.
 
-Passes `submission_tests.py` correctness (8 seeds) and the first **3** tiers:
-`baseline < 147734`, `updated-starting-point < 18532`, `opus4-many-hours
-< 2164`. Fails the 5 tiers below 2164 (1790/1579/1548/1487/1363).
+Passes correctness (8 seeds) and three tiers: `baseline`, `updated-starting`,
+`opus4-many-hours < 2164`.
 
 ---
 
-## v3c - V2 greedy VLIW scheduler                     ~2,236 cyc   66.1x
+## Step 5 - VLIW scheduler (greedy pick)              2 236 cyc   66.1×
 
-Commit (pending). Replaces v1 random pick with greedy: iterate the entire
+Commit `cedf93a`. Replaces v1 random pick with greedy: iterate the entire
 frontier in idx order, skip nodes that can't be placed (don't break), loop
 until no progress (WAR unlocks may add new placeable nodes), then advance.
 
-- No instruction priority (by design - future v3d). Vector ops still prefer
-  `valu`; spill to `alu` if `valu` full. Known limitation: `vec_elem` ops
-  (xor-shift stages) can greedily fill `valu` slots, blocking `vec_fma`
-  (`multiply_add`, valu-only) from scheduling. Priority (fma-first) would
-  fix this but is deferred.
+- No instruction priority (by design - future step 6). Vector ops still
+  prefer `valu`; spill to `alu` if `valu` full. Known limitation: `vec_elem`
+  ops (xor-shift stages) can greedily fill `valu` slots, blocking `vec_fma`
+  (`multiply_add`, valu-only) from scheduling.
 - `_try_place` refactored out of the inline loop; returns
-  (committed_count, emitted_non_debug) tuple or None. Shared by both v1
+  `(committed_count, emitted_non_debug)` tuple or None. Shared by both v1
   random and v2 greedy paths.
 - `schedule_dag` gains `greedy: bool = True` parameter; v1 random preserved
   as `greedy=False` for testing.
 
-Cycle count: 2394 (v1 random) -> 2236 (v2 greedy). Improvement from filling
-all engine slots each cycle instead of breaking on first failure.
+Improvement from filling all engine slots each cycle instead of breaking on
+first failure: 2394 -> 2236.
 
-Passes `submission_tests.py` correctness (8 seeds). Passes first 3 tiers
-(baseline, updated-starting, opus4-many-hours < 2164 is FAIL - 2236 > 2164
-by 72 cyc / 3.3%). The fma-priority fix (v3d) is expected to clear 2164.
+Passes correctness (8 seeds). Still passes the same three tiers (2236 < 2164
+is false - 72 cyc / 3.3% over). The fma-priority fix (step 6) clears 2164.
 
 ---
 
-## v3d - Tree preload levels 0-2 + fma-first picker    ~2,049 cyc   72.1x
+## Step 6 - tree preload levels 0-2 + fma-first picker 2 049 cyc   72.1×
 
-Commit (pending). Two changes:
+Commits `11fde8d`, `2e4c3f4`, `4528728`. Two changes:
 
-1. **fma-first picker** (scheduler): `schedule_dag` gains `picker` param.
-   `fma_first` (default) sorts frontier by (kind_priority, idx): vec_fma >
-   vec_elem > other > debug. Rationale: fma is valu-rigid; elem is spillable
-   to alu. Preferring fma ensures it gets a valu slot before elem fills them.
-   No cycle improvement at this stage (scheduler was gather-bound, not
-   valu-bound), but correct for when gather wall is lowered.
+1. **fma-first picker** (`11fde8d`, `2e4c3f4`): `schedule_dag` gains a
+   `picker` param. `fma_first` (default) sorts the frontier by
+   `(kind_priority, idx)`: `vec_fma` > `vec_elem` > other > debug. Rationale:
+   fma is valu-rigid; elem is spillable to `alu`. Preferring fma ensures it
+   gets a valu slot before elem fills them. Infrastructure only at this
+   stage - no cycle improvement by itself (the scheduler was gather-bound,
+   not valu-bound), but correct for when the gather wall is lowered.
 
-2. **Tree preload levels 0-2** (kernel): single `vload` reads tree[0..7]
-   (7 nodes = levels 0-2 + 1 bonus) into scratch at prologue. 7 `vbroadcast`s
-   create shared vector constants tree0_vec..tree6_vec. Rounds 0-2 replace
-   the 8-scalar-load gather with select-based node_val:
+2. **Tree preload levels 0-2** (`4528728`): single `vload` reads
+   `tree[0..7]` (7 nodes = levels 0-2 + 1 bonus) into scratch at prologue.
+   7 `vbroadcast`s create shared vector constants `tree0_vec`..`tree6_vec`.
+   Rounds 0-2 replace the 8-scalar-load gather with select-based node_val:
    - Round 0 (level 0): all idx=0. `nv_g = tree0_vec ^ zero` (1 valu, 0 loads).
    - Round 1 (level 1): idx in {1,2}. 1 `vselect` on idx bit 0 (1 valu + 1 flow).
    - Round 2 (level 2): idx in {3,4,5,6}. Subtract base 3, 2-level select
      on bits 0-1 (3 valu + 3 flow).
-   Total: 768 loads removed (3 rounds x 256 lanes). Body: ~2048 -> ~1664
-   load-bound. Total: ~2236 -> ~2049.
+   Total: 768 loads removed (3 rounds × 256 lanes). Body: ~2048 -> ~1664
+   load-bound. Total: 2236 -> 2049.
 
 Scratch additions: 8 (preload) + 56 (7 tree broadcast vecs) + 8 (three_vec) +
 16 (2 sel temp vecs) = 88 words. Free: 97 -> 9.
 
-Passes correctness (8 seeds) and 3/8 speed tiers: baseline, updated-starting,
-opus4-many-hours (< 2164). Fails 5 tiers below 2164 (1790/1579/1548/1487/1363).
+Passes correctness (8 seeds) and three tiers: `baseline`, `updated-starting`,
+`opus4-many-hours < 2164` (2049 < 2164, cleared the threshold step 5 missed).
 
 ---
 
-## v3e - (next) further gather dedup / priority tuning
+## Step 7 - tree preload, post-wrap rounds 11-13      1 799 cyc   82.1×
 
-Status: not started. The body is still gather-bound at ~1664 cyc (3328 loads
-from rounds 3-15 / 2 ports). Levers:
-1. Deeper preload (level 3-4) - diminishing returns per user's note.
-2. Cross-group gather sharing within a round (distinct idx broadcast).
-3. Instruction priority tuning (now that gather wall is partially lowered,
-   valu port pressure matters more).
+Commit `264ad0e`. After the uniform wrap at round 10, lanes return to root
+and descend through levels 0-2 again in rounds 11-13 (verified level
+determinism). Same preload tree vectors, same select logic - just extend the
+round checks: `r in (0, 11)` for level 0, `r in (1, 12)` for level 1,
+`r in (2, 13)` for level 2.
 
+Removes another 768 loads (3 rounds × 256 lanes). Total loads:
+4096 - 768×2 = 2560. At 2 load ports: 1280 cyc gather floor. Body ~1280.
+Total: 2049 -> 1799.
 
-Status: not started. Two levers toward the ~1300 realistic target:
+Passes correctness (8 seeds) and three tiers. 9 cyc short of `opus45-casual
+< 1790`.
 
-1. **Instruction priority** - prefer `vec_fma` (valu-only, rigid) over
-   `vec_elem` (spillable to alu) when both are in the frontier. Prevents
-   elementwise ops from saturating valu before fma gets a slot. Estimated
-   ~2000 cyc (clears < 2164).
-2. **Gather dedup** - exploit level-determinism (all lanes at same level per
-   round; verified). Early rounds have few distinct idx (round 0: 1, round 1:
-   2, ...). Broadcast shared loads; total distinct gathers ~899 (vs 4096 naive)
-   / 2 load ports ~ 450 cyc gather, overlapped with ~1024 cyc compute.
-   Estimated ~1300 cyc.
+---
+
+## Tools
+
+- `analyze_slots.py` (commit `cf59b74`): builds the kernel, extracts the
+  scheduled body bundles, and plots per-cycle slot usage by engine
+  (valu/load/alu/flow) as separate subplots, each scaled to its own capacity.
+  Two views: per-cycle bars (shows the alternating gather/compute pattern)
+  and 10-cycle rolling average (shows macro phase trends). Usage:
+  `python analyze_slots.py [--show] [--picker fma_first|idx|random]`.
+
+Slot utilization at step 7 (body, 1614 cycles):
+
+| engine | slots used | capacity | util | idle cycles |
+|--------|-----------|----------|------|-------------|
+| valu   | 7999      | 9684     | 82.6% | 1 |
+| load   | 2560      | 3228     | 79.3% | **334** |
+| alu    | 6665      | 19368    | 34.4% | 1019 |
+| flow   | 256       | 1614     | 15.9% | 1358 |
+
+The 334 idle load cycles are during the preload-select rounds (0-2, 11-13)
+where load ports sit idle while valu+alu do compute. The load alternation
+(2,0,2,0,...) during gather rounds shows the scheduler batching gathers
+rather than fully overlapping them with compute across rounds.
+
+---
+
+## Next levers
+
+The body is gather-bound at ~1280 cyc (2560 loads from rounds 3-10, 14-15 /
+2 ports). Levers toward the ~1300 realistic target:
+
+1. **Fill the 334 idle load cycles** - during preload-select rounds (0-2,
+   11-13), both load ports are idle. Better cross-round pipelining in the
+   scheduler could overlap gather-round loads with select-round compute.
+   The DAG allows it (round 3's gather depends on round 2's idx update, not
+   round 0's hash), but the scheduler isn't fully overlapping them.
+2. **Deeper preload (level 3-4)** - diminishing returns per prior
+   experimentation: select cost grows (3-7 vselects per level, flow is
+   1/cycle), and scratch is nearly exhausted (9 words free).
+3. **Gather dedup** - exploit level-determinism within a round: early gather
+   rounds have few distinct idx; broadcast shared loads.
 
 Roofline reminders (see `notes/architecture.md`): compute floor ~1280-1600
-cyc (12-slot hash x 4096 lane-rounds over 6 valu + 12 alu/cyc); the Opus-4.5
-1487 score sits in that band. Scratch-tree tricks are N/A (scratch has no
-indirect addressing; tree 2047 > scratch 1536).
-
-Status: not started. Two levers toward the ~1300 realistic target:
-
-1. **v2 greedy scheduler** - replace random pick with critical-path /
-  port-pressure-aware priority. Prefers `valu` (8x efficient); spills to `alu`
-  only under pressure. Fills both ports when possible. Estimated ~1700 cyc.
-2. **Gather dedup** - exploit level-determinism (all lanes at same level per
-  round; verified). Early rounds have few distinct idx (round 0: 1, round 1:
-  2, ...). Broadcast shared loads; total distinct gathers ~899 (vs 4096 naive)
-  / 2 load ports ~ 450 cyc gather, overlapped with ~1024 cyc compute.
-  Estimated ~1300 cyc.
-
-Roofline reminders (see `notes/architecture.md`): compute floor ~1280-1600
-cyc (12-slot hash x 4096 lane-rounds over 6 valu + 12 alu/cyc); the Opus-4.5
-1487 score sits in that band. Scratch-tree tricks are N/A (scratch has no
-indirect addressing; tree 2047 > scratch 1536).
+cyc (12-slot hash × 4096 lane-rounds over 6 valu + 12 alu/cyc); the
+Opus-4.5 1487 score sits in that band.
