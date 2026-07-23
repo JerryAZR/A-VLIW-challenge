@@ -220,23 +220,28 @@ class KernelBuilder:
         # per-group planes (nv_g for the gather address via self-addressing
         # loads; t2_g for the level-2 select intermediate) so no register is
         # written by more than one group -> no cross-group WAR dependency chains.
-        # CONST vectors: uniform CONST(value)*8 (vbroadcast of a literal).
-        mult4097_vec = self.alloc_scratch("mult4097_vec", VLEN)  # stage 0 fma mult
-        K0_vec       = self.alloc_scratch("K0_vec", VLEN)        # stage 0 addend
-        mult33_vec   = self.alloc_scratch("mult33_vec", VLEN)    # stage 2 fma mult
-        K2_vec       = self.alloc_scratch("K2_vec", VLEN)        # stage 2 addend
-        mult9_vec    = self.alloc_scratch("mult9_vec", VLEN)     # stage 4 fma mult
-        K4_vec       = self.alloc_scratch("K4_vec", VLEN)        # stage 4 addend
-        K1_vec       = self.alloc_scratch("K1_vec", VLEN)        # stage 1 xor const
-        K3_vec       = self.alloc_scratch("K3_vec", VLEN)        # stage 3 add const
-        K5_vec       = self.alloc_scratch("K5_vec", VLEN)        # stage 5 xor const
-        shift19_vec  = self.alloc_scratch("shift19_vec", VLEN)   # stage 1 shift
-        shift9_vec   = self.alloc_scratch("shift9_vec", VLEN)    # stage 3 shift
-        shift16_vec  = self.alloc_scratch("shift16_vec", VLEN)   # stage 5 shift
-        two_vec      = self.alloc_scratch("two_vec", VLEN)       # idx: 2*idx
-        one_vec      = self.alloc_scratch("one_vec", VLEN)       # idx: +1 / parity mask
-        zero_vec     = self.alloc_scratch("zero_vec", VLEN)      # wrap: idx &= 0
-        three_vec    = self.alloc_scratch("three_vec", VLEN)     # level-2 select base
+        # CONST vectors: uniform value*8. Small reusable ones are named
+        # const_vec_<value> and sorted by value (not tied to a step - e.g. 9 is
+        # both the stage-4 multiplier and the stage-3 shift). K0..K5 are the
+        # stage-specific hash addend/xor constants. No separate broadcast-source
+        # scalars: each is created by `load const` into its own lane 0, then
+        # self-broadcast (vbroadcast vec, vec) - see the prologue. Scalar uses of
+        # a value read the matching const_vec's lane 0.
+        const_vec_0    = self.alloc_scratch("const_vec_0", VLEN)
+        const_vec_1    = self.alloc_scratch("const_vec_1", VLEN)
+        const_vec_2    = self.alloc_scratch("const_vec_2", VLEN)
+        const_vec_3    = self.alloc_scratch("const_vec_3", VLEN)
+        const_vec_9    = self.alloc_scratch("const_vec_9", VLEN)     # stage4 mult + stage3 shift
+        const_vec_16   = self.alloc_scratch("const_vec_16", VLEN)   # stage5 shift
+        const_vec_19   = self.alloc_scratch("const_vec_19", VLEN)   # stage1 shift
+        const_vec_33   = self.alloc_scratch("const_vec_33", VLEN)   # stage2 mult
+        const_vec_4097 = self.alloc_scratch("const_vec_4097", VLEN) # stage0 mult
+        K0_vec = self.alloc_scratch("K0_vec", VLEN)   # stage 0 addend
+        K1_vec = self.alloc_scratch("K1_vec", VLEN)   # stage 1 xor const
+        K2_vec = self.alloc_scratch("K2_vec", VLEN)   # stage 2 addend
+        K3_vec = self.alloc_scratch("K3_vec", VLEN)   # stage 3 add const
+        K4_vec = self.alloc_scratch("K4_vec", VLEN)   # stage 4 addend
+        K5_vec = self.alloc_scratch("K5_vec", VLEN)   # stage 5 xor const
         # VAR vectors: runtime values (forest_p = header broadcast; tree_preload
         # = non-uniform vload of tree[0..7]; tree0..6 = its lane broadcasts).
         forest_p_vec = self.alloc_scratch("forest_p_vec", VLEN)
@@ -251,40 +256,34 @@ class KernelBuilder:
         tree_vecs = [tree0_vec, tree1_vec, tree2_vec,
                      tree3_vec, tree4_vec, tree5_vec, tree6_vec]
 
-        # (vec, literal) pairs broadcast in the prologue from CONST scalars.
+        # (vec, literal) pairs: the prologue `load const` lane 0 + self-broadcast.
         vec_bcasts = [
-            (mult4097_vec, 4097),        (K0_vec, 0x7ED55D16),
-            (mult33_vec,  33),            (K2_vec, 0x165667B1),
-            (mult9_vec,   9),             (K4_vec, 0xFD7046C5),
-            (K1_vec,      0xC761C23C),   (K3_vec, 0xD3A2646C),
-            (K5_vec,      0xB55A4F09),
-            (shift19_vec, 19),            (shift9_vec, 9),
-            (shift16_vec, 16),
-            (two_vec,     2),             (one_vec,  1),
-            (zero_vec,    0),
+            (const_vec_0, 0),    (const_vec_1, 1),    (const_vec_2, 2),
+            (const_vec_3, 3),    (const_vec_9, 9),    (const_vec_16, 16),
+            (const_vec_19, 19),  (const_vec_33, 33),  (const_vec_4097, 4097),
+            (K0_vec, 0x7ED55D16), (K1_vec, 0xC761C23C), (K2_vec, 0x165667B1),
+            (K3_vec, 0xD3A2646C), (K4_vec, 0xFD7046C5), (K5_vec, 0xB55A4F09),
         ]
 
-        # fma / irr split so literal `9` (mult in stage 4 vs shift in stage 3)
-        # doesn't collide as a dict key.
+        # Hash-stage consts by value. The literal `9` is shared (stage-4 mult +
+        # stage-3 shift both read const_vec_9); kept in two dicts only because
+        # fma stages read (mult, addend) and irr stages read (K, shift).
         fma_vec_consts = {
-            4097: mult4097_vec, 0x7ED55D16: K0_vec,
-            33:   mult33_vec,   0x165667B1: K2_vec,
-            9:    mult9_vec,    0xFD7046C5: K4_vec,
+            4097: const_vec_4097, 0x7ED55D16: K0_vec,
+            33:   const_vec_33,   0x165667B1: K2_vec,
+            9:    const_vec_9,    0xFD7046C5: K4_vec,
         }
         irr_vec_consts = {
             0xC761C23C: K1_vec, 0xD3A2646C: K3_vec, 0xB55A4F09: K5_vec,
-            19: shift19_vec, 9: shift9_vec, 16: shift16_vec,
+            19: const_vec_19, 9: const_vec_9, 16: const_vec_16,
         }
 
         # ---- Phase 3: scalar section (1 word each, CONST first then VAR) ----
-        # CONST scalars: named literals, then the broadcast-source consts
-        # (pre-allocated here so they land in the CONST section; the prologue
-        # bcast loop reuses them via scratch_const dedup, adding no instructions).
-        zero_const  = self.scratch_const(0, "zero")
+        # No per-vector broadcast-source scalars (self-broadcast from lane 0).
+        # The only CONST scalar is `eight` (vload/vstore stride of 8 - no matching
+        # const_vec_8 since 8 is never used as a vector). Scalar uses of 0 read
+        # const_vec_0's lane 0 (see prologue/epilogue).
         eight_const = self.scratch_const(8, "eight")     # vload/vstore stride
-        three_const = self.scratch_const(3, "three")     # level-2 select base
-        for _, value in vec_bcasts:
-            self.scratch_const(value)   # deduped; allocates the 13 bcast sources
         # VAR scalars: header vars (loaded from mem) + addr_a (vload/vstore ptr).
         for v in init_vars:
             self.alloc_scratch(v, 1)
@@ -300,7 +299,7 @@ class KernelBuilder:
             self.add("load", ("load",  self.scratch[v], addr_a))     # scratch[v] := mem[i]
 
         # vload val[256] as 32 vectors of 8 contiguous words from mem[inp_values_p..].
-        self.add("alu", ("+", addr_a, self.scratch["inp_values_p"], zero_const))
+        self.add("alu", ("+", addr_a, self.scratch["inp_values_p"], const_vec_0))
         for k in range(n_groups):
             self.add("load", ("vload", val_base + k * VLEN, addr_a))
             if k < n_groups - 1:
@@ -309,18 +308,19 @@ class KernelBuilder:
         # Broadcast forest_values_p (from a header var, not a literal).
         self.add("valu", ("vbroadcast", forest_p_vec, self.scratch["forest_values_p"]))
 
-        # Broadcast all hash-const / idx-helper vectors from literal scratch_consts.
+        # Create each const vector by `load const` into its own lane 0 then
+        # self-broadcast (vbroadcast vec, vec reads lane 0, writes all 8). No
+        # separate broadcast-source scalar needed.
         for vec_addr, value in vec_bcasts:
-            s = self.scratch_const(value)         # deduped by value; emits load const
-            self.add("valu", ("vbroadcast", vec_addr, s))
+            self.add("load", ("const", vec_addr, value))
+            self.add("valu", ("vbroadcast", vec_addr, vec_addr))
 
         # vload tree[0..7] (levels 0-2 = 7 nodes + 1 bonus) into tree_preload.
-        self.add("alu", ("+", addr_a, self.scratch["forest_values_p"], zero_const))
+        self.add("alu", ("+", addr_a, self.scratch["forest_values_p"], const_vec_0))
         self.add("load", ("vload", tree_preload, addr_a))
         # Broadcast tree[0..6] into shared vector constants.
         for i in range(7):
             self.add("valu", ("vbroadcast", tree_vecs[i], tree_preload + i))
-        self.add("valu", ("vbroadcast", three_vec, three_const))
 
         # Pause 1 -- match reference_kernel2's first yield (initial mem).
         self.add("flow", ("pause",))
@@ -347,11 +347,11 @@ class KernelBuilder:
                 # --- node_val gather or preload-select (rounds 0-2 use preloaded) ---
                 if r in (0, 11):
                     # Level 0: all lanes at idx=0. node_val = tree[0].
-                    body.append(("valu", ("^", nv_g, tree0_vec, zero_vec)))
+                    body.append(("valu", ("^", nv_g, tree0_vec, const_vec_0)))
                 elif r in (1, 12):
                     # Level 1: idx in {1,2}. 1 vselect on idx bit 0.
                     # idx=1 (bit0=1) -> tree[1]; idx=2 (bit0=0) -> tree[2].
-                    body.append(("valu", ("&", t1_g, idx_vec, one_vec)))   # cond = idx & 1
+                    body.append(("valu", ("&", t1_g, idx_vec, const_vec_1)))   # cond = idx & 1
                     body.append(("flow", ("vselect", nv_g, t1_g, tree1_vec, tree2_vec)))
                 elif r in (2, 13):
                     # Level 2: idx in {3,4,5,6}. Subtract level base (3), then
@@ -360,12 +360,12 @@ class KernelBuilder:
                     #   nv = bit1 ? (bit0?tree6:tree5) : (bit0?tree4:tree3)
                     # Uses only per-group temps: t1 (idx-3, then bit1), t2 (bit0,
                     # then the bit0?tree6:tree5 intermediate). No shared vector.
-                    body.append(("valu", ("-", t1_g, idx_vec, three_vec)))    # idx - 3
-                    body.append(("valu", ("&", t2_g, t1_g, one_vec)))        # bit 0 of (idx-3)
+                    body.append(("valu", ("-", t1_g, idx_vec, const_vec_3)))    # idx - 3
+                    body.append(("valu", ("&", t2_g, t1_g, const_vec_1)))        # bit 0 of (idx-3)
                     body.append(("flow", ("vselect", nv_g, t2_g, tree4_vec, tree3_vec)))  # bit0?tree4:tree3
                     body.append(("flow", ("vselect", t2_g, t2_g, tree6_vec, tree5_vec)))  # bit0?tree6:tree5 (t2 reused)
-                    body.append(("valu", (">>", t1_g, t1_g, one_vec)))        # (idx-3) >> 1
-                    body.append(("valu", ("&", t1_g, t1_g, one_vec)))        # bit 1 of (idx-3)
+                    body.append(("valu", (">>", t1_g, t1_g, const_vec_1)))        # (idx-3) >> 1
+                    body.append(("valu", ("&", t1_g, t1_g, const_vec_1)))        # bit 1 of (idx-3)
                     body.append(("flow", ("vselect", nv_g, t1_g, t2_g, nv_g)))  # bit1?intermediate:nv
                 else:
                     # Rounds 3+: gather from mem. Compute the gather address
@@ -395,11 +395,11 @@ class KernelBuilder:
                 if is_wrap:
                     # Verified: on this round, all 256 lanes are at leaf,
                     # so next = 2*idx + 1 + parity >= n_nodes -> wrap to 0.
-                    body.append(("valu", ("&", idx_vec, idx_vec, zero_vec)))
+                    body.append(("valu", ("&", idx_vec, idx_vec, const_vec_0)))
                 else:
-                    body.append(("valu", ("&", t1_g, val_vec, one_vec)))        # parity = v & 1
+                    body.append(("valu", ("&", t1_g, val_vec, const_vec_1)))        # parity = v & 1
                     body.append(("valu", ("multiply_add", t2_g,
-                                           idx_vec, two_vec, one_vec)))         # base = 2*idx + 1
+                                           idx_vec, const_vec_2, const_vec_1)))         # base = 2*idx + 1
                     body.append(("valu", ("+", idx_vec, t2_g, t1_g)))          # next = base + parity
                 body.append(("debug", ("vcompare", idx_vec, keywr)))
 
@@ -411,7 +411,7 @@ class KernelBuilder:
         # =====================================================================
         # Epilogue: vstore val[256] back to mem[inp_values_p .. +256]
         # =====================================================================
-        self.add("alu", ("+", addr_a, self.scratch["inp_values_p"], zero_const))
+        self.add("alu", ("+", addr_a, self.scratch["inp_values_p"], const_vec_0))
         for k in range(n_groups):
             self.add("store", ("vstore", addr_a, val_base + k * VLEN))
             if k < n_groups - 1:
