@@ -336,3 +336,51 @@ rounds-outer + `random` seed=42 = 1773.
 Passes correctness (8 seeds) and **four** tiers: `baseline`,
 `updated-starting`, `opus4-many-hours`, `opus45-casual < 1790`. 194 cyc short
 of `opus45-2hr < 1579`.
+
+---
+
+## Step 9 - weighted picker (property-weighted priority)   1 599 cyc   92.4×
+
+Commits (this step). Replace the static priority pickers (`idx`/
+`fma_first`/lucky-`random`) with a weighted scoring function over static
+per-node properties, with weights found by random search.
+
+**Structure** (`scheduler.py`): each node carries a `NodeProps` (computed
+once at DAG build via backward DP), holding four normalized (0..1) properties:
+
+  - `sink` - dist_to_sink: longest cycle-weighted path (RAW=1, WAR=0) to a
+    sink (critical-path urgency).
+  - `load` - dist_to_load: cycle-distance to the nearest downstream load (0
+    for loads; 1 = no downstream load). Lower = feeds the gather sooner.
+  - `raw` - #RAW dependents (unblocked next cycle).
+  - `war` - #WAR dependents (unblocked same cycle).
+
+Plus rigidity as **mutable placement state** (on `_Placement`, not a static
+prop): a node is rigid unless it's a fresh (un-spilled) `vec_elem`.
+
+The weighted picker scores `score = w_sink·sink - w_load·load + w_raw·raw +
+w_war·war + w_rigid·is_rigid_now` (higher = scheduled first, max-heap via
+negation; `idx` is the final tiebreaker for determinism). `load` is
+subtracted because low dist_to_load = urgent.
+
+**Weight search** (`sweep_picker.py`): random search over discrete weights
+(negatives included), printing each new best. ~180 samples found the region
+in ~3 min; refinement around the winner pushed further. All deterministic
+priority fns land ~1822-1827; `random`+seed42 = 1773; the weighted winner =
+**1599**.
+
+Shipped weights: `Weights(sink=-2, load=4, raw=-6, war=7, rigid=2)`.
+
+The signs are the interesting result:
+  - `load=+4`, `war=+7` (strong positives) - keep the load ports saturated
+    and unblock same-cycle work. The two throughput drivers.
+  - `rigid=+2` - prioritize nodes with no fallback (the fma_first signal,
+    generalized to atomic/pinned-alu).
+  - `sink=-2`, `raw=-4` (negatives!) - *deprioritize* critical-path and
+    RAW-fan-out. In a throughput-bound schedule, chasing the critical path
+    or next-cycle unblocks hurts; same-cycle (war) and load-feeding win.
+
+Passes correctness (8 seeds) and **four** tiers: `baseline`,
+`updated-starting`, `opus4-many-hours`, `opus45-casual < 1790`. 20 cyc short
+of `opus45-2hr < 1579`. (Next: the clear-win op/edge reductions, then real
+picker training once the architecture is stable.)

@@ -20,6 +20,7 @@ from collections import defaultdict
 import random
 import unittest
 
+from scheduler import Weights
 from problem import (
     Engine,
     DebugInfo,
@@ -49,7 +50,8 @@ class KernelBuilder:
         return DebugInfo(scratch_map=self.scratch_debug)
 
     def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False,
-              seed: int | None = None, picker: str = "fma_first"):
+              seed: int | None = None, picker: str = "fma_first",
+              weights=None):
         """Convert a slot list into instruction bundles.
 
         vliw=False: one slot per bundle (the original sequential packing).
@@ -63,7 +65,7 @@ class KernelBuilder:
         from scheduler import DAG, schedule
         dag = DAG(slots)
         cap = len(slots)  # worst case: 1 slot/cycle
-        return schedule(dag, seed=seed, cap=cap, picker=picker)
+        return schedule(dag, seed=seed, cap=cap, picker=picker, weights=weights)
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
@@ -400,7 +402,9 @@ class KernelBuilder:
                     body.append(("valu", ("+", idx_vec, t2_g, t1_g)))          # next = base + parity
                 body.append(("debug", ("vcompare", idx_vec, keywr)))
 
-        body_instrs = self.build(body, vliw=True, seed=42, picker="random")
+        body_instrs = self.build(body, vliw=True, seed=42, picker="weighted",
+                                   weights=Weights(sink=-2, load=4, raw=-6,
+                                                   war=7, rigid=2))
         self.instrs.extend(body_instrs)
 
         # =====================================================================

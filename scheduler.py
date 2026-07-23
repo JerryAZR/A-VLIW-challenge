@@ -32,6 +32,7 @@ operand reads pre-cycle state, every write commits at end of cycle):
 from dataclasses import dataclass, field
 import heapq
 import random
+from typing import NamedTuple
 
 from problem import VLEN, SLOT_LIMITS
 
@@ -40,6 +41,31 @@ from problem import VLEN, SLOT_LIMITS
 # register aliases the 8 scalars in its 8-word region, which the dependency
 # table tracks so a vector read depends on per-lane scalar writes (the gather).
 Reg = tuple[int, bool]
+
+# Sentinel for "no downstream load" in dist_to_load (before normalization).
+NO_LOAD = 10**6
+
+
+class NodeProps(NamedTuple):
+    """Static per-node scheduling properties, normalized to 0..1.
+    Higher = more urgent for sink/raw/war; for load LOWER = more urgent
+    (0 = this node is a load; 1 = no downstream load)."""
+    sink: float   # dist_to_sink / max  (longest RAW=1/WAR=0 path to a sink)
+    load: float   # dist_to_load / max  (cycle-distance to nearest downstream load)
+    raw: float    # #RAW dependents / max  (unblocked next cycle)
+    war: float    # #WAR dependents / max  (unblocked same cycle)
+
+
+class Weights(NamedTuple):
+    """Multiplier for each NodeProps term in the weighted picker's score
+    (score = sink*props.sink - load*props.load + raw*props.raw
+             + war*props.war + rigid*is_rigid_now; higher = scheduled first).
+    load is subtracted because low dist_to_load = urgent."""
+    sink: float
+    load: float
+    raw: float
+    war: float
+    rigid: float
 
 # Flow ops that modify the PC - the DAG cannot represent control flow.
 # Hitting one means a jump leaked into the body.
@@ -341,6 +367,8 @@ class DAG:
             if self._raw[i] == 0 and self._war[i] == 0:
                 self._frontier.add(i)
 
+        self.props: list[NodeProps] = self._compute_props()
+
     # -- queries ----------------------------------------------------------
 
     def ready(self) -> set[int]:
@@ -406,6 +434,18 @@ class DAG:
         """Node has zero unresolved in-edges (frontier-eligible)."""
         return self._raw[idx] == 0 and self._war[idx] == 0
 
+    def reset(self) -> None:
+        """Reset dynamic scheduling state for re-scheduling the same DAG
+        (e.g. sweeping picker weights). Static graph + props are untouched."""
+        n = len(self.nodes)
+        for node in self.nodes:
+            self._raw[node.idx] = sum(1 for _, w in node.in_edges if w == 1)
+            self._war[node.idx] = sum(1 for _, w in node.in_edges if w == 0)
+        self._pending = [0] * n
+        self._committed = [False] * n
+        self._frontier = {i for i in range(n)
+                          if self._raw[i] == 0 and self._war[i] == 0}
+
     # -- construction -----------------------------------------------------
 
     @staticmethod
@@ -458,6 +498,47 @@ class DAG:
                     f"Node {n.idx}: out-edge ({dst_idx},{w}) not in dst in_edges")
 
         return nodes
+
+    def _compute_props(self) -> list[NodeProps]:
+        """Static per-node scheduling properties (normalized to 0..1), derived
+        once from the DAG (reverse program order is a topological order since
+        all edges go low->high idx):
+          sink - dist_to_sink: longest cycle-weighted path (RAW=1, WAR=0) to a
+                 sink. Higher = feeds a longer chain = more urgent.
+          load - dist_to_load: cycle-distance to the nearest downstream load
+                 (0 for loads). Lower = feeds the gather sooner = more urgent;
+                 1.0 = no downstream load.
+          raw  - #RAW dependents (unblocked next cycle). Higher = more urgent.
+          war  - #WAR dependents (unblocked same cycle). Higher = more urgent.
+        """
+        n = len(self.nodes)
+        n_raw = [sum(1 for _, w in node.out_edges if w == 1) for node in self.nodes]
+        n_war = [sum(1 for _, w in node.out_edges if w == 0) for node in self.nodes]
+        dist_to_sink = [0] * n
+        dist_to_load = [NO_LOAD] * n
+        for node in reversed(self.nodes):
+            best_sink = 0
+            best_load = NO_LOAD
+            for dst, w in node.out_edges:
+                d = w + dist_to_sink[dst]
+                if d > best_sink:
+                    best_sink = d
+                dl = dist_to_load[dst]
+                if dl != NO_LOAD:
+                    d2 = w + dl
+                    if d2 < best_load:
+                        best_load = d2
+            dist_to_sink[node.idx] = best_sink
+            dist_to_load[node.idx] = 0 if node.engine == "load" else best_load
+        max_sink = max(dist_to_sink) or 1
+        max_load = max((d for d in dist_to_load if d != NO_LOAD), default=1) or 1
+        max_raw = max(n_raw) or 1
+        max_war = max(n_war) or 1
+        return [NodeProps(dist_to_sink[i] / max_sink,
+                          1.0 if dist_to_load[i] == NO_LOAD else dist_to_load[i] / max_load,
+                          n_raw[i] / max_raw,
+                          n_war[i] / max_war)
+                for i in range(n)]
 
 
 # ---------------------------------------------------------------------------
@@ -625,20 +706,41 @@ class FuncUnitPool:
         return p.lanes_done == p.lanes_total
 
 
-def _make_picker(picker: str, placements: list[_Placement], rng: random.Random):
+def _make_picker(picker: str, placements: list[_Placement], rng: random.Random,
+                 props: list[NodeProps] | None = None,
+                 weights: Weights | None = None):
     """Return a sort key for a node index (lower = higher priority)."""
     if picker == "idx":
         return lambda idx: idx
     if picker == "random":
         return lambda idx: rng.random()
-    # "fma_first" (default): vec_fma < vec_elem < rest < debug, then idx.
-    def _key(idx):
-        return (_KIND_PRIORITY.get(placements[idx].kind, 9), idx)
-    return _key
+    if picker == "fma_first":
+        # vec_fma < vec_elem < rest < debug, then idx.
+        def _key(idx):
+            return (_KIND_PRIORITY.get(placements[idx].kind, 9), idx)
+        return _key
+    if picker == "weighted":
+        # score = sink*sink - load*load + raw*raw + war*war + rigid*is_rigid_now;
+        # higher = scheduled first (max-heap via negation). is_rigid_now is
+        # mutable placement state: a node is rigid unless it's a fresh
+        # (un-spilled) vec_elem. Computed at push time, so partial vec_elem
+        # (lanes_done>0 -> sticky alu) read as rigid when re-pushed next cycle.
+        w = weights
+        def _key(idx):
+            p = props[idx]
+            pl = placements[idx]
+            rigid = (pl.kind != _KIND_VEC_ELEM) or (pl.lanes_done > 0)
+            score = (w.sink * p.sink - w.load * p.load
+                     + w.raw * p.raw + w.war * p.war
+                     + w.rigid * (1 if rigid else 0))
+            return -score
+        return _key
+    raise ValueError(f"Unknown picker: {picker}")
 
 
 def schedule(dag: DAG, *, seed: int | None = None,
-             cap: int | None = None, picker: str = "fma_first") -> list[dict]:
+             cap: int | None = None, picker: str = "fma_first",
+             weights: Weights | None = None) -> list[dict]:
     """List-schedule a ``DAG`` into VLIW bundles.
 
     Each cycle:
@@ -664,6 +766,8 @@ def schedule(dag: DAG, *, seed: int | None = None,
       ``"fma_first"`` - vec_fma < vec_elem < rest < debug (default)
       ``"idx"``       - program order
       ``"random"``    - random key per node (uses ``seed``)
+      ``"weighted"``  - score = Σ weight·property (max-heap); pass ``weights``
+                       (a ``Weights`` of sink/load/raw/war/rigid)
 
     Returns a list of bundles (``dict[engine, list[instruction]]``), one per
     cycle that placed at least one instruction. Debug-only bundles cost 0
@@ -677,7 +781,7 @@ def schedule(dag: DAG, *, seed: int | None = None,
     if cap is None:
         cap = len(dag) + 1
 
-    key_fn = _make_picker(picker, placements, rng)
+    key_fn = _make_picker(picker, placements, rng, dag.props, weights)
 
     pool = FuncUnitPool()
     bundles: list[dict] = []

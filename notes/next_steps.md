@@ -5,31 +5,29 @@ Living planning document (updated as the plan evolves). The optimization log
 holds the current tier matrix, the next levers, and forward-looking design
 notes.
 
-## Current tier status (after step 8: 1773 cyc)
+## Current tier status (after step 9: 1599 cyc)
 
 | tier                     | threshold | status |
 |--------------------------|-----------|--------|
 | baseline                 | 147 734   | PASS   |
 | updated-starting         | 18 532    | PASS   |
 | opus4-many-hours         | 2 164     | PASS   |
-| opus45-casual            | 1 790     | **PASS** (cleared at step 8) |
-| opus45-2hr               | 1 579     | FAIL (194 cyc short) |
+| opus45-casual            | 1 790     | PASS   |
+| opus45-2hr               | 1 579     | FAIL (20 cyc short) |
 | sonnet45                 | 1 548     | FAIL   |
 | opus45-11hr              | 1 487     | FAIL   |
 | opus45-improved-harness  | 1 363     | FAIL   |
 
-Shipped config: rounds-outer loop, `random` picker (seed=42) = **1773 cyc**.
+Shipped config: rounds-outer loop, weighted picker
+`Weights(sink=-2, load=4, raw=-6, war=7, rigid=2)` = **1599 cyc**.
 
 ## Where we are
 
-The cross-group WAR is gone (step 8): the body is loop-order-independent and
-gather-bound at ~1280 cyc (2560 loads from rounds 3-10, 14-15 / 2 ports). The
-readiness lower bound is the within-group hash critical path (~223 RAW edges)
-in both loop orders, so the body is resource-bound, not dependency-bound.
-
-All deterministic priority functions (`idx`, `fma_first`) land at ~1822-1827;
-`random`+seed=42 hits 1773 via a lucky shuffle (variance 1729-1799 across
-seeds). The picker is confirmed sub-optimal.
+The cross-group WAR is gone (step 8) and the picker is now property-weighted
+(step 9, weights found by random search). The body is loop-order-independent
+and gather-bound at ~1280 cyc (2560 loads / 2 ports). 1599 = 185 fixed
+prologue/epilogue + ~1414 body; the body is ~134 cyc over the 1280 load
+floor.
 
 ## Next levers (order = do the clear wins first, then train)
 
@@ -39,14 +37,14 @@ seeds). The picker is confirmed sub-optimal.
    - hash-stage algebraic reductions beyond the verified 12-slot form,
    - collapsing the idx-update ops,
    - trimming debug edges (debug vcompares are 0-cycle but still graph nodes).
-2. **Fill the 334 idle load cycles** - during preload-select rounds (0-2,
-   11-13) both load ports sit idle. The clean DAG (no cross-group WAR) now
-   lets the scheduler overlap gather-round loads with select-round compute
-   across groups; a better picker realizes this.
-3. **Trained picker** (planned): replace the static priority functions with a
-   learned scoring function (e.g. sum of weight * node-property). Requires an
-   otherwise stable architecture, so land the clear-win op/edge reductions
-   first.
+2. **Fill the remaining ~134 body cycles over the load floor** - overlap
+   gather-round loads with select-round compute across groups. The weighted
+   picker (load=+4, war=+7) already pushes this; a better load-feeding
+   strategy (prefetch / both load ports) could close more.
+3. **Real picker training** (planned): the weighted picker's 5 weights were
+   found by ~180 random samples + refinement. Real training (e.g. gradient /
+   Bayesian opt over weights, or a learned scoring net) needs a stable
+   architecture first - land the op/edge reductions, then train.
 
 ## Deferred: Direction 2 (IR + register allocator)
 
