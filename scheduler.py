@@ -28,6 +28,7 @@ slot reads pre-cycle state, every write commits at end of cycle):
 """
 
 from dataclasses import dataclass, field
+import heapq
 import random
 
 from problem import VLEN, SLOT_LIMITS
@@ -590,23 +591,33 @@ def schedule(dag: DAG, *, seed: int | None = None,
     """List-schedule a ``DAG`` into VLIW bundles.
 
     Each cycle:
-      1. Take the DAG's ready set as the working set.
-      2. Feed ready nodes (priority-ordered) to a ``FuncUnitPool``, which
-         assigns units and fills slots; loop until no WAR unlock adds
-         new placeable nodes.
-      3. Advance the cycle (deferred RAW resolutions become ready).
+      1. Seed a priority queue (the working set) from the DAG's ready set.
+      2. Pop nodes in priority order and place each via the ``FuncUnitPool``,
+         which assigns units and fills slots. A fully-placed node commits
+         immediately; the same-cycle WAR unlocks it produces are pushed
+         straight back onto the queue (no re-scan of the working set).
+      3. Append the cycle's bundle and advance (deferred RAW resolutions
+         become ready next cycle).
 
     Spillable elementwise ``valu`` ops fall back to ``alu`` scalar lanes
     (sticky, splittable across cycles) when ``valu`` is saturated.
     ``vec_fma`` (``multiply_add``) is rigid - no scalar fma exists.
 
+    A node that doesn't fully place this cycle - no unit had room
+    (``place`` returns None) or a partial vec_elem spill (False) - is left
+    uncommitted in the frontier; ``dag.ready()`` returns it next cycle with
+    ``lanes_done`` carried over (placements persist across cycles). Slots
+    never free mid-cycle, so neither case is retried within the same cycle.
+
     ``picker`` selects node ordering within a cycle:
       ``"fma_first"`` - vec_fma < vec_elem < rest < debug (default)
       ``"idx"``       - program order
-      ``"random"``    - shuffled each pass (uses ``seed``)
+      ``"random"``    - random key per node (uses ``seed``)
 
     Returns a list of bundles (``dict[engine, list[slot]]``), one per cycle
-    that emitted at least one non-debug slot.
+    that placed at least one slot. Debug-only bundles cost 0 cycles in the
+    simulator (only bundles with a non-debug engine advance ``cycle``), so a
+    trailing debug flush contributes nothing to the cycle count.
     """
     rng = random.Random(seed)
     placements = [_classify(n) for n in dag.nodes]
@@ -623,42 +634,38 @@ def schedule(dag: DAG, *, seed: int | None = None,
     total = len(dag)
 
     while committed < total:
-        working = dag.ready()
-        if not working:
+        ready = dag.ready()
+        if not ready:
             raise RuntimeError(
                 f"scheduler: frontier empty with {total - committed} "
                 f"uncommitted nodes at C={C} - cyclic DAG or counter bug")
 
         pool.reset()
-        # Feed ready nodes (priority-ordered) to the pool; loop until no WAR
-        # unlock adds new placeable nodes.
-        progress = True
-        while progress:
-            progress = False
-            for idx in sorted(working, key=key_fn):
-                if dag.is_committed(idx):
-                    working.discard(idx)
-                    continue
-                finished = pool.place(dag[idx], placements[idx])
-                if finished is None:
-                    continue                    # no unit had room - skip
-                if finished:                    # yes: all lanes landed -> commit
-                    unlocked = dag.commit(idx)
-                    committed += 1
-                    if unlocked:
-                        working.update(unlocked)
-                        progress = True
-                # finished is False: partial - placed some lanes, retry
-                # next cycle with carried-over lanes_done (no commit).
+        # Working set for this cycle: a priority queue of the ready nodes.
+        working: list[tuple] = []
+        for idx in ready:
+            heapq.heappush(working, (key_fn(idx), idx))
 
-        if committed >= total:
-            break
-        if not pool.has_work:
+        # Pop in priority order; place each. A fully-placed node commits and
+        # pushes its same-cycle WAR unlocks back onto the queue. Nodes that
+        # don't fully place (None / False) fall through - they stay in the
+        # frontier and come back next cycle with carried-over lanes_done.
+        while working:
+            _, idx = heapq.heappop(working)
+            if pool.place(dag[idx], placements[idx]):
+                committed += 1
+                for u in dag.commit(idx):
+                    heapq.heappush(working, (key_fn(u), u))
+
+        # A cycle that placed nothing (ready was non-empty but no node fit any
+        # unit) is stuck. A debug-only flush is fine - it costs 0 cycles.
+        if not pool.bundle and committed < total:
             raise RuntimeError(
                 f"scheduler: empty cycle at C={C} - stuck "
-                f"(frontier had {len(working)} nodes but none were placeable)")
-        dag.advance()
+                f"({len(ready)} ready nodes but none were placeable)")
+
         bundles.append(pool.bundle)
+        dag.advance()
         C += 1
         if C > cap:
             raise RuntimeError(
