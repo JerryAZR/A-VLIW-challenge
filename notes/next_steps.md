@@ -5,7 +5,7 @@ Living planning document (updated as the plan evolves). The optimization log
 holds the current tier matrix, the next levers, and forward-looking design
 notes.
 
-## Current tier status (after step 11: 1559 cyc - temporary regression)
+## Current tier status (after step 12: 1535 cyc)
 
 | tier                     | threshold | status |
 |--------------------------|-----------|--------|
@@ -14,22 +14,34 @@ notes.
 | opus4-many-hours         | 2 164     | PASS   |
 | opus45-casual            | 1 790     | PASS   |
 | opus45-2hr               | 1 579     | PASS   |
-| sonnet45                 | 1 548     | FAIL (11 cyc short - temporary, was PASS at 1546) |
-| opus45-11hr              | 1 487     | FAIL   |
+| sonnet45                 | 1 548     | PASS   |
+| opus45-11hr              | 1 487     | FAIL (48 cyc short) |
 | opus45-improved-harness  | 1 363     | FAIL   |
 
 Shipped config: rounds-outer loop, weighted picker
-`Weights(sink=-1, load=1, raw=-2, war=-2, rigid=-1)`, store tree address
-(addr = idx + forest_p) = **1559 cyc** (temporary +13 vs the idx-scheme's 1546;
-traded for 704 fewer nodes + 7-shorter critical path as the base for follow-ups).
+`Weights(sink=-1, load=1, raw=-2, war=-2, rigid=-1)`, store tree address +
+parity-carry selects = **1535 cyc**.
+
+## DAG quality (the honest metric - cycles depend on the untrained picker)
+
+| metric              | idx (s10) | addr (s11) | addr+parity (s12) |
+|---------------------|----------:|-----------:|------------------:|
+| nodes               | 16 864    | 16 160     | 15 776            |
+| height (crit path)  | 223       | 216        | 204               |
+| RAW edges           | 23 840    | 23 104     | 22 720            |
+| WAR edges           | 14 208    | 20 416     | 20 352            |
+| valu nodes          | 8 832     | 8 640      | 8 256             |
+
+The addr direction (steps 11-12) now beats idx on every structural metric and
+on cycles. WAR edges remain high (addr read+written every round) - the main
+lever for the trained picker.
 
 ## Where we are
 
-Step 11 stored the tree address directly (addr = idx + forest_p), cutting 704
-nodes and 7 off the critical path (223->216) - the structural base for the
-next optimizations. Temporary +13 cycle regression: the gather-add was
-load-bound (free), the select-round idx recovery (`addr − forest_p`) is
-compute-bound, and WAR edges jumped. Weights re-tuned for the new DAG.
+Step 11 stored the tree address (addr = idx + forest_p); step 12 eliminated the
+select-round idx recovery via parity-carry (t1_g holds the prior round's
+parity = the level select bit) and addr-compare (addr < forest_p+5 for the
+level-2 high bit). Net from idx-scheme: -1088 nodes, -19 height, -576 valu.
 
 ## Next levers (order = do the clear wins first, then train)
 

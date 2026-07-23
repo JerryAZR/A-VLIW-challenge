@@ -449,3 +449,46 @@ edges dominate differently now).
 Passes correctness (8 seeds) and **five** tiers: `baseline`, `updated-starting`,
 `opus4-many-hours`, `opus45-casual`, `opus45-2hr < 1579`. 11 cyc short of
 `sonnet45 < 1548` (a tier the idx-scheme cleared - temporary).
+
+---
+
+## Step 12 - parity-carry + addr-compare selects (on addr-scheme)   1 535 cyc   96.2×
+
+Commit (this step). Eliminate the select-round `idx = addr − forest_p` recovery
+(the compute-bound part that made step 11 regress) with two ideas:
+
+1. **Parry carried in `t1_g`**: the next-addr writes `parity = val & 1` into
+   `t1_g` as its last step. At the next round's start `t1_g` still holds it -
+   and it *is* the level-1 select bit (`idx = 1 + parity`). So round 1/12
+   collapses to one `vselect` (1 flow op, no idx recovery / `& 1`). It also
+   feeds round 2/13's bit-0: `bit0(idx−3) = bit0(2·(idx₁−1) + parity₁) =
+   parity₁` = the carried `t1_g`.
+2. **`addr < pos_fp5`** for the level-2 high bit: `{3,4}` vs `{5,6}` is just
+   `addr < forest_p + 5` (broadcast `pos_fp5 = 5 + forest_p`). One `<` valu
+   replaces idx-recovery + shift + and.
+
+Also: `neg_fp1` now a `valu` sub (1 op, no scalar temp/broadcast); new
+`pos_fp5_vec` (5 + forest_p, 2 prologue valu).
+
+### DAG quality (structure - honest; cycles depend on the untrained picker)
+
+| metric              | idx (step 10) | addr (step 11) | addr+parity (step 12) |
+|---------------------|--------------:|---------------:|----------------------:|
+| nodes               | 16 864        | 16 160         | **15 776**            |
+| height (crit path)  | 223           | 216            | **204**               |
+| RAW edges           | 23 840        | 23 104         | **22 720**            |
+| WAR edges           | 14 208        | 20 416         | 20 352                |
+| valu nodes          | 8 832         | 8 640          | **8 256**             |
+| cycles (current wts)| 1 546         | 1 559          | **1 535**             |
+
+Step 12 alone: −384 nodes, −12 height, −384 valu, −64 WAR. The addr direction
+now beats the idx-scheme on every structural metric *and* on cycles. WAR edges
+remain high (the addr plane is read+written every round) - the lever for the
+trained picker.
+
+Passes correctness (8 seeds) and **six** tiers: `baseline`, `updated-starting`,
+`opus4-many-hours`, `opus45-casual`, `opus45-2hr < 1579`, `sonnet45 < 1548`.
+48 cyc short of `opus45-11hr < 1487`.
+
+*(Going forward, log entries include DAG-quality metrics - structure is honest
+where the untrained picker's cycle count is not.)*

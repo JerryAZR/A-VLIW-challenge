@@ -246,6 +246,7 @@ class KernelBuilder:
         # = non-uniform vload of tree[0..7]; tree0..6 = its lane broadcasts).
         forest_p_vec = self.alloc_scratch("forest_p_vec", VLEN)
         neg_fp1_vec  = self.alloc_scratch("neg_fp1_vec", VLEN)  # 1 - forest_p (next-addr: 2*addr + neg_fp1 + parity)
+        pos_fp5_vec  = self.alloc_scratch("pos_fp5_vec", VLEN)  # 5 + forest_p
         tree_preload = self.alloc_scratch("tree_preload", VLEN)  # 8 words: tree[0..7]
         tree0_vec = self.alloc_scratch("tree0_vec", VLEN)
         tree1_vec = self.alloc_scratch("tree1_vec", VLEN)
@@ -323,9 +324,10 @@ class KernelBuilder:
             self.add("valu", ("vbroadcast", vec_addr, vec_addr))
 
         # neg_fp1 = 1 - forest_values_p (used by the next-addr update). Computed
-        # after the bcast loop so const_vec_1 (lane 0 = 1) is ready.
-        self.add("alu", ("-", addr_a, const_vec_1, self.scratch["forest_values_p"]))
-        self.add("valu", ("vbroadcast", neg_fp1_vec, addr_a))
+        self.add("valu", ("-", neg_fp1_vec, const_vec_1, forest_p_vec))
+        # pos_fp5 = 5 + forest_values_p (used by the next-addr update). Computed
+        self.add("valu", ("+", pos_fp5_vec, const_vec_2, const_vec_3)) # pos_fp5 = 5
+        self.add("valu", ("+", pos_fp5_vec, pos_fp5_vec, forest_p_vec))
 
         # vload tree[0..7] (levels 0-2 = 7 nodes + 1 bonus) into tree_preload.
         self.add("alu", ("+", addr_a, self.scratch["forest_values_p"], const_vec_0))
@@ -370,21 +372,17 @@ class KernelBuilder:
                 elif r in (1, 12):
                     # Level 1: idx in {1,2}. Recover idx = addr - forest_p,
                     # then 1 vselect on idx bit 0 (idx=1 -> tree1, idx=2 -> tree2).
-                    body.append(("valu", ("-", t1_g, addr_vec, forest_p_vec)))  # idx = addr - forest_p
-                    body.append(("valu", ("&", t1_g, t1_g, const_vec_1)))      # cond = idx & 1
-                    body.append(("flow", ("vselect", nv_g, t1_g, tree1_vec, tree2_vec)))
+                    # parity from last round was in t1_g
+                    body.append(("flow", ("vselect", nv_g, t1_g, tree2_vec, tree1_vec)))
                 elif r in (2, 13):
                     # Level 2: idx in {3,4,5,6}. Recover idx, subtract level
                     # base (3), then 2-level select on bits 0-1 of (idx-3).
                     #   idx-3=0->tree3, 1->tree4, 2->tree5, 3->tree6
-                    body.append(("valu", ("-", t1_g, addr_vec, forest_p_vec)))  # idx = addr - forest_p
-                    body.append(("valu", ("-", t1_g, t1_g, const_vec_3)))       # idx - 3
-                    body.append(("valu", ("&", t2_g, t1_g, const_vec_1)))        # bit 0 of (idx-3)
-                    body.append(("flow", ("vselect", nv_g, t2_g, tree4_vec, tree3_vec)))  # bit0?tree4:tree3
-                    body.append(("flow", ("vselect", t2_g, t2_g, tree6_vec, tree5_vec)))  # bit0?tree6:tree5 (t2 reused)
-                    body.append(("valu", (">>", t1_g, t1_g, const_vec_1)))        # (idx-3) >> 1
-                    body.append(("valu", ("&", t1_g, t1_g, const_vec_1)))        # bit 1 of (idx-3)
-                    body.append(("flow", ("vselect", nv_g, t1_g, t2_g, nv_g)))  # bit1?intermediate:nv
+
+                    body.append(("flow", ("vselect", nv_g, t1_g, tree4_vec, tree3_vec)))  # bit0?tree4:tree3
+                    body.append(("flow", ("vselect", t2_g, t1_g, tree6_vec, tree5_vec)))  # bit0?tree6:tree5
+                    body.append(("valu", ("<", t1_g, addr_vec, pos_fp5_vec)))   # low?
+                    body.append(("flow", ("vselect", nv_g, t1_g, nv_g, t2_g)))  # low?intermediate:nv
                 else:
                     # Rounds 3+: gather from mem. addr_vec already holds the
                     # tree address (idx + forest_p), so the loads read it
