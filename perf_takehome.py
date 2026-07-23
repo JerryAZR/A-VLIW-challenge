@@ -60,10 +60,10 @@ class KernelBuilder:
         """
         if not vliw:
             return [{engine: [slot]} for engine, slot in slots]
-        from scheduler import build_dag, schedule_dag
-        nodes, frontier = build_dag(slots)
+        from scheduler import DAG, schedule
+        dag = DAG(slots)
         cap = len(slots)  # worst case: 1 slot/cycle
-        return schedule_dag(nodes, frontier, seed=seed, cap=cap, picker=picker)
+        return schedule(dag, seed=seed, cap=cap, picker=picker)
 
     def add(self, engine, slot):
         self.instrs.append({engine: [slot]})
