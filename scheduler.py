@@ -432,13 +432,14 @@ _KIND_PRIORITY = {
     _KIND_DEBUG: 3,          # free; schedule last so real work fills first
 }
 
-# Engines the scheduler hands out per-cycle slots from.
-_SCHED_ENGINES = ("alu", "valu", "load", "store", "flow")
-
 
 @dataclass
 class _Placement:
-    """Scheduler-side per-node state: classification + spill progress."""
+    """Per-node scheduling state: classification + spill progress.
+
+    Owned by the scheduler (persists across cycles); mutated by the
+    ``FuncUnitPool`` during placement.
+    """
     kind: str
     lanes_total: int                  # 1 atomic; 8 spillable vec_elem; 0 debug
     native_engine: str                # alu / load / store / flow / valu / debug
@@ -484,6 +485,94 @@ def _vec_slot_to_alu_lanes(slot: tuple, lanes) -> list[tuple]:
     return [(op, dest + j, a1 + j, a2 + j) for j in lanes]
 
 
+class FuncUnitPool:
+    """Per-cycle functional-unit pool: assigns nodes to units and tracks
+    slot occupation.
+
+    The scheduler feeds it ready nodes one at a time; for each, the pool
+    answers whether it fits and where, updating its own occupation state.
+    The scheduler resets the pool at the start of every cycle and reads
+    back the assembled bundle at cycle end - it never reasons about ports
+    or realisation itself.
+
+    Lifecycle::
+
+        pool = FuncUnitPool()
+        while ...:
+            pool.reset()                          # cycle begin
+            ...
+            finished = pool.place(node, placement)  # yes / partial / no
+            ...
+            bundles.append(pool.bundle)           # cycle end - all placements
+    """
+
+    # Per-engine slot budgets (refreshed by reset() each cycle).
+    _CAPACITY = {e: SLOT_LIMITS[e] for e in ("alu", "valu", "load", "store", "flow")}
+
+    def __init__(self):
+        self.free: dict[str, int] = {}
+        self.bundle: dict[str, list] = {}
+        self.reset()
+
+    def reset(self) -> None:
+        """Clear slot budgets and the bundle for a new cycle."""
+        self.free = dict(self._CAPACITY)
+        self.bundle = {}
+
+    @property
+    def has_work(self) -> bool:
+        """True if any non-debug slot was emitted this cycle."""
+        return any(e != "debug" for e in self.bundle)
+
+    def place(self, node: DNode, p: _Placement) -> bool | None:
+        """Try to place a single node this cycle.
+
+        Updates occupation state and ``p`` (lanes landed / sticky engine)
+        when the node is placed. Returns:
+
+          True  - yes: placed and complete (caller commits to the DAG)
+          False - partial: placed some lanes, needs more cycles
+          None  - no: no unit had room; nothing changed
+        """
+        if p.kind == _KIND_DEBUG:
+            self.bundle.setdefault("debug", []).append(node.slot)
+            return True
+
+        if p.kind == _KIND_VEC_ELEM:
+            if p.lanes_done > 0:              # sticky alu continuation
+                return self._spill_alu(node, p)
+            if self.free["valu"] > 0:         # fresh: prefer one valu slot
+                self.bundle.setdefault("valu", []).append(node.slot)
+                self.free["valu"] -= 1
+                p.lanes_done = p.lanes_total
+                p.engine_choice = "valu"
+                return True
+            return self._spill_alu(node, p)   # else spill to alu
+
+        # Atomic: alu / load / store / flow / vec_fma
+        eng = p.native_engine
+        if self.free[eng] == 0:
+            return None
+        self.bundle.setdefault(eng, []).append(node.slot)
+        self.free[eng] -= 1
+        p.lanes_done = p.lanes_total
+        p.engine_choice = eng
+        return True
+
+    def _spill_alu(self, node: DNode, p: _Placement) -> bool | None:
+        """Land as many remaining vec_elem lanes as fit on the alu unit."""
+        take = min(p.lanes_total - p.lanes_done, self.free["alu"])
+        if take == 0:
+            return None
+        for s in _vec_slot_to_alu_lanes(
+                node.slot, range(p.lanes_done, p.lanes_done + take)):
+            self.bundle.setdefault("alu", []).append(s)
+        self.free["alu"] -= take
+        p.lanes_done += take
+        p.engine_choice = "alu"
+        return p.lanes_done == p.lanes_total
+
+
 def _make_picker(picker: str, placements: list[_Placement], rng: random.Random):
     """Return a sort key for a node index (lower = higher priority)."""
     if picker == "idx":
@@ -496,68 +585,15 @@ def _make_picker(picker: str, placements: list[_Placement], rng: random.Random):
     return _key
 
 
-def _try_place(node: DNode, p: _Placement, cycle_bundle: dict, free: dict):
-    """Try to place ``node`` into the current cycle's bundle.
-
-    Returns ``(finished, emitted)`` if placed (``finished`` is False for a
-    partial spill needing more cycles), or ``None`` if the node can't be
-    placed at all (its engine/port is full).
-
-      finished - all lanes landed; the caller should ``dag.commit(idx)``
-      emitted  - a non-debug slot was emitted this call
-    """
-    if p.kind == _KIND_DEBUG:
-        cycle_bundle.setdefault("debug", []).append(node.slot)
-        return (True, False)
-
-    if p.kind == _KIND_VEC_ELEM:
-        # Partial spill in progress -> sticky alu.
-        if p.lanes_done > 0:
-            take = min(p.lanes_total - p.lanes_done, free["alu"])
-            if take == 0:
-                return None
-            for s in _vec_slot_to_alu_lanes(
-                    node.slot, range(p.lanes_done, p.lanes_done + take)):
-                cycle_bundle.setdefault("alu", []).append(s)
-            free["alu"] -= take
-            p.lanes_done += take
-            return (p.lanes_done == p.lanes_total, True)
-        # Fresh: prefer valu-atomic, else spill to alu.
-        if free["valu"] > 0:
-            cycle_bundle.setdefault("valu", []).append(node.slot)
-            free["valu"] -= 1
-            p.lanes_done = p.lanes_total
-            p.engine_choice = "valu"
-            return (True, True)
-        take = min(p.lanes_total, free["alu"])
-        if take == 0:
-            return None
-        for s in _vec_slot_to_alu_lanes(node.slot, range(0, take)):
-            cycle_bundle.setdefault("alu", []).append(s)
-        free["alu"] -= take
-        p.lanes_done += take
-        p.engine_choice = "alu"
-        return (p.lanes_done == p.lanes_total, True)
-
-    # Atomic: alu / load / store / flow / vec_fma
-    eng = p.native_engine
-    if free[eng] == 0:
-        return None
-    cycle_bundle.setdefault(eng, []).append(node.slot)
-    free[eng] -= 1
-    p.lanes_done = p.lanes_total
-    p.engine_choice = eng
-    return (True, True)
-
-
 def schedule(dag: DAG, *, seed: int | None = None,
              cap: int | None = None, picker: str = "fma_first") -> list[dict]:
     """List-schedule a ``DAG`` into VLIW bundles.
 
     Each cycle:
       1. Take the DAG's ready set as the working set.
-      2. Greedily fill engine slots in priority order (skip on port-full,
-         loop until no WAR unlock adds new placeable nodes).
+      2. Feed ready nodes (priority-ordered) to a ``FuncUnitPool``, which
+         assigns units and fills slots; loop until no WAR unlock adds
+         new placeable nodes.
       3. Advance the cycle (deferred RAW resolutions become ready).
 
     Spillable elementwise ``valu`` ops fall back to ``alu`` scalar lanes
@@ -580,6 +616,7 @@ def schedule(dag: DAG, *, seed: int | None = None,
 
     key_fn = _make_picker(picker, placements, rng)
 
+    pool = FuncUnitPool()
     bundles: list[dict] = []
     C = 0
     committed = 0
@@ -592,11 +629,9 @@ def schedule(dag: DAG, *, seed: int | None = None,
                 f"scheduler: frontier empty with {total - committed} "
                 f"uncommitted nodes at C={C} - cyclic DAG or counter bug")
 
-        free = {e: SLOT_LIMITS[e] for e in _SCHED_ENGINES}
-        cycle_bundle: dict = {}
-        emitted = False
-
-        # Greedily fill slots; loop until no WAR unlock adds new candidates.
+        pool.reset()
+        # Feed ready nodes (priority-ordered) to the pool; loop until no WAR
+        # unlock adds new placeable nodes.
         progress = True
         while progress:
             progress = False
@@ -604,27 +639,26 @@ def schedule(dag: DAG, *, seed: int | None = None,
                 if dag.is_committed(idx):
                     working.discard(idx)
                     continue
-                result = _try_place(dag[idx], placements[idx], cycle_bundle, free)
-                if result is None:
-                    continue                    # port full - skip
-                finished, did_emit = result
-                if did_emit:
-                    emitted = True
-                if finished:
+                finished = pool.place(dag[idx], placements[idx])
+                if finished is None:
+                    continue                    # no unit had room - skip
+                if finished:                    # yes: all lanes landed -> commit
                     unlocked = dag.commit(idx)
                     committed += 1
                     if unlocked:
                         working.update(unlocked)
                         progress = True
+                # finished is False: partial - placed some lanes, retry
+                # next cycle with carried-over lanes_done (no commit).
 
         if committed >= total:
             break
-        if not emitted:
+        if not pool.has_work:
             raise RuntimeError(
                 f"scheduler: empty cycle at C={C} - stuck "
                 f"(frontier had {len(working)} nodes but none were placeable)")
         dag.advance()
-        bundles.append(cycle_bundle)
+        bundles.append(pool.bundle)
         C += 1
         if C > cap:
             raise RuntimeError(
