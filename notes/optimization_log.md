@@ -531,3 +531,42 @@ the -13 is pure scheduling improvement.)
 Passes correctness (8 seeds) and **six** tiers: `baseline`, `updated-starting`,
 `opus4-many-hours`, `opus45-casual`, `opus45-2hr < 1579`, `sonnet45 < 1548`.
 35 cyc short of `opus45-11hr < 1487`.
+
+---
+
+## Step 14 - add idx property + longer training   1 459 cyc   101.4×
+
+The 5-property picker (sink/load/raw/war/rigid) plateaued at 1514 cyc.
+Adding program-order `idx` (normalized 0..1) as a 6th weighted property broke
+through: the trained picker found `idx=-4` (strongly negative = reverse program
+order) unlocks a much better schedule. The idx weight lets the picker decide
+how much locality/ordering matters (was only a tiebreaker before).
+
+Training: coordinate descent with random restarts + fine refinement
+(`train_picker.py`, checkpointed to `_best_weights.txt` for chained runs).
+Also tried scipy differential_evolution and broad random search - all converge
+on the same optimum. ~2500+ evals total across runs.
+
+Winner: `Weights(sink=-3, load=-1.5, raw=-0.25, war=6, rigid=0.25, idx=-4)` =
+**1459 cyc** (-55 vs step 13's 1514, -76 vs step 12's 1535). The `idx=-4`
+(reverse program order) is the dominant new signal; `war=6` (same-cycle
+unblock) and `sink=-3` (deprioritize critical path) remain strong.
+
+### DAG quality (unchanged from step 12 - picker-only steps 13-14)
+
+| metric              | step 12 (= 13 = 14) |
+|---------------------|--------------------:|
+| nodes               | 15 776              |
+| height (crit path)  | 204                 |
+| RAW edges           | 22 720              |
+| WAR edges           | 20 352              |
+| valu nodes          | 8 256               |
+| cycles              | 1 535 -> 1 522 -> **1 459** |
+
+(DAG unchanged across steps 13-14; the -76 is pure scheduling improvement from
+better picker weights, first via coordinate descent on 5 properties, then
+adding idx as a 6th.)
+
+Passes correctness (8 seeds) and **seven** tiers: `baseline`, `updated-starting`,
+`opus4-many-hours`, `opus45-casual`, `opus45-2hr < 1579`, `sonnet45 < 1548`,
+`opus45-11hr < 1487`. 96 cyc short of `opus45-improved-harness < 1363`.

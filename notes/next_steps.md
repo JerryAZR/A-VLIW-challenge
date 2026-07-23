@@ -5,7 +5,7 @@ Living planning document (updated as the plan evolves). The optimization log
 holds the current tier matrix, the next levers, and forward-looking design
 notes.
 
-## Current tier status (after step 13: 1522 cyc)
+## Current tier status (after step 14: 1459 cyc)
 
 | tier                     | threshold | status |
 |--------------------------|-----------|--------|
@@ -15,26 +15,37 @@ notes.
 | opus45-casual            | 1 790     | PASS   |
 | opus45-2hr               | 1 579     | PASS   |
 | sonnet45                 | 1 548     | PASS   |
-| opus45-11hr              | 1 487     | FAIL (35 cyc short) |
-| opus45-improved-harness  | 1 363     | FAIL   |
+| opus45-11hr              | 1 487     | PASS   |
+| opus45-improved-harness  | 1 363     | FAIL (96 cyc short) |
 
-Shipped config: rounds-outer loop, **trained** weighted picker
-`Weights(sink=-3.5, load=-0.25, raw=0.5, war=2, rigid=4)` = **1522 cyc**.
+Shipped config: rounds-outer loop, trained weighted picker (6 properties)
+`Weights(sink=-3, load=-1.5, raw=-0.25, war=6, rigid=0.25, idx=-4)` = **1459 cyc**.
 
-## DAG quality (unchanged since step 12; steps 12-13 are picker-only)
+## DAG quality (unchanged since step 12; steps 13-14 are picker-only)
 
-| metric              | idx (s10) | addr (s11) | addr+parity (s12-13) |
+| metric              | idx (s10) | addr (s11) | addr+parity (s12-14) |
 |---------------------|----------:|-----------:|---------------------:|
 | nodes               | 16 864    | 16 160     | 15 776               |
 | height (crit path)  | 223       | 216        | 204                  |
 | RAW edges           | 23 840    | 23 104     | 22 720               |
 | WAR edges           | 14 208    | 20 416     | 20 352               |
 | valu nodes          | 8 832     | 8 640      | 8 256                |
-| cycles              | 1 546     | 1 559      | 1 535 -> **1 522**   |
+| cycles              | 1 546     | 1 559      | 1 535 -> 1522 -> **1 459** |
 
-The addr direction (steps 11-12) cut structure; step 13 trained the picker on
-that fixed DAG (-13 cyc, pure scheduling). WAR edges remain the lever - the
-high- addr-plane read/write churn that the picker must navigate.
+The addr direction (steps 11-12) cut structure; steps 13-14 trained the picker
+(5 props -> 6 props with idx). The 5-prop picker plateaued at 1514; adding idx
+(reverse program order, idx=-4) broke through to 1459. Picker training
+converged (coordinate descent + DE + random search all agree on the optimum).
+
+## Next levers
+
+The picker has plateaued at 1459 with 6 linear properties. To go lower:
+1. **Richer features**: property interactions (e.g. sink×load, war×rigid) or
+   new properties (engine-specific urgency, remaining-capacity-aware).
+2. **Structural reductions**: reduce WAR edges (20k, the addr-plane churn) or
+   reduce the prologue (123 cyc of setup).
+3. **Direction 2 (IR + register allocator)**: automate scratch management for
+   further kernel restructuring.
 
 ## Next levers (order = do the clear wins first, then train)
 
