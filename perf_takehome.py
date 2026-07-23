@@ -180,22 +180,27 @@ class KernelBuilder:
         WRAP_ROUND = forest_height   # verified: all lanes at leaf on round=h -> wrap to root
 
         # =====================================================================
-        # Scratch layout: planes first (8-aligned), shared sector last.
+        # Scratch layout: planes, then vector section (CONST, VAR), then scalar
+        # section (CONST, VAR). All 8-word vectors follow the 5x256 plane sector
+        # so every vector is 8-aligned (one vector == one region); scalars are
+        # packed after.
         #
-        #   [   0.. 255]  plane 0 : val[256]   (running hash + carried state)
-        #   [ 256.. 511]  plane 1 : idx[256]   (tree index, zero-init)
-        #   [ 512.. 767]  plane 2 : t1[256]    (per-lane stage scratch)
-        #   [ 768..1023]  plane 3 : t2[256]    (per-lane stage scratch)
-        #   [1024..1279]  plane 4 : nv[256]    (node_val landing / spare)
-        #   [1280..1535]  shared sector (256 words):
-        #                   8-word vector regions first  (forest_p_vec,
-        #                     12 hash-const vecs, two/one/zero_vec = 16 vecs)
-        #                   then 1-word scalars (header 7, zero/eight/addr_a,
-        #                     _src scalars for broadcasts)
+        #   [   0..1279]  per-lane planes: val, idx, t1, t2, nv (5 x 256)
+        #   [1280.. ...]  vector section (8 words each):
+        #                   CONST vecs: mult4097/K0/mult33/K2/mult9/K4/K1/K3/
+        #                     K5/shift19/shift9/shift16/two/one/zero/three (16)
+        #                   VAR vecs: forest_p/tree_preload/tree0..tree6 (9)
+        #   [ ... .. ...]  scalar section (1 word each):
+        #                   CONST scalars: zero/eight/three + 13 bcast sources (16)
+        #                   VAR scalars: 7 header vars + addr_a (8)
+        #   [ ... ..1535]  free (32 words)
         #
         # Planes-first guarantees every val_vec = base + 8g is 8-aligned so a
-        # vector write covers exactly one region — essential for the DAG builder's
-        # region-keyed last_writer/readers_since bookkeeping.
+        # vector write covers exactly one region - essential for the DAG
+        # builder's region-keyed last_writer/readers_since bookkeeping.
+        # No addr_vec/sel_lo_vec/sel_hi_vec: those short-lived temporaries reuse
+        # per-group planes (nv_g for gather addr via self-addressing loads; t2_g
+        # for the level-2 select intermediate) -> no cross-group WAR chains.
         # =====================================================================
 
         init_vars = [
@@ -210,30 +215,43 @@ class KernelBuilder:
         t2_base  = self.alloc_scratch("t2",  V)   # plane 3
         nv_base  = self.alloc_scratch("nv",  V)   # plane 4
 
-        # ---- Phase 2: 8-word vector regions (shared sector, 8-aligned) ----
-        # No instructions emitted yet — broadcasts happen in prologue.
-        # No addr_vec / sel_lo_vec / sel_hi_vec: those short-lived temporaries
-        # reuse per-group planes (nv_g for the gather address via self-addressing
+        # ---- Phase 2: vector section (8-word regions, CONST first then VAR) ----
+        # No addr_vec/sel_lo_vec/sel_hi_vec: those short-lived temporaries reuse
+        # per-group planes (nv_g for the gather address via self-addressing
         # loads; t2_g for the level-2 select intermediate) so no register is
         # written by more than one group -> no cross-group WAR dependency chains.
+        # CONST vectors: uniform CONST(value)*8 (vbroadcast of a literal).
+        mult4097_vec = self.alloc_scratch("mult4097_vec", VLEN)  # stage 0 fma mult
+        K0_vec       = self.alloc_scratch("K0_vec", VLEN)        # stage 0 addend
+        mult33_vec   = self.alloc_scratch("mult33_vec", VLEN)    # stage 2 fma mult
+        K2_vec       = self.alloc_scratch("K2_vec", VLEN)        # stage 2 addend
+        mult9_vec    = self.alloc_scratch("mult9_vec", VLEN)     # stage 4 fma mult
+        K4_vec       = self.alloc_scratch("K4_vec", VLEN)        # stage 4 addend
+        K1_vec       = self.alloc_scratch("K1_vec", VLEN)        # stage 1 xor const
+        K3_vec       = self.alloc_scratch("K3_vec", VLEN)        # stage 3 add const
+        K5_vec       = self.alloc_scratch("K5_vec", VLEN)        # stage 5 xor const
+        shift19_vec  = self.alloc_scratch("shift19_vec", VLEN)   # stage 1 shift
+        shift9_vec   = self.alloc_scratch("shift9_vec", VLEN)    # stage 3 shift
+        shift16_vec  = self.alloc_scratch("shift16_vec", VLEN)   # stage 5 shift
+        two_vec      = self.alloc_scratch("two_vec", VLEN)       # idx: 2*idx
+        one_vec      = self.alloc_scratch("one_vec", VLEN)       # idx: +1 / parity mask
+        zero_vec     = self.alloc_scratch("zero_vec", VLEN)      # wrap: idx &= 0
+        three_vec    = self.alloc_scratch("three_vec", VLEN)     # level-2 select base
+        # VAR vectors: runtime values (forest_p = header broadcast; tree_preload
+        # = non-uniform vload of tree[0..7]; tree0..6 = its lane broadcasts).
         forest_p_vec = self.alloc_scratch("forest_p_vec", VLEN)
-        mult4097_vec = self.alloc_scratch("mult4097_vec", VLEN)
-        K0_vec       = self.alloc_scratch("K0_vec", VLEN)
-        mult33_vec   = self.alloc_scratch("mult33_vec", VLEN)
-        K2_vec       = self.alloc_scratch("K2_vec", VLEN)
-        mult9_vec    = self.alloc_scratch("mult9_vec", VLEN)
-        K4_vec       = self.alloc_scratch("K4_vec", VLEN)
-        K1_vec       = self.alloc_scratch("K1_vec", VLEN)
-        K3_vec       = self.alloc_scratch("K3_vec", VLEN)
-        K5_vec       = self.alloc_scratch("K5_vec", VLEN)
-        shift19_vec  = self.alloc_scratch("shift19_vec", VLEN)
-        shift9_vec   = self.alloc_scratch("shift9_vec", VLEN)
-        shift16_vec  = self.alloc_scratch("shift16_vec", VLEN)
-        two_vec      = self.alloc_scratch("two_vec", VLEN)
-        one_vec     = self.alloc_scratch("one_vec", VLEN)
-        zero_vec     = self.alloc_scratch("zero_vec", VLEN)
+        tree_preload = self.alloc_scratch("tree_preload", VLEN)  # 8 words: tree[0..7]
+        tree0_vec = self.alloc_scratch("tree0_vec", VLEN)
+        tree1_vec = self.alloc_scratch("tree1_vec", VLEN)
+        tree2_vec = self.alloc_scratch("tree2_vec", VLEN)
+        tree3_vec = self.alloc_scratch("tree3_vec", VLEN)
+        tree4_vec = self.alloc_scratch("tree4_vec", VLEN)
+        tree5_vec = self.alloc_scratch("tree5_vec", VLEN)
+        tree6_vec = self.alloc_scratch("tree6_vec", VLEN)
+        tree_vecs = [tree0_vec, tree1_vec, tree2_vec,
+                     tree3_vec, tree4_vec, tree5_vec, tree6_vec]
 
-        # Collect (vec_addr, value) pairs for deferred broadcasts (prologue).
+        # (vec, literal) pairs broadcast in the prologue from CONST scalars.
         vec_bcasts = [
             (mult4097_vec, 4097),        (K0_vec, 0x7ED55D16),
             (mult33_vec,  33),            (K2_vec, 0x165667B1),
@@ -245,16 +263,6 @@ class KernelBuilder:
             (two_vec,     2),             (one_vec,  1),
             (zero_vec,    0),
         ]
-
-        # ---- Phase 3: 1-word scalars (after all 8-word vec regions) ----
-        # Header vars (loaded from mem, not const — just reserve space).
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        # Literal constants (scratch_const emits `load const`).
-        zero_const   = self.scratch_const(0, "zero")
-        eight_const  = self.scratch_const(8, "eight")
-        three_const  = self.scratch_const(3, "three")  # level-2 base offset for select
-        addr_a       = self.alloc_scratch("addr_a", 1)   # vload/vstore pointer
 
         # fma / irr split so literal `9` (mult in stage 4 vs shift in stage 3)
         # doesn't collide as a dict key.
@@ -268,28 +276,21 @@ class KernelBuilder:
             19: shift19_vec, 9: shift9_vec, 16: shift16_vec,
         }
 
+        # ---- Phase 3: scalar section (1 word each, CONST first then VAR) ----
+        # CONST scalars: named literals, then the broadcast-source consts
+        # (pre-allocated here so they land in the CONST section; the prologue
+        # bcast loop reuses them via scratch_const dedup, adding no instructions).
+        zero_const  = self.scratch_const(0, "zero")
+        eight_const = self.scratch_const(8, "eight")     # vload/vstore stride
+        three_const = self.scratch_const(3, "three")     # level-2 select base
+        for _, value in vec_bcasts:
+            self.scratch_const(value)   # deduped; allocates the 13 bcast sources
+        # VAR scalars: header vars (loaded from mem) + addr_a (vload/vstore ptr).
+        for v in init_vars:
+            self.alloc_scratch(v, 1)
+        addr_a = self.alloc_scratch("addr_a", 1)
+
         assert self.scratch_ptr <= SCRATCH_SIZE, "scratch overflow"
-
-        # ---- Phase 3b: tree preload for levels 0-2 (gather dedup) ----
-        # Single vload reads mem[forest_values_p + 0..7] (7 nodes = levels 0-2,
-        # plus 1 bonus). Then 7 vbroadcasts create shared vector constants
-        # tree0_vec..tree6_vec so any group can select its node_val without
-        # gathering from mem for rounds 0-2.
-        tree_preload = self.alloc_scratch("tree_preload", VLEN)  # 8 words: tree[0..7]
-        tree0_vec = self.alloc_scratch("tree0_vec", VLEN)
-        tree1_vec = self.alloc_scratch("tree1_vec", VLEN)
-        tree2_vec = self.alloc_scratch("tree2_vec", VLEN)
-        tree3_vec = self.alloc_scratch("tree3_vec", VLEN)
-        tree4_vec = self.alloc_scratch("tree4_vec", VLEN)
-        tree5_vec = self.alloc_scratch("tree5_vec", VLEN)
-        tree6_vec = self.alloc_scratch("tree6_vec", VLEN)
-        # No sel_lo_vec/sel_hi_vec: the level-2 select uses t2_g as its
-        # intermediate (see body) so it stays per-group - no shared write.
-        tree_vecs = [tree0_vec, tree1_vec, tree2_vec,
-                     tree3_vec, tree4_vec, tree5_vec, tree6_vec]
-        three_vec = self.alloc_scratch("three_vec", VLEN)  # broadcast of 3 for level-2 select
-
-        assert self.scratch_ptr <= SCRATCH_SIZE, "scratch overflow (tree preload)"
 
         # =====================================================================
         # Prologue: load header; vload val[256]; broadcast consts; pause
