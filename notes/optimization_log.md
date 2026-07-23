@@ -384,3 +384,28 @@ Passes correctness (8 seeds) and **four** tiers: `baseline`,
 `updated-starting`, `opus4-many-hours`, `opus45-casual < 1790`. 20 cyc short
 of `opus45-2hr < 1579`. (Next: the clear-win op/edge reductions, then real
 picker training once the architecture is stable.)
+
+---
+
+## Step 10 - overlap epilogue vstores with the body tail   1 546 cyc   95.7×
+
+Commit (this step). The epilogue vstored `val[256]` back to mem as a linear
+32-vstore + 31-increment chain *after* the body - 64 cyc fully serial, while
+the store engine sat idle the entire body (~1400 cyc with 0 store slots used).
+
+Move the vstores into the scheduled body so they overlap the tail. Each group's
+vstore fires once its round-15 `val` is ready, filling idle store slots
+(2/cyc). The addressing avoids both the old single-`addr_a` chain (which
+serialized vstores 1/cyc in group order) and a 32-step running-add chain:
+
+each output address is `inp_values_p + 8g` (runtime base `inp_values_p` from
+the header + compile-time offset `8g`). The 32 offsets are `load const`-ed
+independently (no chain) and `inp_values_p` added to each (32 independent alus),
+all early in the body. 32 per-group `out_addr` scalars (32 words) hold them.
+
+Result: the 64-cyc serial epilogue is gone; the vstores hide behind the body
+tail. 1598 -> 1546 cyc (-52). Store engine now saturated during the tail.
+
+Passes correctness (8 seeds) and **six** tiers: `baseline`, `updated-starting`,
+`opus4-many-hours`, `opus45-casual`, `opus45-2hr < 1579`, `sonnet45 < 1548`.
+59 cyc short of `opus45-11hr < 1487`.

@@ -5,7 +5,7 @@ Living planning document (updated as the plan evolves). The optimization log
 holds the current tier matrix, the next levers, and forward-looking design
 notes.
 
-## Current tier status (after step 9: 1599 cyc)
+## Current tier status (after step 10: 1546 cyc)
 
 | tier                     | threshold | status |
 |--------------------------|-----------|--------|
@@ -13,21 +13,22 @@ notes.
 | updated-starting         | 18 532    | PASS   |
 | opus4-many-hours         | 2 164     | PASS   |
 | opus45-casual            | 1 790     | PASS   |
-| opus45-2hr               | 1 579     | FAIL (20 cyc short) |
-| sonnet45                 | 1 548     | FAIL   |
-| opus45-11hr              | 1 487     | FAIL   |
+| opus45-2hr               | 1 579     | PASS   |
+| sonnet45                 | 1 548     | PASS   |
+| opus45-11hr              | 1 487     | FAIL (59 cyc short) |
 | opus45-improved-harness  | 1 363     | FAIL   |
 
 Shipped config: rounds-outer loop, weighted picker
-`Weights(sink=-2, load=4, raw=-6, war=7, rigid=2)` = **1599 cyc**.
+`Weights(sink=-2, load=4, raw=-6, war=7, rigid=2)`, epilogue vstores overlapped
+into the body = **1546 cyc**.
 
 ## Where we are
 
-The cross-group WAR is gone (step 8) and the picker is now property-weighted
-(step 9, weights found by random search). The body is loop-order-independent
-and gather-bound at ~1280 cyc (2560 loads / 2 ports). 1599 = 185 fixed
-prologue/epilogue + ~1414 body; the body is ~134 cyc over the 1280 load
-floor.
+Cross-group WAR gone (step 8); picker property-weighted (step 9); const region
+cleaned + 23 words freed (step 9b, scratch_ptr 1504->1481); epilogue vstores
+overlapped with the body tail (step 10, -52 cyc). Body is gather-bound at
+~1280 cyc (2560 loads / 2 ports); 1546 = 185 fixed prologue/epilogue + ~1361
+body (vstores now hidden). Store engine saturated during the tail.
 
 ## Next levers (order = do the clear wins first, then train)
 

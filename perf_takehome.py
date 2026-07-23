@@ -288,6 +288,12 @@ class KernelBuilder:
         for v in init_vars:
             self.alloc_scratch(v, 1)
         addr_a = self.alloc_scratch("addr_a", 1)
+        # Per-group output addresses for the epilogue-overlapping vstores: each
+        # is inp_values_p + 8g (runtime base + compile-time offset). The offset
+        # is `load const`-ed and inp_values_p added in the body (independent per
+        # group - no addr_a chain), so the vstores can issue 2/cyc as soon as
+        # each group's round-15 val is ready.
+        out_addr_base = self.alloc_scratch("out_addr", n_groups)  # n_groups words
 
         assert self.scratch_ptr <= SCRATCH_SIZE, "scratch overflow"
 
@@ -329,6 +335,14 @@ class KernelBuilder:
         # Body -- unrolled rounds x 32 groups, one slot per bundle.
         # =====================================================================
         body = []
+        # Output addresses: load each group's compile-time offset (8g) as a
+        # const, then add the runtime inp_values_p. Independent per group (no
+        # addr_a chain) so the round-15 vstores can fire 2/cyc in any order.
+        # Scheduled early; ready well before the vstores need them.
+        inp_values_p = self.scratch["inp_values_p"]
+        for g in range(n_groups):
+            body.append(("load", ("const", out_addr_base + g, g * VLEN)))   # offset 8g
+            body.append(("alu", ("+", out_addr_base + g, out_addr_base + g, inp_values_p)))
         for r in range(rounds):
             for g in range(n_groups):
                 is_wrap = (r == WRAP_ROUND)
@@ -403,22 +417,25 @@ class KernelBuilder:
                     body.append(("valu", ("+", idx_vec, t2_g, t1_g)))          # next = base + parity
                 body.append(("debug", ("vcompare", idx_vec, keywr)))
 
+                # --- on the final round, vstore val_g to its output address
+                # (overlaps the body tail via the idle store engine; the linear
+                # epilogue vstore loop is gone) ---
+                if r == rounds - 1:
+                    body.append(("store", ("vstore", out_addr_base + g, val_vec)))
+
         body_instrs = self.build(body, vliw=True, seed=42, picker="weighted",
                                    weights=Weights(sink=-2, load=4, raw=-6,
                                                    war=7, rigid=2))
         self.instrs.extend(body_instrs)
 
         # =====================================================================
-        # Epilogue: vstore val[256] back to mem[inp_values_p .. +256]
+        # Epilogue: the val[256] vstores now overlap the body tail (each group's
+        # vstore fires from the body once its round-15 val is ready, using the
+        # per-group out_addr). Nothing left here but the final pause.
         # =====================================================================
-        self.add("alu", ("+", addr_a, self.scratch["inp_values_p"], const_vec_0))
-        for k in range(n_groups):
-            self.add("store", ("vstore", addr_a, val_base + k * VLEN))
-            if k < n_groups - 1:
-                self.add("alu", ("+", addr_a, addr_a, eight_const))
 
         # Pause 2 -- match reference_kernel2's final yield (final mem).
-        # Must come AFTER the epilogue so machine.mem holds the final values
+        # Must come AFTER the body so machine.mem holds the final values
         # when the test recommends execution on i=1 (final yield).
         self.add("flow", ("pause",))
 
