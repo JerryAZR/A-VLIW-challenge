@@ -492,3 +492,42 @@ Passes correctness (8 seeds) and **six** tiers: `baseline`, `updated-starting`,
 
 *(Going forward, log entries include DAG-quality metrics - structure is honest
 where the untrained picker's cycle count is not.)*
+
+---
+
+## Step 13 - trained picker weights (coordinate descent)   1 522 cyc   97.1×
+
+Commit (this step). The hand-tuned weights (step 12) were found by ~180 random
+samples. Train them properly via coordinate descent with random restarts
+(`train_picker.py`): line-search each weight over a discrete grid, cycle to
+convergence, restart from random points, then refine around the global best.
+
+The loss is `body_cycles(schedule(dag, w))` - deterministic and data-independent
+(the DAG is structural; all submission seeds give the same count for fixed
+weights), so no train/val split. Landscape is piecewise-constant (gradients
+useless) and scale-invariant (optimum is a direction) - sampling-based
+coordinate descent is the right tool. ~588 evals in ~500s.
+
+Winner: `Weights(sink=-3.5, load=-0.25, raw=0.5, war=2, rigid=4)` = **1522 cyc**
+(-13 vs the hand-tuned 1535). The signs differ from the hand-tuned guess:
+`rigid=4` and `war=2` (strong positives) now dominate; `load≈0` (the gather is
+already saturated, so load-urgency barely matters); `sink=-3.5` (deprioritize
+critical-path - throughput-bound).
+
+### DAG quality (unchanged from step 12 - this step is picker-only)
+
+| metric              | step 12 (= step 13) |
+|---------------------|--------------------:|
+| nodes               | 15 776              |
+| height (crit path)  | 204                 |
+| RAW edges           | 22 720              |
+| WAR edges           | 20 352              |
+| valu nodes          | 8 256               |
+| cycles              | 1 535 -> **1 522**  |
+
+(DAG unchanged; only the picker weights changed, so structure is identical -
+the -13 is pure scheduling improvement.)
+
+Passes correctness (8 seeds) and **six** tiers: `baseline`, `updated-starting`,
+`opus4-many-hours`, `opus45-casual`, `opus45-2hr < 1579`, `sonnet45 < 1548`.
+35 cyc short of `opus45-11hr < 1487`.

@@ -325,7 +325,7 @@ class KernelBuilder:
 
         # neg_fp1 = 1 - forest_values_p (used by the next-addr update). Computed
         self.add("valu", ("-", neg_fp1_vec, const_vec_1, forest_p_vec))
-        # pos_fp5 = 5 + forest_values_p (used by the next-addr update). Computed
+        # pos_fp5 = 5 + forest_values_p (used by the level 2 select). Computed
         self.add("valu", ("+", pos_fp5_vec, const_vec_2, const_vec_3)) # pos_fp5 = 5
         self.add("valu", ("+", pos_fp5_vec, pos_fp5_vec, forest_p_vec))
 
@@ -382,7 +382,7 @@ class KernelBuilder:
                     body.append(("flow", ("vselect", nv_g, t1_g, tree4_vec, tree3_vec)))  # bit0?tree4:tree3
                     body.append(("flow", ("vselect", t2_g, t1_g, tree6_vec, tree5_vec)))  # bit0?tree6:tree5
                     body.append(("valu", ("<", t1_g, addr_vec, pos_fp5_vec)))   # low?
-                    body.append(("flow", ("vselect", nv_g, t1_g, nv_g, t2_g)))  # low?intermediate:nv
+                    body.append(("flow", ("vselect", nv_g, t1_g, nv_g, t2_g)))  # low?nv:t2
                 else:
                     # Rounds 3+: gather from mem. addr_vec already holds the
                     # tree address (idx + forest_p), so the loads read it
@@ -433,8 +433,8 @@ class KernelBuilder:
                     body.append(("store", ("vstore", out_addr_base + g, val_vec)))
 
         body_instrs = self.build(body, vliw=True, seed=42, picker="weighted",
-                                   weights=Weights(sink=-1, load=1, raw=-2,
-                                                   war=-2, rigid=-1))
+                                   weights=Weights(sink=-3.5, load=-0.25, raw=0.5,
+                                                   war=2, rigid=4))
         self.instrs.extend(body_instrs)
 
         # =====================================================================

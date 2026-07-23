@@ -5,7 +5,7 @@ Living planning document (updated as the plan evolves). The optimization log
 holds the current tier matrix, the next levers, and forward-looking design
 notes.
 
-## Current tier status (after step 12: 1535 cyc)
+## Current tier status (after step 13: 1522 cyc)
 
 | tier                     | threshold | status |
 |--------------------------|-----------|--------|
@@ -15,33 +15,26 @@ notes.
 | opus45-casual            | 1 790     | PASS   |
 | opus45-2hr               | 1 579     | PASS   |
 | sonnet45                 | 1 548     | PASS   |
-| opus45-11hr              | 1 487     | FAIL (48 cyc short) |
+| opus45-11hr              | 1 487     | FAIL (35 cyc short) |
 | opus45-improved-harness  | 1 363     | FAIL   |
 
-Shipped config: rounds-outer loop, weighted picker
-`Weights(sink=-1, load=1, raw=-2, war=-2, rigid=-1)`, store tree address +
-parity-carry selects = **1535 cyc**.
+Shipped config: rounds-outer loop, **trained** weighted picker
+`Weights(sink=-3.5, load=-0.25, raw=0.5, war=2, rigid=4)` = **1522 cyc**.
 
-## DAG quality (the honest metric - cycles depend on the untrained picker)
+## DAG quality (unchanged since step 12; steps 12-13 are picker-only)
 
-| metric              | idx (s10) | addr (s11) | addr+parity (s12) |
-|---------------------|----------:|-----------:|------------------:|
-| nodes               | 16 864    | 16 160     | 15 776            |
-| height (crit path)  | 223       | 216        | 204               |
-| RAW edges           | 23 840    | 23 104     | 22 720            |
-| WAR edges           | 14 208    | 20 416     | 20 352            |
-| valu nodes          | 8 832     | 8 640      | 8 256             |
+| metric              | idx (s10) | addr (s11) | addr+parity (s12-13) |
+|---------------------|----------:|-----------:|---------------------:|
+| nodes               | 16 864    | 16 160     | 15 776               |
+| height (crit path)  | 223       | 216        | 204                  |
+| RAW edges           | 23 840    | 23 104     | 22 720               |
+| WAR edges           | 14 208    | 20 416     | 20 352               |
+| valu nodes          | 8 832     | 8 640      | 8 256                |
+| cycles              | 1 546     | 1 559      | 1 535 -> **1 522**   |
 
-The addr direction (steps 11-12) now beats idx on every structural metric and
-on cycles. WAR edges remain high (addr read+written every round) - the main
-lever for the trained picker.
-
-## Where we are
-
-Step 11 stored the tree address (addr = idx + forest_p); step 12 eliminated the
-select-round idx recovery via parity-carry (t1_g holds the prior round's
-parity = the level select bit) and addr-compare (addr < forest_p+5 for the
-level-2 high bit). Net from idx-scheme: -1088 nodes, -19 height, -576 valu.
+The addr direction (steps 11-12) cut structure; step 13 trained the picker on
+that fixed DAG (-13 cyc, pure scheduling). WAR edges remain the lever - the
+high- addr-plane read/write churn that the picker must navigate.
 
 ## Next levers (order = do the clear wins first, then train)
 
