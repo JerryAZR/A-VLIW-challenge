@@ -305,3 +305,78 @@ The body is gather-bound at ~1280 cyc (2560 loads from rounds 3-10, 14-15 /
 Roofline reminders (see `notes/architecture.md`): compute floor ~1280-1600
 cyc (12-slot hash × 4096 lane-rounds over 6 valu + 12 alu/cyc); the
 Opus-4.5 1487 score sits in that band.
+
+---
+
+## Scheduler refactors (behavior-preserving)            1 799 -> 1 800 cyc
+
+Commits `d541787`, `6be8c24`. Two refactors of `scheduler.py` with no
+change to scheduling policy:
+
+- **Priority-queue list scheduling loop** (`d541787`): replaced the nested
+  `while progress` + `sorted()` re-scan with a single heap pass per cycle.
+  Same-cycle WAR unlocks are pushed straight back onto the queue. The old
+  drop-last-bundle `break` and `has_work` panic are gone; the trailing
+  debug-only bundle is now appended (0-cycle, so the count is unchanged).
+  1799 -> 1800: the heap prioritizes a newly-unlocked high-priority node
+  *immediately* vs the old finish-pass-first, which resolves slot contention
+  differently (+1 cyc). 1799 was lucky on the old sub-optimal priority fn.
+- **`ReadWriteTable` + `slot`->`instruction` rename** (`6be8c24`): extracted
+  the per-(region,lane) last-writer/readers-since bookkeeping out of the
+  long `_build_nodes` into a `ReadWriteTable` class (`read`/`write` take a
+  register id `(addr, is_vector)`), dropped dead `DNode.reads/.writes`
+  fields. Pure refactor; same edges, same 1800 cyc.
+
+---
+
+## Step 8 - eliminate cross-group WAR (per-group temps)   1 773 cyc   83.4×
+
+The kernel reused three *shared* vector temporaries across all 32 groups -
+`addr_vec` (gather address), `sel_lo_vec`/`sel_hi_vec` (level-2 select
+intermediates). Each is written by every group, so they form cross-group WAR
+dependency chains whose shape depends on the loop order:
+
+  - groups-outer (`for g: for r:`): the `addr_vec` WAR chain runs through
+    all 16 rounds of group 0 before reaching group 1, so group 1 can't start
+    until group 0 is nearly done. Readiness lower bound (longest path,
+    RAW=1/WAR=0) = **5433** -> ~6726 cyc.
+  - rounds-outer (`for r: for g:`): the chain weaves across groups within one
+    round, so group g+1's round r is ready ~2 cyc after group g's. LB = 462
+    -> ~1800 cyc.
+
+The 4× gap is structural (not a scheduler bug): same RAW edge count in both
+orders, but the shared-register WAR edges rearrange the readiness path. The
+fix is to make the temporaries per-group so no register is written by more
+than one group. Two op-neutral changes, both reusing existing per-group
+planes (zero extra scratch; the 3 shared allocations are removed):
+
+1. **Gather self-addressing** (`addr_vec` -> `nv_g` plane): the gather
+   computes the address into `nv_g`, then each load reads `nv_g+j` as the
+   address and writes `nv_g+j` as the value. Per-lane read-before-write makes
+   this correct (each load touches only its own lane). Removes the dominant
+   10-round cross-group WAR chain.
+2. **Level-2 select restructure** (drop `sel_lo_vec`/`sel_hi_vec`): the 4-way
+   mux now uses `t2_g` as the bit0-intermediate (`nv = bit0?tree4:tree3`;
+   `t2 = bit0?tree6:tree5`; `nv = bit1?t2:nv`). Same 3 vselects, no shared
+   vector. Removes the 2-round cross-group WAR chain.
+
+Result: loop order is now irrelevant (rounds-outer == groups-outer for every
+picker). Readiness LB drops to the within-group hash critical path (~223
+RAW edges) in both orders -> resource-bound.
+
+Cycle count by picker (both loop orders identical):
+
+| picker            | cycles | notes |
+|-------------------|--------|-------|
+| `idx`             | 1827   | deterministic (program order) |
+| `fma_first`       | 1822   | deterministic |
+| `random` seed=42  | **1773** | deterministic (fixed seed); variance 1729-1799 across seeds |
+
+All deterministic priority functions land at ~1822-1827; `random`+seed=42's
+1773 is a lucky shuffle. This confirms the picker is sub-optimal (a future
+trained picker should recover the ~50 cyc and more). Shipped config:
+rounds-outer + `random` seed=42 = 1773.
+
+Passes correctness (8 seeds) and **four** tiers: `baseline`,
+`updated-starting`, `opus4-many-hours`, `opus45-casual < 1790`. 194 cyc short
+of `opus45-2hr < 1579`.

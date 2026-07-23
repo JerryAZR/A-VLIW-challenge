@@ -186,8 +186,8 @@ class KernelBuilder:
         #   [ 768..1023]  plane 3 : t2[256]    (per-lane stage scratch)
         #   [1024..1279]  plane 4 : nv[256]    (node_val landing / spare)
         #   [1280..1535]  shared sector (256 words):
-        #                   8-word vector regions first  (forest_p_vec, addr_vec,
-        #                     12 hash-const vecs, two/one/zero_vec = 17 vecs)
+        #                   8-word vector regions first  (forest_p_vec,
+        #                     12 hash-const vecs, two/one/zero_vec = 16 vecs)
         #                   then 1-word scalars (header 7, zero/eight/addr_a,
         #                     _src scalars for broadcasts)
         #
@@ -210,7 +210,10 @@ class KernelBuilder:
 
         # ---- Phase 2: 8-word vector regions (shared sector, 8-aligned) ----
         # No instructions emitted yet — broadcasts happen in prologue.
-        addr_vec     = self.alloc_scratch("addr_vec", VLEN)
+        # No addr_vec / sel_lo_vec / sel_hi_vec: those short-lived temporaries
+        # reuse per-group planes (nv_g for the gather address via self-addressing
+        # loads; t2_g for the level-2 select intermediate) so no register is
+        # written by more than one group -> no cross-group WAR dependency chains.
         forest_p_vec = self.alloc_scratch("forest_p_vec", VLEN)
         mult4097_vec = self.alloc_scratch("mult4097_vec", VLEN)
         K0_vec       = self.alloc_scratch("K0_vec", VLEN)
@@ -278,9 +281,8 @@ class KernelBuilder:
         tree4_vec = self.alloc_scratch("tree4_vec", VLEN)
         tree5_vec = self.alloc_scratch("tree5_vec", VLEN)
         tree6_vec = self.alloc_scratch("tree6_vec", VLEN)
-        # Temp vectors for vselect intermediates (shared, reused across groups).
-        sel_lo_vec = self.alloc_scratch("sel_lo_vec", VLEN)
-        sel_hi_vec = self.alloc_scratch("sel_hi_vec", VLEN)
+        # No sel_lo_vec/sel_hi_vec: the level-2 select uses t2_g as its
+        # intermediate (see body) so it stays per-group - no shared write.
         tree_vecs = [tree0_vec, tree1_vec, tree2_vec,
                      tree3_vec, tree4_vec, tree5_vec, tree6_vec]
         three_vec = self.alloc_scratch("three_vec", VLEN)  # broadcast of 3 for level-2 select
@@ -325,8 +327,8 @@ class KernelBuilder:
         # =====================================================================
         body = []
         for r in range(rounds):
-            is_wrap = (r == WRAP_ROUND)
             for g in range(n_groups):
+                is_wrap = (r == WRAP_ROUND)
                 # per-group vectors into the SoA per-lane planes (8 contiguous words each)
                 val_vec = val_base + g * VLEN
                 idx_vec = idx_base + g * VLEN
@@ -350,20 +352,28 @@ class KernelBuilder:
                     body.append(("flow", ("vselect", nv_g, t1_g, tree1_vec, tree2_vec)))
                 elif r in (2, 13):
                     # Level 2: idx in {3,4,5,6}. Subtract level base (3), then
-                    # 2-level select on bits 0-1 of (idx-3).
-                    # idx-3=0->tree3, 1->tree4, 2->tree5, 3->tree6
-                    body.append(("valu", ("-", t1_g, idx_vec, three_vec)))   # idx - 3
+                    # 2-level select on bits 0-1 of (idx-3) into nv_g.
+                    #   idx-3=0->tree3, 1->tree4, 2->tree5, 3->tree6
+                    #   nv = bit1 ? (bit0?tree6:tree5) : (bit0?tree4:tree3)
+                    # Uses only per-group temps: t1 (idx-3, then bit1), t2 (bit0,
+                    # then the bit0?tree6:tree5 intermediate). No shared vector.
+                    body.append(("valu", ("-", t1_g, idx_vec, three_vec)))    # idx - 3
                     body.append(("valu", ("&", t2_g, t1_g, one_vec)))        # bit 0 of (idx-3)
-                    body.append(("flow", ("vselect", sel_lo_vec, t2_g, tree4_vec, tree3_vec)))
-                    body.append(("flow", ("vselect", sel_hi_vec, t2_g, tree6_vec, tree5_vec)))
-                    body.append(("valu", (">>", t2_g, t1_g, one_vec)))       # (idx-3) >> 1
-                    body.append(("valu", ("&", t2_g, t2_g, one_vec)))        # bit 1 of (idx-3)
-                    body.append(("flow", ("vselect", nv_g, t2_g, sel_hi_vec, sel_lo_vec)))
+                    body.append(("flow", ("vselect", nv_g, t2_g, tree4_vec, tree3_vec)))  # bit0?tree4:tree3
+                    body.append(("flow", ("vselect", t2_g, t2_g, tree6_vec, tree5_vec)))  # bit0?tree6:tree5 (t2 reused)
+                    body.append(("valu", (">>", t1_g, t1_g, one_vec)))        # (idx-3) >> 1
+                    body.append(("valu", ("&", t1_g, t1_g, one_vec)))        # bit 1 of (idx-3)
+                    body.append(("flow", ("vselect", nv_g, t1_g, t2_g, nv_g)))  # bit1?intermediate:nv
                 else:
-                    # Rounds 3+: gather from mem (naive scalar loads).
-                    body.append(("valu", ("+", addr_vec, idx_vec, forest_p_vec)))
+                    # Rounds 3+: gather from mem. Compute the gather address
+                    # into the per-group nv_g plane (self-addressing loads:
+                    # each load reads nv_g+j as the address and writes nv_g+j
+                    # as the value - per-lane read-before-write makes this
+                    # correct), so no shared addr_vec is written -> no cross-
+                    # group WAR. nv_g is then read by the entry XOR below.
+                    body.append(("valu", ("+", nv_g, idx_vec, forest_p_vec)))
                     for j in range(VLEN):
-                        body.append(("load", ("load", nv_g + j, addr_vec + j)))
+                        body.append(("load", ("load", nv_g + j, nv_g + j)))
 
                 body.append(("debug", ("vcompare", nv_g, keynv)))
                 body.append(("debug", ("vcompare", val_vec, keyval)))  # val before xor
@@ -390,7 +400,7 @@ class KernelBuilder:
                     body.append(("valu", ("+", idx_vec, t2_g, t1_g)))          # next = base + parity
                 body.append(("debug", ("vcompare", idx_vec, keywr)))
 
-        body_instrs = self.build(body, vliw=True, seed=42)
+        body_instrs = self.build(body, vliw=True, seed=42, picker="random")
         self.instrs.extend(body_instrs)
 
         # =====================================================================
