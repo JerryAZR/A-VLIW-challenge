@@ -48,24 +48,27 @@ NO_LOAD = 10**6
 
 class NodeProps(NamedTuple):
     """Static per-node scheduling properties, normalized to 0..1.
-    Higher = more urgent for sink/raw/war; for load LOWER = more urgent
+    Higher = more urgent for sink/raw/war/idx; for load LOWER = more urgent
     (0 = this node is a load; 1 = no downstream load)."""
     sink: float   # dist_to_sink / max  (longest RAW=1/WAR=0 path to a sink)
     load: float   # dist_to_load / max  (cycle-distance to nearest downstream load)
     raw: float    # #RAW dependents / max  (unblocked next cycle)
     war: float    # #WAR dependents / max  (unblocked same cycle)
+    idx: float    # program order / total  (locality / determinism)
 
 
 class Weights(NamedTuple):
     """Multiplier for each NodeProps term in the weighted picker's score
     (score = sink*props.sink - load*props.load + raw*props.raw
-             + war*props.war + rigid*is_rigid_now; higher = scheduled first).
-    load is subtracted because low dist_to_load = urgent."""
+             + war*props.war + rigid*is_rigid_now + idx*props.idx;
+    higher = scheduled first). load is subtracted because low dist_to_load =
+    urgent."""
     sink: float
     load: float
     raw: float
     war: float
     rigid: float
+    idx: float
 
 # Flow ops that modify the PC - the DAG cannot represent control flow.
 # Hitting one means a jump leaked into the body.
@@ -537,7 +540,8 @@ class DAG:
         return [NodeProps(dist_to_sink[i] / max_sink,
                           1.0 if dist_to_load[i] == NO_LOAD else dist_to_load[i] / max_load,
                           n_raw[i] / max_raw,
-                          n_war[i] / max_war)
+                          n_war[i] / max_war,
+                          i / (n - 1) if n > 1 else 0.0)
                 for i in range(n)]
 
 
@@ -732,7 +736,8 @@ def _make_picker(picker: str, placements: list[_Placement], rng: random.Random,
             rigid = (pl.kind != _KIND_VEC_ELEM) or (pl.lanes_done > 0)
             score = (w.sink * p.sink - w.load * p.load
                      + w.raw * p.raw + w.war * p.war
-                     + w.rigid * (1 if rigid else 0))
+                     + w.rigid * (1 if rigid else 0)
+                     + w.idx * p.idx)
             return -score
         return _key
     raise ValueError(f"Unknown picker: {picker}")

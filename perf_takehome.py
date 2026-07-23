@@ -433,8 +433,8 @@ class KernelBuilder:
                     body.append(("store", ("vstore", out_addr_base + g, val_vec)))
 
         body_instrs = self.build(body, vliw=True, seed=42, picker="weighted",
-                                   weights=Weights(sink=-3, load=1.5, raw=-1,
-                                                   war=6, rigid=-8))
+                                   weights=Weights(sink=-6, load=-0.5, raw=4,
+                                                   war=6, rigid=0.25, idx=-8))
         self.instrs.extend(body_instrs)
 
         # =====================================================================
