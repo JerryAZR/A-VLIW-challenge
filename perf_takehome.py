@@ -209,11 +209,11 @@ class KernelBuilder:
         ]
 
         # ---- Phase 1: planes (5 × V=256 = 1280 words, 8-aligned) ----
-        val_base = self.alloc_scratch("val", V)   # plane 0
-        idx_base = self.alloc_scratch("idx", V)   # plane 1
-        t1_base  = self.alloc_scratch("t1",  V)   # plane 2
-        t2_base  = self.alloc_scratch("t2",  V)   # plane 3
-        nv_base  = self.alloc_scratch("nv",  V)   # plane 4
+        val_base  = self.alloc_scratch("val", V)    # plane 0: running hash + carried state
+        addr_base = self.alloc_scratch("addr", V)   # plane 1: tree ADDRESS = idx + forest_p (stored, not idx)
+        t1_base   = self.alloc_scratch("t1",  V)    # plane 2: per-lane stage scratch
+        t2_base   = self.alloc_scratch("t2",  V)    # plane 3: per-lane stage scratch
+        nv_base   = self.alloc_scratch("nv",  V)    # plane 4: node_val landing / spare
 
         # ---- Phase 2: vector section (8-word regions, CONST first then VAR) ----
         # No addr_vec/sel_lo_vec/sel_hi_vec: those short-lived temporaries reuse
@@ -245,6 +245,7 @@ class KernelBuilder:
         # VAR vectors: runtime values (forest_p = header broadcast; tree_preload
         # = non-uniform vload of tree[0..7]; tree0..6 = its lane broadcasts).
         forest_p_vec = self.alloc_scratch("forest_p_vec", VLEN)
+        neg_fp1_vec  = self.alloc_scratch("neg_fp1_vec", VLEN)  # 1 - forest_p (next-addr: 2*addr + neg_fp1 + parity)
         tree_preload = self.alloc_scratch("tree_preload", VLEN)  # 8 words: tree[0..7]
         tree0_vec = self.alloc_scratch("tree0_vec", VLEN)
         tree1_vec = self.alloc_scratch("tree1_vec", VLEN)
@@ -321,6 +322,11 @@ class KernelBuilder:
             self.add("load", ("const", vec_addr, value))
             self.add("valu", ("vbroadcast", vec_addr, vec_addr))
 
+        # neg_fp1 = 1 - forest_values_p (used by the next-addr update). Computed
+        # after the bcast loop so const_vec_1 (lane 0 = 1) is ready.
+        self.add("alu", ("-", addr_a, const_vec_1, self.scratch["forest_values_p"]))
+        self.add("valu", ("vbroadcast", neg_fp1_vec, addr_a))
+
         # vload tree[0..7] (levels 0-2 = 7 nodes + 1 bonus) into tree_preload.
         self.add("alu", ("+", addr_a, self.scratch["forest_values_p"], const_vec_0))
         self.add("load", ("vload", tree_preload, addr_a))
@@ -347,34 +353,32 @@ class KernelBuilder:
             for g in range(n_groups):
                 is_wrap = (r == WRAP_ROUND)
                 # per-group vectors into the SoA per-lane planes (8 contiguous words each)
-                val_vec = val_base + g * VLEN
-                idx_vec = idx_base + g * VLEN
-                t1_g    = t1_base  + g * VLEN
-                t2_g    = t2_base  + g * VLEN
-                nv_g    = nv_base  + g * VLEN
-                base_i  = g * VLEN
+                val_vec  = val_base + g * VLEN
+                addr_vec = addr_base + g * VLEN
+                t1_g     = t1_base  + g * VLEN
+                t2_g     = t2_base  + g * VLEN
+                nv_g     = nv_base  + g * VLEN
+                base_i   = g * VLEN
                 keyval  = [(r, base_i + j, "val") for j in range(VLEN)]
                 keynv   = [(r, base_i + j, "node_val") for j in range(VLEN)]
                 keyhv   = [(r, base_i + j, "hashed_val") for j in range(VLEN)]
-                keywr   = [(r, base_i + j, "wrapped_idx") for j in range(VLEN)]
 
                 # --- node_val gather or preload-select (rounds 0-2 use preloaded) ---
                 if r in (0, 11):
                     # Level 0: all lanes at idx=0. node_val = tree[0].
                     body.append(("valu", ("^", nv_g, tree0_vec, const_vec_0)))
                 elif r in (1, 12):
-                    # Level 1: idx in {1,2}. 1 vselect on idx bit 0.
-                    # idx=1 (bit0=1) -> tree[1]; idx=2 (bit0=0) -> tree[2].
-                    body.append(("valu", ("&", t1_g, idx_vec, const_vec_1)))   # cond = idx & 1
+                    # Level 1: idx in {1,2}. Recover idx = addr - forest_p,
+                    # then 1 vselect on idx bit 0 (idx=1 -> tree1, idx=2 -> tree2).
+                    body.append(("valu", ("-", t1_g, addr_vec, forest_p_vec)))  # idx = addr - forest_p
+                    body.append(("valu", ("&", t1_g, t1_g, const_vec_1)))      # cond = idx & 1
                     body.append(("flow", ("vselect", nv_g, t1_g, tree1_vec, tree2_vec)))
                 elif r in (2, 13):
-                    # Level 2: idx in {3,4,5,6}. Subtract level base (3), then
-                    # 2-level select on bits 0-1 of (idx-3) into nv_g.
+                    # Level 2: idx in {3,4,5,6}. Recover idx, subtract level
+                    # base (3), then 2-level select on bits 0-1 of (idx-3).
                     #   idx-3=0->tree3, 1->tree4, 2->tree5, 3->tree6
-                    #   nv = bit1 ? (bit0?tree6:tree5) : (bit0?tree4:tree3)
-                    # Uses only per-group temps: t1 (idx-3, then bit1), t2 (bit0,
-                    # then the bit0?tree6:tree5 intermediate). No shared vector.
-                    body.append(("valu", ("-", t1_g, idx_vec, const_vec_3)))    # idx - 3
+                    body.append(("valu", ("-", t1_g, addr_vec, forest_p_vec)))  # idx = addr - forest_p
+                    body.append(("valu", ("-", t1_g, t1_g, const_vec_3)))       # idx - 3
                     body.append(("valu", ("&", t2_g, t1_g, const_vec_1)))        # bit 0 of (idx-3)
                     body.append(("flow", ("vselect", nv_g, t2_g, tree4_vec, tree3_vec)))  # bit0?tree4:tree3
                     body.append(("flow", ("vselect", t2_g, t2_g, tree6_vec, tree5_vec)))  # bit0?tree6:tree5 (t2 reused)
@@ -382,15 +386,13 @@ class KernelBuilder:
                     body.append(("valu", ("&", t1_g, t1_g, const_vec_1)))        # bit 1 of (idx-3)
                     body.append(("flow", ("vselect", nv_g, t1_g, t2_g, nv_g)))  # bit1?intermediate:nv
                 else:
-                    # Rounds 3+: gather from mem. Compute the gather address
-                    # into the per-group nv_g plane (self-addressing loads:
-                    # each load reads nv_g+j as the address and writes nv_g+j
-                    # as the value - per-lane read-before-write makes this
-                    # correct), so no shared addr_vec is written -> no cross-
-                    # group WAR. nv_g is then read by the entry XOR below.
-                    body.append(("valu", ("+", nv_g, idx_vec, forest_p_vec)))
+                    # Rounds 3+: gather from mem. addr_vec already holds the
+                    # tree address (idx + forest_p), so the loads read it
+                    # directly - no per-round address-add valu. Self-addressing:
+                    # each load reads addr_g+j as the address and writes nv_g+j
+                    # as the value. nv_g is then read by the entry XOR below.
                     for j in range(VLEN):
-                        body.append(("load", ("load", nv_g + j, nv_g + j)))
+                        body.append(("load", ("load", nv_g + j, addr_vec + j)))
 
                 body.append(("debug", ("vcompare", nv_g, keynv)))
                 body.append(("debug", ("vcompare", val_vec, keyval)))  # val before xor
@@ -406,16 +408,25 @@ class KernelBuilder:
                 body.append(("debug", ("vcompare", val_vec, keyhv)))
 
                 # --- post-hash: idx update or wrap (branchless, on valu) ---
+                # --- post-hash: addr update (store addr = idx + forest_p, not
+                # idx; gather reads addr directly). next_addr = 2*addr +
+                # (1-forest_p) + parity = 2*addr + neg_fp1 + parity. Wrap sets
+                # addr = forest_p. Round 0 (idx=0 initial) computes next_addr
+                # = forest_p+1+parity = (2-neg_fp1)+parity without reading addr
+                # (addr plane is not yet valid). ---
                 if is_wrap:
-                    # Verified: on this round, all 256 lanes are at leaf,
-                    # so next = 2*idx + 1 + parity >= n_nodes -> wrap to 0.
-                    body.append(("valu", ("&", idx_vec, idx_vec, const_vec_0)))
+                    # idx -> 0, so addr = forest_p = 1 - neg_fp1.
+                    body.append(("valu", ("-", addr_vec, const_vec_1, neg_fp1_vec)))
                 else:
                     body.append(("valu", ("&", t1_g, val_vec, const_vec_1)))        # parity = v & 1
-                    body.append(("valu", ("multiply_add", t2_g,
-                                           idx_vec, const_vec_2, const_vec_1)))         # base = 2*idx + 1
-                    body.append(("valu", ("+", idx_vec, t2_g, t1_g)))          # next = base + parity
-                body.append(("debug", ("vcompare", idx_vec, keywr)))
+                    if r == 0:
+                        # idx=0: next_addr = forest_p + 1 + parity = (2 - neg_fp1) + parity
+                        body.append(("valu", ("-", t2_g, const_vec_2, neg_fp1_vec)))  # 2 - neg_fp1
+                    else:
+                        # next_addr base = 2*addr + neg_fp1
+                        body.append(("valu", ("multiply_add", t2_g,
+                                               addr_vec, const_vec_2, neg_fp1_vec)))
+                    body.append(("valu", ("+", addr_vec, t2_g, t1_g)))        # next_addr = base + parity
 
                 # --- on the final round, vstore val_g to its output address
                 # (overlaps the body tail via the idle store engine; the linear
@@ -424,8 +435,8 @@ class KernelBuilder:
                     body.append(("store", ("vstore", out_addr_base + g, val_vec)))
 
         body_instrs = self.build(body, vliw=True, seed=42, picker="weighted",
-                                   weights=Weights(sink=-2, load=4, raw=-6,
-                                                   war=7, rigid=2))
+                                   weights=Weights(sink=-1, load=1, raw=-2,
+                                                   war=-2, rigid=-1))
         self.instrs.extend(body_instrs)
 
         # =====================================================================

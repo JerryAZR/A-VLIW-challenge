@@ -409,3 +409,43 @@ tail. 1598 -> 1546 cyc (-52). Store engine now saturated during the tail.
 Passes correctness (8 seeds) and **six** tiers: `baseline`, `updated-starting`,
 `opus4-many-hours`, `opus45-casual`, `opus45-2hr < 1579`, `sonnet45 < 1548`.
 59 cyc short of `opus45-11hr < 1487`.
+
+---
+
+## Step 11 - store tree address, not index (structural)   1 559 cyc   94.8×
+
+Commit (this step). Store `addr = idx + forest_p` per lane (replaces the idx
+plane) so the gather reads the address directly - eliminating the per-round
+`idx + forest_p` address-add (and its 1-cycle RAW before the loads).
+
+The next-idx logic becomes next-address: `next_addr = 2·addr + (1−forest_p) +
+parity`, using a broadcast `neg_fp1 = 1 − forest_p` vec (3 ops, same as
+next-idx). Round 0 (idx=0 initial) computes `next_addr = (2−neg_fp1)+parity`
+without reading addr (no addr-plane init). Wrap sets `addr = 1−neg_fp1` (=
+forest_p). Select rounds (1/2/12/13) recover `idx = addr − forest_p_vec` (the
+part to optimize away next, e.g. via the round-0 parity-as-select idea).
+
+Structural effect (the point of the change):
+
+| metric            | idx-scheme | addr-scheme | Δ |
+|-------------------|-----------|-------------|------|
+| nodes             | 16 864    | 16 160      | −704 |
+| valu nodes        | 8 832     | 8 640       | −192 (gather adds) |
+| critical path (LB)| 223       | 216         | −7 |
+| WAR edges         | 14 208    | 20 416      | +6 208 |
+
+Temporary cycle regression: 1546 -> 1559 (+13). The gather-add was load-bound
+(hid behind the 8 loads, so removing it saves a slot not a cycle); the
+select-round idx recovery is compute-bound (costs cycles); and WAR edges
+jumped (addr read+written every round). Net worse *today*, but this is the
+structural base for follow-ups: the 704 fewer nodes and 7-shorter critical
+path are where the next optimizations (parity-as-select, better scheduling,
+trained picker) land.
+
+Best weights re-tuned for the addr-scheme DAG: `Weights(sink=-1, load=1,
+raw=-2, war=-2, rigid=-1)` (the idx-scheme weights were a poor fit - WAR
+edges dominate differently now).
+
+Passes correctness (8 seeds) and **five** tiers: `baseline`, `updated-starting`,
+`opus4-many-hours`, `opus45-casual`, `opus45-2hr < 1579`. 11 cyc short of
+`sonnet45 < 1548` (a tier the idx-scheme cleared - temporary).

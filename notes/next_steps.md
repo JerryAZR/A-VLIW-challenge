@@ -5,7 +5,7 @@ Living planning document (updated as the plan evolves). The optimization log
 holds the current tier matrix, the next levers, and forward-looking design
 notes.
 
-## Current tier status (after step 10: 1546 cyc)
+## Current tier status (after step 11: 1559 cyc - temporary regression)
 
 | tier                     | threshold | status |
 |--------------------------|-----------|--------|
@@ -14,21 +14,22 @@ notes.
 | opus4-many-hours         | 2 164     | PASS   |
 | opus45-casual            | 1 790     | PASS   |
 | opus45-2hr               | 1 579     | PASS   |
-| sonnet45                 | 1 548     | PASS   |
-| opus45-11hr              | 1 487     | FAIL (59 cyc short) |
+| sonnet45                 | 1 548     | FAIL (11 cyc short - temporary, was PASS at 1546) |
+| opus45-11hr              | 1 487     | FAIL   |
 | opus45-improved-harness  | 1 363     | FAIL   |
 
 Shipped config: rounds-outer loop, weighted picker
-`Weights(sink=-2, load=4, raw=-6, war=7, rigid=2)`, epilogue vstores overlapped
-into the body = **1546 cyc**.
+`Weights(sink=-1, load=1, raw=-2, war=-2, rigid=-1)`, store tree address
+(addr = idx + forest_p) = **1559 cyc** (temporary +13 vs the idx-scheme's 1546;
+traded for 704 fewer nodes + 7-shorter critical path as the base for follow-ups).
 
 ## Where we are
 
-Cross-group WAR gone (step 8); picker property-weighted (step 9); const region
-cleaned + 23 words freed (step 9b, scratch_ptr 1504->1481); epilogue vstores
-overlapped with the body tail (step 10, -52 cyc). Body is gather-bound at
-~1280 cyc (2560 loads / 2 ports); 1546 = 185 fixed prologue/epilogue + ~1361
-body (vstores now hidden). Store engine saturated during the tail.
+Step 11 stored the tree address directly (addr = idx + forest_p), cutting 704
+nodes and 7 off the critical path (223->216) - the structural base for the
+next optimizations. Temporary +13 cycle regression: the gather-add was
+load-bound (free), the select-round idx recovery (`addr − forest_p`) is
+compute-bound, and WAR edges jumped. Weights re-tuned for the new DAG.
 
 ## Next levers (order = do the clear wins first, then train)
 
