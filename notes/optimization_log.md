@@ -5,21 +5,10 @@ Canonical workload: `forest_height=10, n_nodes=2047, batch_size=256,
 rounds=16`. Scored by simulated cycle count on a frozen copy of the
 simulator (`tests/submission_tests.py`).
 
-Each entry records the commit, intent, mechanism, cycle count, and
-correctness/tier status.
-
-Speed tiers (lower is better; current step highlighted):
-
-| tier                     | threshold | 1    | 2     | 3      | 4    | 5    | 6    | **7** |
-|--------------------------|-----------|------|-------|--------|------|------|------|-------|
-| baseline                 | 147 734   | PASS | PASS  | PASS   | PASS | PASS | PASS | PASS  |
-| updated-starting         | 18 532    | -    | -     | PASS   | PASS | PASS | PASS | PASS  |
-| opus4-many-hours         | 2 164     | -    | -     | -      | -    | -    | PASS | PASS  |
-| opus45-casual            | 1 790     | -    | -     | -      | -    | -    | -    | FAIL  |
-| opus45-2hr               | 1 579     | -    | -     | -      | -    | -    | -    | FAIL  |
-| sonnet45                 | 1 548     | -    | -     | -      | -    | -    | -    | FAIL  |
-| opus45-11hr              | 1 487     | -    | -     | -      | -    | -    | -    | FAIL  |
-| opus45-improved-harness  | 1 363     | -    | -     | -      | -    | -    | -    | FAIL  |
+Append-only history of optimization steps. Each entry records the commit,
+intent, mechanism, cycle count, and correctness/tier status. The current
+tier matrix, next levers, and tooling notes live in `notes/next_steps.md`
+(this file is history only).
 
 ---
 
@@ -256,21 +245,7 @@ Removes another 768 loads (3 rounds × 256 lanes). Total loads:
 4096 - 768×2 = 2560. At 2 load ports: 1280 cyc gather floor. Body ~1280.
 Total: 2049 -> 1799.
 
-Passes correctness (8 seeds) and three tiers. 9 cyc short of `opus45-casual
-< 1790`.
-
----
-
-## Tools
-
-- `analyze_slots.py` (commit `cf59b74`): builds the kernel, extracts the
-  scheduled body bundles, and plots per-cycle slot usage by engine
-  (valu/load/alu/flow) as separate subplots, each scaled to its own capacity.
-  Two views: per-cycle bars (shows the alternating gather/compute pattern)
-  and 10-cycle rolling average (shows macro phase trends). Usage:
-  `python analyze_slots.py [--show] [--picker fma_first|idx|random]`.
-
-Slot utilization at step 7 (body, 1614 cycles):
+Slot utilization at this step (body, 1614 cycles):
 
 | engine | slots used | capacity | util | idle cycles |
 |--------|-----------|----------|------|-------------|
@@ -284,27 +259,8 @@ where load ports sit idle while valu+alu do compute. The load alternation
 (2,0,2,0,...) during gather rounds shows the scheduler batching gathers
 rather than fully overlapping them with compute across rounds.
 
----
-
-## Next levers
-
-The body is gather-bound at ~1280 cyc (2560 loads from rounds 3-10, 14-15 /
-2 ports). Levers toward the ~1300 realistic target:
-
-1. **Fill the 334 idle load cycles** - during preload-select rounds (0-2,
-   11-13), both load ports are idle. Better cross-round pipelining in the
-   scheduler could overlap gather-round loads with select-round compute.
-   The DAG allows it (round 3's gather depends on round 2's idx update, not
-   round 0's hash), but the scheduler isn't fully overlapping them.
-2. **Deeper preload (level 3-4)** - diminishing returns per prior
-   experimentation: select cost grows (3-7 vselects per level, flow is
-   1/cycle), and scratch is nearly exhausted (9 words free).
-3. **Gather dedup** - exploit level-determinism within a round: early gather
-   rounds have few distinct idx; broadcast shared loads.
-
-Roofline reminders (see `notes/architecture.md`): compute floor ~1280-1600
-cyc (12-slot hash × 4096 lane-rounds over 6 valu + 12 alu/cyc); the
-Opus-4.5 1487 score sits in that band.
+Passes correctness (8 seeds) and three tiers. 9 cyc short of `opus45-casual
+< 1790`.
 
 ---
 
@@ -331,10 +287,10 @@ change to scheduling policy:
 
 ## Step 8 - eliminate cross-group WAR (per-group temps)   1 773 cyc   83.4×
 
-The kernel reused three *shared* vector temporaries across all 32 groups -
-`addr_vec` (gather address), `sel_lo_vec`/`sel_hi_vec` (level-2 select
-intermediates). Each is written by every group, so they form cross-group WAR
-dependency chains whose shape depends on the loop order:
+Commit `3097b19`. The kernel reused three *shared* vector temporaries across
+all 32 groups - `addr_vec` (gather address), `sel_lo_vec`/`sel_hi_vec`
+(level-2 select intermediates). Each is written by every group, so they form
+cross-group WAR dependency chains whose shape depends on the loop order:
 
   - groups-outer (`for g: for r:`): the `addr_vec` WAR chain runs through
     all 16 rounds of group 0 before reaching group 1, so group 1 can't start

@@ -61,6 +61,18 @@ usage instead.
 Register renaming is familiar territory (hardware/CPU background); the
 algorithm can be sketched jointly when we start.
 
+## Tools
+
+- `analyze_slots.py` (commit `cf59b74`): builds the kernel, extracts the
+  scheduled body bundles, and plots per-cycle slot usage by engine
+  (valu/load/alu/flow) as separate subplots, each scaled to its own capacity.
+  Two views: per-cycle bars (shows the alternating gather/compute pattern)
+  and 10-cycle rolling average (shows macro phase trends). Usage:
+  `python analyze_slots.py [--show] [--picker fma_first|idx|random]`.
+- `pmu.py`: `InstrumentedMachine` subclasses the frozen simulator to count
+  slot fires / op breakdowns / per-cycle histograms without touching it.
+  Run: `python pmu.py`.
+
 ## Roofline reminders
 
 (See `notes/architecture.md`.) Compute floor ~1280-1600 cyc (12-slot hash ×
