@@ -37,7 +37,7 @@ Only the ops the kernel actually emits are modeled. PC-modifying flow ops
 prologue/epilogue and the DAG builder rejects it.
 """
 
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 from typing import ClassVar, Callable, Union
 
 from problem import VLEN
@@ -115,6 +115,13 @@ def _ids(ops) -> list[RegId]:
 class Instr:
     """Base class for IR instructions. ``engine`` is a ClassVar."""
     engine: ClassVar[str]
+    # Operand fields read / written by this instruction (field names).
+    # rename() applies the engine's read_op to _RD fields and write_op to
+    # _WR fields (reads first - a self-read-write instruction must see the
+    # OLD home on its reads). Non-operand fields (op strings, immediates,
+    # keys) are never listed and pass through untouched.
+    _RD: ClassVar[tuple] = ()
+    _WR: ClassVar[tuple] = ()
 
     def reads(self) -> list[RegId]:
         raise NotImplementedError
@@ -126,6 +133,13 @@ class Instr:
         """The simulator slot tuple (without the engine tag)."""
         raise NotImplementedError
 
+    def rename(self, re) -> "Instr":
+        """Apply a rename engine to this instruction's operands, returning
+        the resolved instruction (reads renamed before writes)."""
+        vals = {f: re.read_op(getattr(self, f)) for f in self._RD}
+        vals.update({f: re.write_op(getattr(self, f)) for f in self._WR})
+        return replace(self, **vals)
+
 
 # ---------------------------------------------------------------------------
 # alu
@@ -135,6 +149,8 @@ class Instr:
 class Alu(Instr):
     """Scalar binary op: dest = a1 OP a2 (mod 2^32)."""
     engine: ClassVar[str] = "alu"
+    _RD: ClassVar[tuple] = ("a1", "a2")
+    _WR: ClassVar[tuple] = ("dest",)
     op: str
     dest: Operand
     a1: Operand
@@ -161,6 +177,8 @@ class VecElem(Instr):
 
     Spillable to per-lane alu slots by the scheduler."""
     engine: ClassVar[str] = "valu"
+    _RD: ClassVar[tuple] = ("a1", "a2")
+    _WR: ClassVar[tuple] = ("dest",)
     op: str
     dest: Operand
     a1: Operand
@@ -182,6 +200,8 @@ class VecFma(Instr):
     """Fused multiply_add: dest[i] = a[i]*b[i] + c[i]. valu-only (rigid:
     no scalar fma exists, so the scheduler cannot spill it)."""
     engine: ClassVar[str] = "valu"
+    _RD: ClassVar[tuple] = ("a", "b", "c")
+    _WR: ClassVar[tuple] = ("dest",)
     dest: Operand
     a: Operand
     b: Operand
@@ -202,6 +222,8 @@ class VecFma(Instr):
 class VBroadcast(Instr):
     """dest[i] = scratch[src] for all lanes."""
     engine: ClassVar[str] = "valu"
+    _RD: ClassVar[tuple] = ("src",)
+    _WR: ClassVar[tuple] = ("dest",)
     dest: Operand
     src: Operand
 
@@ -223,6 +245,8 @@ class VBroadcast(Instr):
 class Load(Instr):
     """Scalar gather: dest = mem[scratch[addr]]."""
     engine: ClassVar[str] = "load"
+    _RD: ClassVar[tuple] = ("addr",)
+    _WR: ClassVar[tuple] = ("dest",)
     dest: Operand
     addr: Operand
 
@@ -240,6 +264,8 @@ class Load(Instr):
 class VLoad(Instr):
     """Contiguous 8-word fetch: dest[i] = mem[scratch[addr]+i]."""
     engine: ClassVar[str] = "load"
+    _RD: ClassVar[tuple] = ("addr",)
+    _WR: ClassVar[tuple] = ("dest",)
     dest: Operand
     addr: Operand
 
@@ -257,6 +283,7 @@ class VLoad(Instr):
 class Const(Instr):
     """dest = <literal>. A load-engine slot with an immediate operand."""
     engine: ClassVar[str] = "load"
+    _WR: ClassVar[tuple] = ("dest",)
     dest: Operand
     val: int
 
@@ -278,6 +305,7 @@ class Const(Instr):
 class VStore(Instr):
     """mem[scratch[addr]+i] = src[i] for i in [0, VLEN)."""
     engine: ClassVar[str] = "store"
+    _RD: ClassVar[tuple] = ("addr", "src")
     addr: Operand
     src: Operand
 
@@ -299,6 +327,8 @@ class VStore(Instr):
 class VSelect(Instr):
     """dest[i] = a[i] if cond[i] != 0 else b[i]."""
     engine: ClassVar[str] = "flow"
+    _RD: ClassVar[tuple] = ("cond", "a", "b")
+    _WR: ClassVar[tuple] = ("dest",)
     dest: Operand
     cond: Operand
     a: Operand
@@ -339,6 +369,7 @@ class Pause(Instr):
 class DebugVCompare(Instr):
     """Dev oracle: assert scratch[loc..loc+7] == value_trace[keys]."""
     engine: ClassVar[str] = "debug"
+    _RD: ClassVar[tuple] = ("loc",)
     loc: Operand
     keys: list
 
@@ -353,73 +384,30 @@ class DebugVCompare(Instr):
 
 
 # ---------------------------------------------------------------------------
-# Rename engine (symbolic -> resolved translation)
+# Rename-engine directives (never reach the resolved program)
 # ---------------------------------------------------------------------------
 
-def _resolve_operand(o: Operand, res: Callable[[Sym], int]) -> Operand:
-    """Sym -> Reg via the pin table; LaneRefs translate their vector;
-    everything else (immediates) passes through."""
-    if isinstance(o, Sym):
-        return Reg(res(o), o.is_vec)
-    if isinstance(o, LaneRef):
-        return LaneRef(_resolve_operand(o.vec, res), o.j)
-    return o
+@dataclass(frozen=True)
+class Refresh(Instr):
+    """Re-home a temp symbol: free its current home and assign a fresh one
+    from the rename engine's free pool. Emitted before a lane-write sequence
+    (the gather) so the vector's home rotates instead of pinning forever.
 
+    A rename-engine-only directive: consumed during rename and absent from
+    the resolved output. No DAG ordering is needed from it - the old home's
+    next occupant WAR-depends on the old home's last readers, and the new
+    home's lane writers WAR-depend on its previous life's readers, both via
+    the renamed instructions themselves. On a pinned symbol: no-op."""
+    engine: ClassVar[str] = "debug"
+    vec: Operand
 
-class RenameEngine:
-    """Owns the symbol -> scratch-address mapping and translates symbolic
-    IR into resolved IR.
+    def reads(self):
+        return []
 
-    Currently pin-only: every symbol must be explicitly pinned to an
-    address (``pin``), and resolution is a table lookup. Dynamic allocation
-    of unpinned symbols (liveness + packing) is a planned extension; the
-    pin table is its policy input either way.
+    def writes(self):
+        return []
 
-    Validation at pin time: vector symbols 8-aligned (so LaneRef views map
-    to region lanes), no symbol pinned twice, no overlapping pinned regions.
-    """
-
-    def __init__(self):
-        self._pins: dict[Sym, int] = {}
-        self._intervals: list[tuple[int, int, Sym]] = []   # [start, end)
-
-    def pin(self, sym: Sym, addr: int) -> Sym:
-        """Pin a symbol to a fixed scratch address (returns sym, for
-        declare-and-pin one-liners)."""
-        if sym in self._pins:
-            raise ValueError(f"symbol {sym.name!r} pinned twice "
-                             f"({self._pins[sym]} vs {addr})")
-        size = VLEN if sym.is_vec else 1
-        if sym.is_vec and addr % VLEN != 0:
-            raise ValueError(f"vector symbol {sym.name!r} pinned at {addr} - "
-                             f"not {VLEN}-aligned (LaneRef views require it)")
-        for lo, hi, other in self._intervals:
-            if addr < hi and lo < addr + size:
-                raise ValueError(f"pin of {sym.name!r} at [{addr},{addr+size}) "
-                                 f"overlaps {other.name!r} at [{lo},{hi})")
-        self._pins[sym] = addr
-        self._intervals.append((addr, addr + size, sym))
-        return sym
-
-    def resolve(self, sym: Sym) -> int:
-        """The pinned address of a symbol."""
-        try:
-            return self._pins[sym]
-        except KeyError:
-            raise KeyError(f"unpinned symbol {sym.name!r} - dynamic "
-                           f"allocation not implemented") from None
-
-    def resolve_instr(self, instr: Instr) -> Instr:
-        """Translate one symbolic instruction to resolved form (all Sym
-        operands become Regs via the pin table; immediates untouched)."""
-        return replace(instr, **{f.name: _resolve_operand(getattr(instr, f.name),
-                                                          self.resolve)
-                                 for f in fields(instr)})
-
-    def resolve_instrs(self, instrs: list[Instr]) -> list[Instr]:
-        return [self.resolve_instr(i) for i in instrs]
-
-    def debug_map(self) -> dict[int, tuple[str, int]]:
-        """addr -> (name, length) for the simulator's debug scratch map."""
-        return {addr: (sym.name, VLEN if sym.is_vec else 1)
-                for sym, addr in self._pins.items()}
+    def lower(self, res=_ident):
+        raise NotImplementedError(
+            "Refresh is a rename-engine directive - it must be consumed by "
+            "RenameEngine.rename() and never lowered")

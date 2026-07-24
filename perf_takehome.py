@@ -21,9 +21,10 @@ import random
 import unittest
 
 from ir import (
-    Sym, RenameEngine, Alu, VecElem, VecFma, VBroadcast, Load, VLoad, Const,
-    VStore, VSelect, Pause, DebugVCompare,
+    Sym, Alu, VecElem, VecFma, VBroadcast, Load, VLoad, Const, VStore,
+    VSelect, Pause, DebugVCompare, Refresh,
 )
+from rename import RenameEngine
 from scheduler import Weights
 from problem import (
     Engine,
@@ -45,12 +46,9 @@ from problem import (
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
-        self.scratch = {}            # name -> Sym (scalar header vars)
-        self.scratch_ptr = 0
-        self.const_map = {}
-        # Rename engine: every symbol is pinned to the hand-laid-out address
-        # (translation only; dynamic allocation is a future extension).
-        self.re = RenameEngine()
+        # Rename engine: owns all scratch space. Created by build_kernel
+        # once the pinned symbols are declared.
+        self.re = None
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.re.debug_map())
@@ -81,39 +79,10 @@ class KernelBuilder:
 
     def add(self, instr):
         """Append a single symbolic IR instruction as a one-slot bundle
-        (linear code: prologue/epilogue). Resolved + lowered immediately -
+        (linear code: prologue/epilogue). Renamed + lowered immediately -
         these never see the DAG."""
-        instr = self.re.resolve_instr(instr)
-        self.instrs.append({instr.engine: [instr.lower()]})
-
-    def alloc_scratch(self, name=None, length=1, is_vec=False):
-        """Declare a symbol pinned at the next scratch address (sequential
-        layout - same allocation order as the hand-pinned address map)."""
-        addr = self.scratch_ptr
-        sym = self.re.pin(Sym(name or f"@{addr}", is_vec), addr)
-        if name is not None:
-            self.scratch[name] = sym
-        self.scratch_ptr += length
-        assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
-        return sym
-
-    def alloc_plane(self, name, n):
-        """Declare n vector symbols pinned as one contiguous plane
-        (n*VLEN words, 8-aligned): sym[g] at base + g*VLEN - group g's
-        vector of a per-lane SoA plane. Returns the symbol list."""
-        base = self.scratch_ptr
-        syms = [self.re.pin(Sym(f"{name}[{g}]", True), base + g * VLEN)
-                for g in range(n)]
-        self.scratch_ptr += n * VLEN
-        assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
-        return syms
-
-    def scratch_const(self, val, name=None):
-        if val not in self.const_map:
-            sym = self.alloc_scratch(name)
-            self.add(Const(sym, val))
-            self.const_map[val] = sym
-        return self.const_map[val]
+        for r in self.re.rename([instr]):
+            self.instrs.append({r.engine: [r.lower()]})
 
     def build_vec_hash(self, val_vec, t1_vec, t2_vec, r, base_i,
                         fma_vec_consts, irr_vec_consts):
@@ -238,20 +207,20 @@ class KernelBuilder:
             "forest_values_p", "inp_indices_p", "inp_values_p",
         ]
 
-        # ---- Phase 1: planes (5 × V=256 = 1280 words, 8-aligned) ----
+        # ---- Pinned symbol declarations ----
+        # The builder defines symbols; the engine owns all scratch space and
+        # assigns addresses (vectors first, stable order, then scalars -
+        # reproducing the historical hand-laid-out map: planes [0..1279],
+        # const vecs [1280..1487], scalars [1488..1528]).
+        #
         # Per-lane SoA planes as 32 group-vector symbols each: val[g] is
-        # lanes 8g..8g+7 of the plane, pinned at plane_base + 8g.
-        val  = self.alloc_plane("val",  n_groups)  # running hash + carried state
-        addr = self.alloc_plane("addr", n_groups)  # tree ADDRESS = idx + forest_p (stored, not idx)
-        t1   = self.alloc_plane("t1",   n_groups)  # per-lane stage scratch
-        t2   = self.alloc_plane("t2",   n_groups)  # per-lane stage scratch
-        nv   = self.alloc_plane("nv",   n_groups)  # node_val landing / spare
+        # lanes 8g..8g+7 of the plane.
+        val  = [Sym(f"val[{g}]",  True) for g in range(n_groups)]  # running hash + carried state
+        addr = [Sym(f"addr[{g}]", True) for g in range(n_groups)]  # tree ADDRESS = idx + forest_p (stored, not idx)
+        t1   = [Sym(f"t1[{g}]",   True) for g in range(n_groups)]  # per-lane stage scratch
+        t2   = [Sym(f"t2[{g}]",   True) for g in range(n_groups)]  # per-lane stage scratch
+        nv   = [Sym(f"nv[{g}]",   True) for g in range(n_groups)]  # node_val landing / spare
 
-        # ---- Phase 2: vector section (8-word regions, CONST first then VAR) ----
-        # No addr_vec/sel_lo_vec/sel_hi_vec: those short-lived temporaries reuse
-        # per-group planes (nv_g for the gather address via self-addressing
-        # loads; t2_g for the level-2 select intermediate) so no register is
-        # written by more than one group -> no cross-group WAR dependency chains.
         # CONST vectors: uniform value*8. Small reusable ones are named
         # const_vec_<value> and sorted by value (not tied to a step - e.g. 9 is
         # both the stage-4 multiplier and the stage-3 shift). K0..K5 are the
@@ -259,36 +228,55 @@ class KernelBuilder:
         # scalars: each is created by `load const` into its own lane 0, then
         # self-broadcast (vbroadcast vec, vec) - see the prologue. Scalar uses of
         # a value read the matching const_vec's lane 0.
-        const_vec_0    = self.alloc_scratch("const_vec_0", VLEN, is_vec=True)
-        const_vec_1    = self.alloc_scratch("const_vec_1", VLEN, is_vec=True)
-        const_vec_2    = self.alloc_scratch("const_vec_2", VLEN, is_vec=True)
-        const_vec_3    = self.alloc_scratch("const_vec_3", VLEN, is_vec=True)
-        const_vec_9    = self.alloc_scratch("const_vec_9", VLEN, is_vec=True)     # stage4 mult + stage3 shift
-        const_vec_16   = self.alloc_scratch("const_vec_16", VLEN, is_vec=True)   # stage5 shift
-        const_vec_19   = self.alloc_scratch("const_vec_19", VLEN, is_vec=True)   # stage1 shift
-        const_vec_33   = self.alloc_scratch("const_vec_33", VLEN, is_vec=True)   # stage2 mult
-        const_vec_4097 = self.alloc_scratch("const_vec_4097", VLEN, is_vec=True) # stage0 mult
-        K0_vec = self.alloc_scratch("K0_vec", VLEN, is_vec=True)   # stage 0 addend
-        K1_vec = self.alloc_scratch("K1_vec", VLEN, is_vec=True)   # stage 1 xor const
-        K2_vec = self.alloc_scratch("K2_vec", VLEN, is_vec=True)   # stage 2 addend
-        K3_vec = self.alloc_scratch("K3_vec", VLEN, is_vec=True)   # stage 3 add const
-        K4_vec = self.alloc_scratch("K4_vec", VLEN, is_vec=True)   # stage 4 addend
-        K5_vec = self.alloc_scratch("K5_vec", VLEN, is_vec=True)   # stage 5 xor const
+        const_vec_0    = Sym("const_vec_0", True)
+        const_vec_1    = Sym("const_vec_1", True)
+        const_vec_2    = Sym("const_vec_2", True)
+        const_vec_3    = Sym("const_vec_3", True)
+        const_vec_9    = Sym("const_vec_9", True)     # stage4 mult + stage3 shift
+        const_vec_16   = Sym("const_vec_16", True)   # stage5 shift
+        const_vec_19   = Sym("const_vec_19", True)   # stage1 shift
+        const_vec_33   = Sym("const_vec_33", True)   # stage2 mult
+        const_vec_4097 = Sym("const_vec_4097", True) # stage0 mult
+        K0_vec = Sym("K0_vec", True)   # stage 0 addend
+        K1_vec = Sym("K1_vec", True)   # stage 1 xor const
+        K2_vec = Sym("K2_vec", True)   # stage 2 addend
+        K3_vec = Sym("K3_vec", True)   # stage 3 add const
+        K4_vec = Sym("K4_vec", True)   # stage 4 addend
+        K5_vec = Sym("K5_vec", True)   # stage 5 xor const
         # VAR vectors: runtime values (forest_p = header broadcast; tree_preload
         # = non-uniform vload of tree[0..7]; tree0..6 = its lane broadcasts).
-        forest_p_vec = self.alloc_scratch("forest_p_vec", VLEN, is_vec=True)
-        neg_fp1_vec  = self.alloc_scratch("neg_fp1_vec", VLEN, is_vec=True)  # 1 - forest_p (next-addr: 2*addr + neg_fp1 + parity)
-        pos_fp5_vec  = self.alloc_scratch("pos_fp5_vec", VLEN, is_vec=True)  # 5 + forest_p
-        tree_preload = self.alloc_scratch("tree_preload", VLEN, is_vec=True)  # 8 words: tree[0..7]
-        tree0_vec = self.alloc_scratch("tree0_vec", VLEN, is_vec=True)
-        tree1_vec = self.alloc_scratch("tree1_vec", VLEN, is_vec=True)
-        tree2_vec = self.alloc_scratch("tree2_vec", VLEN, is_vec=True)
-        tree3_vec = self.alloc_scratch("tree3_vec", VLEN, is_vec=True)
-        tree4_vec = self.alloc_scratch("tree4_vec", VLEN, is_vec=True)
-        tree5_vec = self.alloc_scratch("tree5_vec", VLEN, is_vec=True)
-        tree6_vec = self.alloc_scratch("tree6_vec", VLEN, is_vec=True)
+        forest_p_vec = Sym("forest_p_vec", True)
+        neg_fp1_vec  = Sym("neg_fp1_vec", True)  # 1 - forest_p (next-addr: 2*addr + neg_fp1 + parity)
+        pos_fp5_vec  = Sym("pos_fp5_vec", True)  # 5 + forest_p
+        tree_preload = Sym("tree_preload", True)  # 8 words: tree[0..7]
+        tree0_vec = Sym("tree0_vec", True)
+        tree1_vec = Sym("tree1_vec", True)
+        tree2_vec = Sym("tree2_vec", True)
+        tree3_vec = Sym("tree3_vec", True)
+        tree4_vec = Sym("tree4_vec", True)
+        tree5_vec = Sym("tree5_vec", True)
+        tree6_vec = Sym("tree6_vec", True)
         tree_vecs = [tree0_vec, tree1_vec, tree2_vec,
                      tree3_vec, tree4_vec, tree5_vec, tree6_vec]
+
+        # Scalars: `eight` (vload/vstore stride of 8 - the only CONST scalar);
+        # header vars (loaded from mem); addr_a (vload/vstore ptr); per-group
+        # out_addr (= inp_values_p + 8g: runtime base + compile-time offset,
+        # so the round-15 vstores can issue 2/cyc in any order).
+        eight_const = Sym("eight")
+        header = {v: Sym(v) for v in init_vars}
+        addr_a = Sym("addr_a")
+        out_addr = [Sym(f"out_addr[{g}]") for g in range(n_groups)]
+
+        # The engine owns scratch space from here on.
+        self.re = RenameEngine([
+            *val, *addr, *t1, *t2, *nv,
+            const_vec_0, const_vec_1, const_vec_2, const_vec_3, const_vec_9,
+            const_vec_16, const_vec_19, const_vec_33, const_vec_4097,
+            K0_vec, K1_vec, K2_vec, K3_vec, K4_vec, K5_vec,
+            forest_p_vec, neg_fp1_vec, pos_fp5_vec, tree_preload, *tree_vecs,
+            eight_const, *header.values(), addr_a, *out_addr,
+        ])
 
         # (vec, literal) pairs: the prologue `load const` lane 0 + self-broadcast.
         vec_bcasts = [
@@ -312,36 +300,16 @@ class KernelBuilder:
             19: const_vec_19, 9: const_vec_9, 16: const_vec_16,
         }
 
-        # ---- Phase 3: scalar section (1 word each, CONST first then VAR) ----
-        # No per-vector broadcast-source scalars (self-broadcast from lane 0).
-        # The only CONST scalar is `eight` (vload/vstore stride of 8 - no matching
-        # const_vec_8 since 8 is never used as a vector). Scalar uses of 0 read
-        # const_vec_0's lane 0 (see prologue/epilogue).
-        eight_const = self.scratch_const(8, "eight")     # vload/vstore stride
-        # VAR scalars: header vars (loaded from mem) + addr_a (vload/vstore ptr).
-        for v in init_vars:
-            self.alloc_scratch(v, 1)
-        addr_a = self.alloc_scratch("addr_a", 1)
-        # Per-group output addresses for the epilogue-overlapping vstores: each
-        # is inp_values_p + 8g (runtime base + compile-time offset). The offset
-        # is `load const`-ed and inp_values_p added in the body (independent per
-        # group - no addr_a chain), so the vstores can issue 2/cyc as soon as
-        # each group's round-15 val is ready.
-        out_addr = [self.re.pin(Sym(f"out_addr[{g}]"), self.scratch_ptr + g)
-                    for g in range(n_groups)]
-        self.scratch_ptr += n_groups
-
-        assert self.scratch_ptr <= SCRATCH_SIZE, "scratch overflow"
-
         # =====================================================================
         # Prologue: load header; vload val[256]; broadcast consts; pause
         # =====================================================================
+        self.add(Const(eight_const, 8))        # vload/vstore stride
         for i, v in enumerate(init_vars):
             self.add(Const(addr_a, i))                              # addr_a := i
-            self.add(Load(self.scratch[v], addr_a))                 # scratch[v] := mem[i]
+            self.add(Load(header[v], addr_a))                       # header[v] := mem[i]
 
         # vload val[256] as 32 vectors of 8 contiguous words from mem[inp_values_p..].
-        self.add(Alu("+", addr_a, self.scratch["inp_values_p"],
+        self.add(Alu("+", addr_a, header["inp_values_p"],
                      const_vec_0.lane(0)))
         for k in range(n_groups):
             self.add(VLoad(val[k], addr_a))
@@ -349,7 +317,7 @@ class KernelBuilder:
                 self.add(Alu("+", addr_a, addr_a, eight_const))
 
         # Broadcast forest_values_p (from a header var, not a literal).
-        self.add(VBroadcast(forest_p_vec, self.scratch["forest_values_p"]))
+        self.add(VBroadcast(forest_p_vec, header["forest_values_p"]))
 
         # Create each const vector by `load const` into its own lane 0 then
         # self-broadcast (vbroadcast vec, vec reads lane 0, writes all 8). No
@@ -365,7 +333,7 @@ class KernelBuilder:
         self.add(VecElem("+", pos_fp5_vec, pos_fp5_vec, forest_p_vec))
 
         # vload tree[0..7] (levels 0-2 = 7 nodes + 1 bonus) into tree_preload.
-        self.add(Alu("+", addr_a, self.scratch["forest_values_p"],
+        self.add(Alu("+", addr_a, header["forest_values_p"],
                      const_vec_0.lane(0)))
         self.add(VLoad(tree_preload, addr_a))
         # Broadcast tree[0..6] into shared vector constants.
@@ -383,7 +351,7 @@ class KernelBuilder:
         # const, then add the runtime inp_values_p. Independent per group (no
         # addr_a chain) so the round-15 vstores can fire 2/cyc in any order.
         # Scheduled early; ready well before the vstores need them.
-        inp_values_p = self.scratch["inp_values_p"]
+        inp_values_p = header["inp_values_p"]
         for g in range(n_groups):
             body.append(Const(out_addr[g], g * VLEN))   # offset 8g
             body.append(Alu("+", out_addr[g], out_addr[g], inp_values_p))
@@ -425,6 +393,8 @@ class KernelBuilder:
                     # directly - no per-round address-add valu. Self-addressing:
                     # each load reads addr_g+j as the address and writes nv_g+j
                     # as the value. nv_g is then read by the entry XOR below.
+                    # Refresh re-homes nv_g each round (no-op while nv is pinned).
+                    body.append(Refresh(nv_g))
                     for j in range(VLEN):
                         body.append(Load(nv_g.lane(j), addr_vec.lane(j)))
 
@@ -467,8 +437,8 @@ class KernelBuilder:
                 if r == rounds - 1:
                     body.append(VStore(out_addr[g], val_vec))
 
-        # Rename: symbolic -> resolved IR (all-pinned translation), then schedule.
-        body = self.re.resolve_instrs(body)
+        # Rename: symbolic -> resolved IR (single pass), then schedule.
+        body = self.re.rename(body)
         body_instrs = self.build(body, vliw=True, seed=42, picker="weighted",
                                    weights=Weights(sink=-3, load=-1.5, raw=-0.25,
                                                    war=6, rigid=0.25, idx=-4))
