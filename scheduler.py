@@ -122,17 +122,20 @@ class ReadWriteTable:
         scalar writes landed into individual lanes.
       ``_readers[(region, lane)]`` - instruction ids that read this lane
         since its last write.
+
+    The instruction list is passed at construction so dead-write errors can
+    name the stable rid of the offending instructions.
     """
 
-    def __init__(self):
+    def __init__(self, instructions: list | None = None):
         self._last_writer: dict[int, int | list] = {}
         self._readers: dict[tuple[int, int], list[int]] = {}
-        self._instrs: list | None = None   # optional, for rid-tagged warnings
+        self._instrs = instructions         # for rid-tagged dead-write errors
 
     def _rid(self, instr_id: int) -> int:
         """The stable rename id of a node index, for cross-referencing the
         rename-pass logs. Falls back to the node index when the instruction
-        list isn't attached."""
+        list wasn't given."""
         if self._instrs is None:
             return instr_id
         return self._instrs[instr_id].rid
@@ -244,10 +247,21 @@ class DAG:
         self.nodes: list[DNode] = self._build_nodes(instructions)
         self._finish_init()
 
+    @classmethod
+    def from_nodes(cls, nodes: list[DNode]) -> "DAG":
+        """Build a DAG directly from a pre-built node list (with edges already
+        wired), re-deriving dynamic scheduling state and static props. Used by
+        compaction passes (e.g. ``prune_to_stores``) that produce a filtered
+        node set rather than re-running ``_build_nodes``."""
+        dag = cls.__new__(cls)
+        dag.nodes = nodes
+        dag._finish_init()
+        return dag
+
     def _finish_init(self) -> None:
         """(Re)derive dynamic scheduling state + static props from the current
         node/edge lists. Called by ``__init__`` after construction and by
-        ``prune_to_stores`` after compaction."""
+        ``from_nodes`` after compaction."""
         n = len(self.nodes)
         self._raw = [0] * n          # remaining RAW (weight-1) in-edges
         self._war = [0] * n          # remaining WAR (weight-0) in-edges
@@ -363,8 +377,7 @@ class DAG:
         the scheduler.
         """
         nodes: list[DNode] = []
-        table = ReadWriteTable()
-        table._instrs = instructions     # for rid-tagged dead-write warnings
+        table = ReadWriteTable(instructions)
         for idx, instr in enumerate(instructions):
             if isinstance(instr, FLOW_PANIC):
                 raise NotImplementedError(
@@ -507,9 +520,7 @@ def prune_to_stores(dag: DAG) -> DAG:
         nn.in_edges = [(remap[src], w) for src, w in old.in_edges if src in keep]
         nn.out_edges = [(remap[dst], w) for dst, w in old.out_edges if dst in keep]
 
-    new = DAG.__new__(DAG)
-    new.nodes = new_nodes
-    new._finish_init()
+    new = DAG.from_nodes(new_nodes)
     return new
 
 
