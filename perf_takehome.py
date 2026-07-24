@@ -22,7 +22,7 @@ import unittest
 
 from ir import (
     Sym, Alu, VecElem, VecFma, VBroadcast, Load, VLoad, Const, VStore,
-    VSelect, Pause, DebugVCompare, Refresh,
+    VSelect, Pause, DebugVCompare, Gather,
 )
 from rename import RenameEngine
 from scheduler import Weights
@@ -217,9 +217,18 @@ class KernelBuilder:
         # lanes 8g..8g+7 of the plane.
         val  = [Sym(f"val[{g}]",  True) for g in range(n_groups)]  # running hash + carried state
         addr = [Sym(f"addr[{g}]", True) for g in range(n_groups)]  # tree ADDRESS = idx + forest_p (stored, not idx)
-        t1   = [Sym(f"t1[{g}]",   True) for g in range(n_groups)]  # per-lane stage scratch
-        t2   = [Sym(f"t2[{g}]",   True) for g in range(n_groups)]  # per-lane stage scratch
-        nv   = [Sym(f"nv[{g}]",   True) for g in range(n_groups)]  # node_val landing / spare
+        # Local temporaries: ONE shared tag each across all groups (loop-body
+        # locals - each is dead within one group's round). The rename engine
+        # re-homes them per write, so different groups' in-flight values
+        # still land in different physical homes (no cross-group WAR chains
+        # by construction), and homes recycle through the free pool.
+        t1 = Sym("t1", True)   # hash stage scratch + level-2 select low bit
+        t2 = Sym("t2", True)   # hash stage scratch + addr-update base
+        nv = Sym("nv", True)   # node_val landing / gather pad
+        # Parity (hash & 1) is NOT a temporary: it is produced by the addr
+        # update and consumed by the NEXT round's level-1/2 select, so it
+        # must persist across the round boundary -> per-group symbol.
+        parity = [Sym(f"parity[{g}]", True) for g in range(n_groups)]
 
         # CONST vectors: uniform value*8. Small reusable ones are named
         # const_vec_<value> and sorted by value (not tied to a step - e.g. 9 is
@@ -270,7 +279,7 @@ class KernelBuilder:
 
         # The engine owns scratch space from here on.
         self.re = RenameEngine([
-            *val, *addr, *t1, *t2, *nv,
+            *val, *addr,
             const_vec_0, const_vec_1, const_vec_2, const_vec_3, const_vec_9,
             const_vec_16, const_vec_19, const_vec_33, const_vec_4097,
             K0_vec, K1_vec, K2_vec, K3_vec, K4_vec, K5_vec,
@@ -361,9 +370,8 @@ class KernelBuilder:
                 # per-group vector symbols of the SoA per-lane planes
                 val_vec  = val[g]
                 addr_vec = addr[g]
-                t1_g     = t1[g]
-                t2_g     = t2[g]
-                nv_g     = nv[g]
+                parity_g = parity[g]   # persists to the next round's select
+                # t1 / t2 / nv : the shared loop-body local tags
                 base_i   = g * VLEN
                 keyval  = [(r, base_i + j, "val") for j in range(VLEN)]
                 keynv   = [(r, base_i + j, "node_val") for j in range(VLEN)]
@@ -372,40 +380,37 @@ class KernelBuilder:
                 # --- node_val gather or preload-select (rounds 0-2 use preloaded) ---
                 if r in (0, 11):
                     # Level 0: all lanes at idx=0. node_val = tree[0].
-                    body.append(VecElem("^", nv_g, tree0_vec, const_vec_0))
+                    body.append(VecElem("^", nv, tree0_vec, const_vec_0))
                 elif r in (1, 12):
-                    # Level 1: idx in {1,2}. Recover idx = addr - forest_p,
-                    # then 1 vselect on idx bit 0 (idx=1 -> tree1, idx=2 -> tree2).
-                    # parity from last round was in t1_g
-                    body.append(VSelect(nv_g, t1_g, tree2_vec, tree1_vec))
+                    # Level 1: idx in {1,2}. idx = 1 + parity, so the parity
+                    # carried from last round IS the select bit (idx=1 -> tree1,
+                    # idx=2 -> tree2).
+                    body.append(VSelect(nv, parity_g, tree2_vec, tree1_vec))
                 elif r in (2, 13):
-                    # Level 2: idx in {3,4,5,6}. Recover idx, subtract level
-                    # base (3), then 2-level select on bits 0-1 of (idx-3).
+                    # Level 2: idx in {3,4,5,6}. bit0(idx-3) = last round's
+                    # parity; high bit = addr < forest_p + 5.
                     #   idx-3=0->tree3, 1->tree4, 2->tree5, 3->tree6
-
-                    body.append(VSelect(nv_g, t1_g, tree4_vec, tree3_vec))  # bit0?tree4:tree3
-                    body.append(VSelect(t2_g, t1_g, tree6_vec, tree5_vec))  # bit0?tree6:tree5
-                    body.append(VecElem("<", t1_g, addr_vec, pos_fp5_vec))   # low?
-                    body.append(VSelect(nv_g, t1_g, nv_g, t2_g))  # low?nv:t2
+                    body.append(VSelect(nv, parity_g, tree4_vec, tree3_vec))  # bit0?tree4:tree3
+                    body.append(VSelect(t2, parity_g, tree6_vec, tree5_vec))  # bit0?tree6:tree5
+                    body.append(VecElem("<", t1, addr_vec, pos_fp5_vec))   # low?
+                    body.append(VSelect(nv, t1, nv, t2))  # low?nv:t2
                 else:
                     # Rounds 3+: gather from mem. addr_vec already holds the
                     # tree address (idx + forest_p), so the loads read it
-                    # directly - no per-round address-add valu. Self-addressing:
-                    # each load reads addr_g+j as the address and writes nv_g+j
-                    # as the value. nv_g is then read by the entry XOR below.
-                    # Refresh re-homes nv_g each round (no-op while nv is pinned).
-                    body.append(Refresh(nv_g))
-                    for j in range(VLEN):
-                        body.append(Load(nv_g.lane(j), addr_vec.lane(j)))
+                    # directly - no per-round address-add valu. One Gather op
+                    # (nv = mem[addr[0..7]]); the rename engine re-homes the
+                    # shared nv tag and decomposes this into 8 scalar loads.
+                    # nv is then read by the entry XOR below.
+                    body.append(Gather(nv, addr_vec))
 
-                body.append(DebugVCompare(nv_g, keynv))
+                body.append(DebugVCompare(nv, keynv))
                 body.append(DebugVCompare(val_vec, keyval))  # val before xor
 
-                # --- entry XOR: val_vec = val_vec ^ nv_g  (a) ---
-                body.append(VecElem("^", val_vec, val_vec, nv_g))
+                # --- entry XOR: val_vec = val_vec ^ nv  (a) ---
+                body.append(VecElem("^", val_vec, val_vec, nv))
 
                 # --- 12-slot hash, fully on valu (8 lanes / slot) ---
-                body.extend(self.build_vec_hash(val_vec, t1_g, t2_g, r, base_i,
+                body.extend(self.build_vec_hash(val_vec, t1, t2, r, base_i,
                                                 fma_vec_consts, irr_vec_consts))
 
                 # debug: hashed_val == v == val_vec after hash
@@ -422,14 +427,15 @@ class KernelBuilder:
                     # idx -> 0, so addr = forest_p = 1 - neg_fp1.
                     body.append(VecElem("-", addr_vec, const_vec_1, neg_fp1_vec))
                 else:
-                    body.append(VecElem("&", t1_g, val_vec, const_vec_1))        # parity = v & 1
+                    # parity = v & 1 - persists to the next round's select.
+                    body.append(VecElem("&", parity_g, val_vec, const_vec_1))
                     if r == 0:
                         # idx=0: next_addr = forest_p + 1 + parity = (2 - neg_fp1) + parity
-                        body.append(VecElem("-", t2_g, const_vec_2, neg_fp1_vec))  # 2 - neg_fp1
+                        body.append(VecElem("-", t2, const_vec_2, neg_fp1_vec))  # 2 - neg_fp1
                     else:
                         # next_addr base = 2*addr + neg_fp1
-                        body.append(VecFma(t2_g, addr_vec, const_vec_2, neg_fp1_vec))
-                    body.append(VecElem("+", addr_vec, t2_g, t1_g))        # next_addr = base + parity
+                        body.append(VecFma(t2, addr_vec, const_vec_2, neg_fp1_vec))
+                    body.append(VecElem("+", addr_vec, t2, parity_g))        # next_addr = base + parity
 
                 # --- on the final round, vstore val_g to its output address
                 # (overlaps the body tail via the idle store engine; the linear

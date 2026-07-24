@@ -277,7 +277,6 @@ class Load(Instr):
 
 @dataclass(frozen=True)
 class VLoad(Instr):
-    """Contiguous 8-word fetch: dest[i] = mem[scratch[addr]+i]."""
     engine: ClassVar[str] = "load"
     _RD: ClassVar[tuple] = ("addr",)
     _WR: ClassVar[tuple] = ("dest",)
@@ -292,6 +291,34 @@ class VLoad(Instr):
 
     def lower(self, res=_ident):
         return ("vload", self.dest.resolve(res), self.addr.resolve(res))
+
+
+@dataclass(frozen=True)
+class Gather(Instr):
+    """Vector gather: dest[j] = mem[scratch[addr+j]] for j in [0, VLEN).
+
+    The ISA has no gather; the rename engine decomposes this into VLEN
+    scalar loads AFTER renaming (lane addresses are plain arithmetic on
+    resolved homes). At rename time it is a whole-vector read of addr and
+    a whole-vector write of dest - rename-on-write re-homes dest per
+    gather, so no lane-access discipline (and no Refresh directive) is
+    needed. Never reaches the DAG or the simulator."""
+    engine: ClassVar[str] = "load"
+    _RD: ClassVar[tuple] = ("addr",)
+    _WR: ClassVar[tuple] = ("dest",)
+    dest: Operand
+    addr: Operand
+
+    def reads(self):
+        return _ids([self.addr])
+
+    def writes(self):
+        return _ids([self.dest])
+
+    def lower(self, res=_ident):
+        raise NotImplementedError(
+            "Gather must be decomposed into scalar loads by "
+            "RenameEngine.rename() before lowering")
 
 
 @dataclass(frozen=True)
@@ -396,33 +423,3 @@ class DebugVCompare(Instr):
 
     def lower(self, res=_ident):
         return ("vcompare", self.loc.resolve(res), self.keys)
-
-
-# ---------------------------------------------------------------------------
-# Rename-engine directives (never reach the resolved program)
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class Refresh(Instr):
-    """Re-home a temp symbol: free its current home and assign a fresh one
-    from the rename engine's free pool. Emitted before a lane-write sequence
-    (the gather) so the vector's home rotates instead of pinning forever.
-
-    A rename-engine-only directive: consumed during rename and absent from
-    the resolved output. No DAG ordering is needed from it - the old home's
-    next occupant WAR-depends on the old home's last readers, and the new
-    home's lane writers WAR-depend on its previous life's readers, both via
-    the renamed instructions themselves. On a pinned symbol: no-op."""
-    engine: ClassVar[str] = "debug"
-    vec: Operand
-
-    def reads(self):
-        return []
-
-    def writes(self):
-        return []
-
-    def lower(self, res=_ident):
-        raise NotImplementedError(
-            "Refresh is a rename-engine directive - it must be consumed by "
-            "RenameEngine.rename() and never lowered")
