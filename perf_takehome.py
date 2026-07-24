@@ -62,8 +62,13 @@ class KernelBuilder:
         """
         if not vliw:
             return [{engine: [slot]} for engine, slot in slots]
-        from scheduler import DAG, schedule
+        from scheduler import DAG, schedule, prune_to_stores
         dag = DAG(slots)
+        pruned = prune_to_stores(dag)
+        if len(pruned) != len(dag):
+            print(f"prune_to_stores: {len(dag)} -> {len(pruned)} nodes "
+                  f"({len(dag) - len(pruned)} dead)")
+        dag = pruned
         cap = len(slots)  # worst case: 1 slot/cycle
         return schedule(dag, seed=seed, cap=cap, picker=picker, weights=weights)
 

@@ -570,3 +570,54 @@ adding idx as a 6th.)
 Passes correctness (8 seeds) and **seven** tiers: `baseline`, `updated-starting`,
 `opus4-many-hours`, `opus45-casual`, `opus45-2hr < 1579`, `sonnet45 < 1548`,
 `opus45-11hr < 1487`. 96 cyc short of `opus45-improved-harness < 1363`.
+
+---
+
+## Step 15 - prune-to-stores dead-code pass   1 458 cyc   101.3×
+
+Commit (this step). Prune DAG nodes that do not contribute to the final
+stores, in `scheduler.py` (`prune_to_stores`), wired into
+`KernelBuilder.build` ahead of `schedule()`.
+
+- **Pass 1**: backward walk from the 32 store sinks following RAW
+  (weight-1, true data dependency) edges only, marking nodes useful. WAR
+  edges are anti-dependencies (register-reuse ordering), not data flow -
+  neither walked nor marking.
+- **Pass 2**: drop every unmarked node and its attached edges. Debug nodes
+  inherit the usefulness of their producers: kept iff all their RAW
+  producers are kept (vacuously true with none - the 32 round-0 "val before
+  xor" vcompares read the prologue-vloaded val, outside the body DAG).
+- **No dependency re-analysis**: kept-kept edges are exactly the induced
+  subgraph; only edges incident to removed nodes disappear. Compaction
+  (filter + re-index) suffices, no ReadWriteTable re-walk. WAW safety is
+  preserved: a kept writer is useful -> has a kept reader on a RAW path to
+  a store -> that reader precedes the next kept writer of the lane, so the
+  W1 ->RAW R' ->WAR W2 bridge survives. (A writer with no kept reader
+  before the next writer is not RAW-reachable from a store and is pruned.)
+- Counters/frontier/props re-derived from the filtered edge lists via the
+  extracted `DAG._finish_init()` (shared with `__init__`). `dist_to_sink`
+  is now anchored on the real sinks only - before, the zero-out-degree set
+  included 96 debug nodes and 32 dead round-15 `+` writes.
+
+Pruned exactly the expected **96 nodes**: the round-15 addr-update chain
+(`&` parity -> `multiply_add` -> `+`, x 32 groups; round 16 never reads
+addr). Only -1 cycle (1459 -> 1458): the dead chain sat in the store-bound
+tail where its valu ops hid in otherwise-idle slots. The kernel is
+otherwise RAW-tight - everything else reaches a store (11 072 useful + 4
+608 inherited debug of 15 776 nodes). The pass's value is structural:
+clean sink anchoring for the picker props, and a safety net for future
+restructuring.
+
+Picker weights unchanged (no retraining; compute is limited).
+
+### DAG quality
+
+| metric              | step 12-14 | step 15 |
+|---------------------|-----------:|--------:|
+| nodes               | 15 776     | 15 680  |
+| cycles              | 1 459      | **1 458** |
+
+Passes correctness (8 seeds) and **seven** tiers (unchanged): `baseline`,
+`updated-starting`, `opus4-many-hours`, `opus45-casual`, `opus45-2hr < 1579`,
+`sonnet45 < 1548`, `opus45-11hr < 1487`. 95 cyc short of
+`opus45-improved-harness < 1363`.

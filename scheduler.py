@@ -355,6 +355,12 @@ class DAG:
 
     def __init__(self, instructions: list[tuple[str, tuple]]):
         self.nodes: list[DNode] = self._build_nodes(instructions)
+        self._finish_init()
+
+    def _finish_init(self) -> None:
+        """(Re)derive dynamic scheduling state + static props from the current
+        node/edge lists. Called by ``__init__`` after construction and by
+        ``prune_to_stores`` after compaction."""
         n = len(self.nodes)
         self._raw = [0] * n          # remaining RAW (weight-1) in-edges
         self._war = [0] * n          # remaining WAR (weight-0) in-edges
@@ -543,6 +549,76 @@ class DAG:
                           n_war[i] / max_war,
                           i / (n - 1) if n > 1 else 0.0)
                 for i in range(n)]
+
+
+# ---------------------------------------------------------------------------
+# Dead-code pruning
+# ---------------------------------------------------------------------------
+
+def prune_to_stores(dag: DAG) -> DAG:
+    """Prune nodes that do not contribute to the final stores, in place on a
+    compacted copy of ``dag``.
+
+    Pass 1: backward walk from the store sinks following RAW (weight-1,
+    true data dependency) edges only, marking nodes "useful". WAR edges are
+    anti-dependencies (register-reuse ordering), not data flow, so they
+    neither mark nor are walked.
+
+    Pass 2: drop every unmarked node and its attached edges. Debug nodes
+    inherit the usefulness of their producers: a debug node is kept iff all
+    its RAW producers are kept (vacuously true when it has none - e.g. it
+    reads prologue state outside the body DAG), preserving the dev oracle
+    exactly where the asserted value is still computed.
+
+    The kept subgraph needs no dependency re-analysis: kept-kept edges are
+    unchanged (they are exactly the induced subgraph), and only edges
+    incident to removed nodes disappear. WAW safety is preserved: a kept
+    writer W1 of a lane is useful, so it has a kept reader R' on a RAW path
+    to a store, and R' necessarily precedes the next kept writer W2 of that
+    lane - the bridge W1 ->RAW R' ->WAR W2 survives pruning. (A writer with
+    no kept reader before the next writer has no RAW path to a store and is
+    pruned.)
+
+    Counter/frontier/props are re-derived from the filtered edge lists via
+    ``_finish_init`` (so ``dist_to_sink`` is re-anchored on the real sinks).
+    """
+    stores = [n.idx for n in dag.nodes if n.engine == "store"]
+    assert stores, "prune_to_stores: no store nodes - nothing to anchor on"
+
+    useful: set[int] = set(stores)
+    stack = list(stores)
+    while stack:
+        i = stack.pop()
+        for src, w in dag.nodes[i].in_edges:
+            if w == 1 and src not in useful:
+                useful.add(src)
+                stack.append(src)
+
+    keep = set(useful)
+    for n in dag.nodes:
+        if n.engine == "debug" and n.idx not in keep:
+            if all(src in useful for src, w in n.in_edges if w == 1):
+                keep.add(n.idx)
+
+    remap: dict[int, int] = {}
+    new_nodes: list[DNode] = []
+    for old in dag.nodes:
+        if old.idx not in keep:
+            continue
+        nn = DNode(idx=len(new_nodes), engine=old.engine, instr=old.instr)
+        remap[old.idx] = nn.idx
+        new_nodes.append(nn)
+    for old in dag.nodes:
+        if old.idx not in keep:
+            continue
+        nn = new_nodes[remap[old.idx]]
+        nn.in_edges = [(remap[src], w) for src, w in old.in_edges if src in keep]
+        nn.out_edges = [(remap[dst], w) for dst, w in old.out_edges if dst in keep]
+
+    new = DAG.__new__(DAG)
+    new.nodes = new_nodes
+    new._finish_init()
+    return new
 
 
 # ---------------------------------------------------------------------------

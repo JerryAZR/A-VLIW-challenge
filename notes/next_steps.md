@@ -5,7 +5,7 @@ Living planning document (updated as the plan evolves). The optimization log
 holds the current tier matrix, the next levers, and forward-looking design
 notes.
 
-## Current tier status (after step 14: 1459 cyc)
+## Current tier status (after step 15: 1458 cyc)
 
 | tier                     | threshold | status |
 |--------------------------|-----------|--------|
@@ -16,7 +16,7 @@ notes.
 | opus45-2hr               | 1 579     | PASS   |
 | sonnet45                 | 1 548     | PASS   |
 | opus45-11hr              | 1 487     | PASS   |
-| opus45-improved-harness  | 1 363     | FAIL (96 cyc short) |
+| opus45-improved-harness  | 1 363     | FAIL (95 cyc short) |
 
 Shipped config: rounds-outer loop, trained weighted picker (6 properties)
 `Weights(sink=-3, load=-1.5, raw=-0.25, war=6, rigid=0.25, idx=-4)` = **1459 cyc**.
