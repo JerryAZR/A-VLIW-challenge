@@ -19,14 +19,9 @@ import time
 import perf_takehome as pt
 from scheduler import DAG, schedule, Weights
 
-# --- capture the body slot list (short-circuit build) ---
-cap = {}
-_orig = pt.KernelBuilder.build
-pt.KernelBuilder.build = lambda self, slots, vliw=False, seed=None, picker="fma_first", weights=None: (
-    cap.__setitem__("body", list(slots)), [])[1]
+# The resolved body is kept on the builder after build_kernel (no monkeypatch).
 kb = pt.KernelBuilder(); kb.build_kernel(10, 2047, 256, 16)
-pt.KernelBuilder.build = _orig
-dag = DAG(cap["body"])
+dag = DAG(kb.resolved_body)
 PROLOGUE_EPI = 123  # measured: 123 prologue + 0 epilogue (vstores overlap body; pause2 is 0-cyc)
 
 

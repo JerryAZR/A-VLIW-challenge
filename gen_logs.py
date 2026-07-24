@@ -70,7 +70,7 @@ def main():
         machine.run()
     except IndexError:
         crashed = True
-    machine._log.close()
+    machine.close()
 
     # Correctness summary against the reference.
     p = mem[6]

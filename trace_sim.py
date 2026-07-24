@@ -25,8 +25,7 @@ Design notes:
   within a cycle is the scheduler's guarantee, not the sim's).
 """
 
-from problem import Machine, VLEN, N_CORES
-from ir import Instr
+from problem import Machine, VLEN
 
 
 def _fmt_pairs(pairs):
@@ -44,6 +43,16 @@ class TracingMachine(Machine):
         # writes()) instead of re-deriving layouts from slot shapes.
         self._by_rid = {i.rid: i for i in resolved_body} if resolved_body else {}
 
+    def close(self) -> None:
+        """Flush and close the trace log."""
+        self._log.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
     # -- per-engine wrappers that log around the real op -------------------
 
     def _log_slot(self, core, engine, slot, read_pairs, write_pairs):
@@ -57,29 +66,37 @@ class TracingMachine(Machine):
             f"          write {_fmt_pairs(write_pairs)}\n"
         )
 
+    # -- per-slot logging -----------------------------------------------------
+    # step() below iterates the bundle itself (rather than calling the base
+    # Machine.step) for one reason: the base unpacks each slot as ``fn(core,
+    # *slot)``, which re-packs a TaggedSlot into a plain tuple and loses its
+    # rid. Iterating here keeps the original TaggedSlot so its rid reaches the
+    # log. Execution still goes through the base engine fns (alu/valu/load/
+    # store/flow) - those are NOT duplicated - and the commit mirrors the base.
+
     def step(self, instr, core):
-        # Snapshot scratch before the bundle executes (reads see pre-bundle).
+        # Snapshot scratch so each slot's reads reflect pre-bundle state
+        # (read-before-write within a cycle is the scheduler's guarantee).
         pre = list(core.scratch)
-        # Run the real step, but intercept by monkeypatching scratch_write
-        # capture per engine. Simpler: execute engine fns ourselves with logging.
+        engine_fns = {"alu": self.alu, "valu": self.valu, "load": self.load,
+                      "store": self.store, "flow": self.flow}
         self.scratch_write = {}
         self.mem_write = {}
         for name, slots in instr.items():
             if name == "debug":
-                if self.enable_debug:
-                    self._run_debug(slots, core)
+                # Delegate the debug-oracle handling to the base class logic.
+                self._run_debug(slots, core)
                 continue
-            fn = {"alu": self.alu, "valu": self.valu, "load": self.load,
-                  "store": self.store, "flow": self.flow}[name]
+            fn = engine_fns[name]
             for slot in slots:
-                before = dict(self.scratch_write)
-                reads = self._capture_reads(core, pre, name, slot)
+                scratch_before = dict(self.scratch_write)
+                mem_before = dict(self.mem_write)
+                reads = self._capture_reads(pre, slot)
                 fn(core, *slot)
-                writes = [(a, v) for a, v in self.scratch_write.items()
-                          if a not in before]
-                # also capture mem writes for store
-                if name == "store":
-                    writes = [(a, v) for a, v in self.mem_write.items()]
+                writes = ([(a, v) for a, v in self.scratch_write.items()
+                           if a not in scratch_before]
+                          + [(f"mem[{a}]", v) for a, v in self.mem_write.items()
+                             if a not in mem_before])
                 self._log_slot(core, name, slot, reads, writes)
         for addr, val in self.scratch_write.items():
             core.scratch[addr] = val
@@ -89,7 +106,10 @@ class TracingMachine(Machine):
         del self.mem_write
 
     def _run_debug(self, slots, core):
-        # Replicate the debug handling (compare/vcompare) without logging.
+        """The debug-oracle (compare/vcompare) handling, kept in lockstep with
+        the base Machine.step's debug block."""
+        if not self.enable_debug:
+            return
         for slot in slots:
             if slot[0] == "compare":
                 loc, key = slot[1], slot[2]
@@ -116,7 +136,7 @@ class TracingMachine(Machine):
                 out.append((a, pre[a] if 0 <= a < len(pre) else None))
         return out
 
-    def _capture_reads(self, core, pre, engine, slot):
+    def _capture_reads(self, pre, slot):
         """Return [(addr, value)] the slot reads, using pre-bundle scratch.
 
         Driven by the IR instruction the slot's rid points to (ir.py owns the

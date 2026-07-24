@@ -15,14 +15,9 @@ import time
 import perf_takehome as pt
 from scheduler import DAG, schedule, Weights
 
-# --- capture the body slot list (short-circuit build) ---
-cap = {}
-_orig = pt.KernelBuilder.build
-pt.KernelBuilder.build = lambda self, slots, vliw=False, seed=None, picker="fma_first", weights=None: (
-    cap.__setitem__("body", list(slots)), [])[1]
+# The resolved body is kept on the builder after build_kernel (no monkeypatch).
 kb = pt.KernelBuilder(); kb.build_kernel(10, 2047, 256, 16)
-pt.KernelBuilder.build = _orig
-dag = DAG(cap["body"])
+dag = DAG(kb.resolved_body)
 
 PROLOGUE_EPI = 185  # 121 prologue + 64 epilogue (fixed, not scheduled)
 
@@ -45,12 +40,12 @@ for pk in ["idx", "fma_first", "random"]:
     c = sum(1 for x in b if any(e != "debug" for e in x))
     print(f"  {pk:10s}: body {c:5d}  total {c + PROLOGUE_EPI}")
 # previous grid winner, for reference
-ref = Weights(0, 0, 0, 1, 1)
-print(f"  grid winner (0,0,0,1,1): body {body_cycles(ref):5d}  total {total(ref)}")
+ref = Weights(sink=0, load=0, raw=0, war=1, rigid=1, idx=0)
+print(f"  grid winner {ref}: body {body_cycles(ref):5d}  total {total(ref)}")
 
 # --- random search ---
-# Discrete value set with negatives; 7^5 = 16807 possible combos sampled at
-# random so we explore many distinct regions without grinding any one axis.
+# Discrete value set with negatives; sampled at random so we explore many
+# distinct regions without grinding any one axis.
 VALUES = [-4, -2, -1, 0, 1, 2, 4]
 budget = float(sys.argv[1]) if len(sys.argv) > 1 else 180.0
 rng = random.Random(12345)
@@ -62,7 +57,7 @@ t0 = time.time()
 n = 0
 last_heartbeat = t0
 while time.time() - t0 < budget:
-    w = Weights(*(rng.choice(VALUES) for _ in range(5)))
+    w = Weights(*(rng.choice(VALUES) for _ in range(6)))
     tot = total(w)
     results.append((tot, w))
     n += 1
