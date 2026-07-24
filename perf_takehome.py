@@ -49,6 +49,10 @@ class KernelBuilder:
         # Rename engine: owns all scratch space. Created by build_kernel
         # once the pinned symbols are declared.
         self.re = None
+        # The resolved (address-assigned) body instructions, kept from the
+        # last build() so a tracing harness can map rid -> instruction for
+        # operand-level read/write capture.
+        self.resolved_body = None
 
     def debug_info(self):
         return DebugInfo(scratch_map=self.re.debug_map())
@@ -67,6 +71,7 @@ class KernelBuilder:
         """
         if not vliw:
             return [{s.engine: [s.lower()]} for s in slots]
+        self.resolved_body = list(slots)
         from scheduler import DAG, schedule, prune_to_stores
         dag = DAG(slots)
         pruned = prune_to_stores(dag)
