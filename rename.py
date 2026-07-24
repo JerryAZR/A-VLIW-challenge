@@ -149,7 +149,7 @@ class RenameEngine:
                 continue
             rd = [self.read_op(o) for o in instr.read_operands()]
             wr = [self.write_op(o, rid) for o in instr.write_operands()]
-            out.append(instr.resolve(rd, wr))
+            out.append(instr.rebuild(rd, wr))
         af_log.close(); alloc_log.close(); gather_log.close()
         self._alloc_log = None
         return out

@@ -90,7 +90,9 @@ class Reg:
         assert 0 <= j < VLEN
         return LaneRef(self, j)
 
-    def resolve(self, res: Resolver = _ident) -> int:
+    def addr_of(self, res: Resolver = _ident) -> int:
+        """The physical scratch address of this register (``res`` maps a Reg
+        to its home; identity for pinned registers)."""
         return res(self)
 
     def reg_id(self) -> RegId:
@@ -103,8 +105,10 @@ class LaneRef:
     vec: Union[Sym, Reg]
     j: int
 
-    def resolve(self, res: Resolver = _ident) -> int:
-        assert isinstance(self.vec, Reg), "resolve() requires resolved phase"
+    def addr_of(self, res: Resolver = _ident) -> int:
+        """The physical scratch address of this lane: the base vector's home
+        plus the lane index."""
+        assert isinstance(self.vec, Reg), "addr_of() requires resolved phase"
         return res(self.vec) + self.j
 
     def reg_id(self) -> RegId:
@@ -152,7 +156,7 @@ class Instr:
     rid: int = field(default_factory=lambda: Instr._fresh_rid(), kw_only=True)
     # Operand fields read / written by this instruction (field names) -
     # they define the position order of the read_operands() /
-    # write_operands() / resolve() rename contract. Reads are always
+    # write_operands() / rebuild() rename contract. Reads are always
     # resolved before writes (a self-read-write instruction must see the
     # OLD home on its reads). Non-operand fields (op strings, immediates,
     # keys) are never listed and pass through untouched.
@@ -201,7 +205,7 @@ class Instr:
         """Write operands, in field order."""
         return tuple(getattr(self, f) for f in self._WR)
 
-    def resolve(self, rd: list, wr: list) -> "Instr":
+    def rebuild(self, rd: list, wr: list) -> "Instr":
         """Rebuild with resolved operands: position-indexed lists of the
         same length/order as read_operands() / write_operands(). ``rid`` is
         a real field, so ``dataclasses.replace`` carries it onto the rebuilt
@@ -233,8 +237,8 @@ class Alu(Instr):
         return _ids([self.dest])
 
     def lower(self, res=_ident):
-        return (self.op, self.dest.resolve(res),
-                self.a1.resolve(res), self.a2.resolve(res))
+        return (self.op, self.dest.addr_of(res),
+                self.a1.addr_of(res), self.a2.addr_of(res))
 
 
 # ---------------------------------------------------------------------------
@@ -261,8 +265,8 @@ class VecElem(Instr):
         return _ids([self.dest])
 
     def lower(self, res=_ident):
-        return (self.op, self.dest.resolve(res),
-                self.a1.resolve(res), self.a2.resolve(res))
+        return (self.op, self.dest.addr_of(res),
+                self.a1.addr_of(res), self.a2.addr_of(res))
 
 
 @dataclass(frozen=True)
@@ -284,8 +288,8 @@ class VecFma(Instr):
         return _ids([self.dest])
 
     def lower(self, res=_ident):
-        return ("multiply_add", self.dest.resolve(res), self.a.resolve(res),
-                self.b.resolve(res), self.c.resolve(res))
+        return ("multiply_add", self.dest.addr_of(res), self.a.addr_of(res),
+                self.b.addr_of(res), self.c.addr_of(res))
 
 
 @dataclass(frozen=True)
@@ -304,7 +308,7 @@ class VBroadcast(Instr):
         return _ids([self.dest])
 
     def lower(self, res=_ident):
-        return ("vbroadcast", self.dest.resolve(res), self.src.resolve(res))
+        return ("vbroadcast", self.dest.addr_of(res), self.src.addr_of(res))
 
 
 # ---------------------------------------------------------------------------
@@ -327,7 +331,7 @@ class Load(Instr):
         return _ids([self.dest])
 
     def lower(self, res=_ident):
-        return ("load", self.dest.resolve(res), self.addr.resolve(res))
+        return ("load", self.dest.addr_of(res), self.addr.addr_of(res))
 
 
 @dataclass(frozen=True)
@@ -345,7 +349,7 @@ class VLoad(Instr):
         return _ids([self.dest])
 
     def lower(self, res=_ident):
-        return ("vload", self.dest.resolve(res), self.addr.resolve(res))
+        return ("vload", self.dest.addr_of(res), self.addr.addr_of(res))
 
 
 @dataclass(frozen=True)
@@ -391,7 +395,7 @@ class Const(Instr):
         return _ids([self.dest])
 
     def lower(self, res=_ident):
-        return ("const", self.dest.resolve(res), self.val)
+        return ("const", self.dest.addr_of(res), self.val)
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +417,7 @@ class VStore(Instr):
         return []
 
     def lower(self, res=_ident):
-        return ("vstore", self.addr.resolve(res), self.src.resolve(res))
+        return ("vstore", self.addr.addr_of(res), self.src.addr_of(res))
 
 
 # ---------------------------------------------------------------------------
@@ -438,8 +442,8 @@ class VSelect(Instr):
         return _ids([self.dest])
 
     def lower(self, res=_ident):
-        return ("vselect", self.dest.resolve(res), self.cond.resolve(res),
-                self.a.resolve(res), self.b.resolve(res))
+        return ("vselect", self.dest.addr_of(res), self.cond.addr_of(res),
+                self.a.addr_of(res), self.b.addr_of(res))
 
 
 @dataclass(frozen=True)
@@ -503,4 +507,4 @@ class DebugVCompare(Instr):
         return []
 
     def lower(self, res=_ident):
-        return ("vcompare", self.loc.resolve(res), self.keys)
+        return ("vcompare", self.loc.addr_of(res), self.keys)

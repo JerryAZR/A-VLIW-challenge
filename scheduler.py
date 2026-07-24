@@ -587,7 +587,7 @@ def _vec_instr_to_alu_lanes(instr: Instr, lanes) -> list[tuple]:
         raise NotImplementedError("multiply_add cannot spill to alu (no scalar fma)")
     rid = instr.rid
     if isinstance(instr, VBroadcast):
-        return [TaggedSlot(("+", instr.dest.addr + j, instr.src.resolve(), 0), rid)
+        return [TaggedSlot(("+", instr.dest.addr + j, instr.src.addr_of(), 0), rid)
                 for j in lanes]
     assert isinstance(instr, VecElem)
     return [TaggedSlot(
