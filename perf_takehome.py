@@ -21,8 +21,8 @@ import random
 import unittest
 
 from ir import (
-    Reg, Alu, VecElem, VecFma, VBroadcast, Load, VLoad, Const, VStore,
-    VSelect, Pause, DebugVCompare,
+    Sym, RenameEngine, Alu, VecElem, VecFma, VBroadcast, Load, VLoad, Const,
+    VStore, VSelect, Pause, DebugVCompare,
 )
 from scheduler import Weights
 from problem import (
@@ -45,13 +45,15 @@ from problem import (
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
-        self.scratch = {}
-        self.scratch_debug = {}
+        self.scratch = {}            # name -> Sym (scalar header vars)
         self.scratch_ptr = 0
         self.const_map = {}
+        # Rename engine: every symbol is pinned to the hand-laid-out address
+        # (translation only; dynamic allocation is a future extension).
+        self.re = RenameEngine()
 
     def debug_info(self):
-        return DebugInfo(scratch_map=self.scratch_debug)
+        return DebugInfo(scratch_map=self.re.debug_map())
 
     def build(self, slots: list, vliw: bool = False,
               seed: int | None = None, picker: str = "fma_first",
@@ -78,24 +80,39 @@ class KernelBuilder:
         return schedule(dag, seed=seed, cap=cap, picker=picker, weights=weights)
 
     def add(self, instr):
-        """Append a single IR instruction as a one-slot bundle (linear code:
-        prologue/epilogue). Lowered immediately - these never see the DAG."""
+        """Append a single symbolic IR instruction as a one-slot bundle
+        (linear code: prologue/epilogue). Resolved + lowered immediately -
+        these never see the DAG."""
+        instr = self.re.resolve_instr(instr)
         self.instrs.append({instr.engine: [instr.lower()]})
 
-    def alloc_scratch(self, name=None, length=1):
+    def alloc_scratch(self, name=None, length=1, is_vec=False):
+        """Declare a symbol pinned at the next scratch address (sequential
+        layout - same allocation order as the hand-pinned address map)."""
         addr = self.scratch_ptr
+        sym = self.re.pin(Sym(name or f"@{addr}", is_vec), addr)
         if name is not None:
-            self.scratch[name] = addr
-            self.scratch_debug[addr] = (name, length)
+            self.scratch[name] = sym
         self.scratch_ptr += length
         assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
-        return addr
+        return sym
+
+    def alloc_plane(self, name, n):
+        """Declare n vector symbols pinned as one contiguous plane
+        (n*VLEN words, 8-aligned): sym[g] at base + g*VLEN - group g's
+        vector of a per-lane SoA plane. Returns the symbol list."""
+        base = self.scratch_ptr
+        syms = [self.re.pin(Sym(f"{name}[{g}]", True), base + g * VLEN)
+                for g in range(n)]
+        self.scratch_ptr += n * VLEN
+        assert self.scratch_ptr <= SCRATCH_SIZE, "Out of scratch space"
+        return syms
 
     def scratch_const(self, val, name=None):
         if val not in self.const_map:
-            addr = self.alloc_scratch(name)
-            self.add(Const(Reg(addr), val))
-            self.const_map[val] = addr
+            sym = self.alloc_scratch(name)
+            self.add(Const(sym, val))
+            self.const_map[val] = sym
         return self.const_map[val]
 
     def build_vec_hash(self, val_vec, t1_vec, t2_vec, r, base_i,
@@ -122,20 +139,17 @@ class KernelBuilder:
             if op1 == "+" and op2 == "+":
                 # Linear stage: (a + K) + (a << s) == a*(1+2^s) + K, one fma.
                 mult = (1 << val3) + 1
-                slots.append(VecFma(Reg(val_vec, True), Reg(val_vec, True),
-                                    Reg(fma_vec_consts[mult], True),
-                                    Reg(fma_vec_consts[val1], True)))
+                slots.append(VecFma(val_vec, val_vec,
+                                    fma_vec_consts[mult],
+                                    fma_vec_consts[val1]))
             else:
                 # Irreducible xor/add-shift stage: 2 parallel elementwise
                 # transforms of val_vec, then a `^` (or `+`) combine.
-                slots.append(VecElem(op1, Reg(t1_vec, True), Reg(val_vec, True),
-                                     Reg(irr_vec_consts[val1], True)))
-                slots.append(VecElem(op3, Reg(t2_vec, True), Reg(val_vec, True),
-                                     Reg(irr_vec_consts[val3], True)))
-                slots.append(VecElem(op2, Reg(val_vec, True), Reg(t1_vec, True),
-                                     Reg(t2_vec, True)))
+                slots.append(VecElem(op1, t1_vec, val_vec, irr_vec_consts[val1]))
+                slots.append(VecElem(op3, t2_vec, val_vec, irr_vec_consts[val3]))
+                slots.append(VecElem(op2, val_vec, t1_vec, t2_vec))
             keys = [(r, base_i + j, "hash_stage", hi) for j in range(VLEN)]
-            slots.append(DebugVCompare(Reg(val_vec, True), keys))
+            slots.append(DebugVCompare(val_vec, keys))
         return slots
 
     def build_kernel(
@@ -225,11 +239,13 @@ class KernelBuilder:
         ]
 
         # ---- Phase 1: planes (5 × V=256 = 1280 words, 8-aligned) ----
-        val_base  = self.alloc_scratch("val", V)    # plane 0: running hash + carried state
-        addr_base = self.alloc_scratch("addr", V)   # plane 1: tree ADDRESS = idx + forest_p (stored, not idx)
-        t1_base   = self.alloc_scratch("t1",  V)    # plane 2: per-lane stage scratch
-        t2_base   = self.alloc_scratch("t2",  V)    # plane 3: per-lane stage scratch
-        nv_base   = self.alloc_scratch("nv",  V)    # plane 4: node_val landing / spare
+        # Per-lane SoA planes as 32 group-vector symbols each: val[g] is
+        # lanes 8g..8g+7 of the plane, pinned at plane_base + 8g.
+        val  = self.alloc_plane("val",  n_groups)  # running hash + carried state
+        addr = self.alloc_plane("addr", n_groups)  # tree ADDRESS = idx + forest_p (stored, not idx)
+        t1   = self.alloc_plane("t1",   n_groups)  # per-lane stage scratch
+        t2   = self.alloc_plane("t2",   n_groups)  # per-lane stage scratch
+        nv   = self.alloc_plane("nv",   n_groups)  # node_val landing / spare
 
         # ---- Phase 2: vector section (8-word regions, CONST first then VAR) ----
         # No addr_vec/sel_lo_vec/sel_hi_vec: those short-lived temporaries reuse
@@ -243,34 +259,34 @@ class KernelBuilder:
         # scalars: each is created by `load const` into its own lane 0, then
         # self-broadcast (vbroadcast vec, vec) - see the prologue. Scalar uses of
         # a value read the matching const_vec's lane 0.
-        const_vec_0    = self.alloc_scratch("const_vec_0", VLEN)
-        const_vec_1    = self.alloc_scratch("const_vec_1", VLEN)
-        const_vec_2    = self.alloc_scratch("const_vec_2", VLEN)
-        const_vec_3    = self.alloc_scratch("const_vec_3", VLEN)
-        const_vec_9    = self.alloc_scratch("const_vec_9", VLEN)     # stage4 mult + stage3 shift
-        const_vec_16   = self.alloc_scratch("const_vec_16", VLEN)   # stage5 shift
-        const_vec_19   = self.alloc_scratch("const_vec_19", VLEN)   # stage1 shift
-        const_vec_33   = self.alloc_scratch("const_vec_33", VLEN)   # stage2 mult
-        const_vec_4097 = self.alloc_scratch("const_vec_4097", VLEN) # stage0 mult
-        K0_vec = self.alloc_scratch("K0_vec", VLEN)   # stage 0 addend
-        K1_vec = self.alloc_scratch("K1_vec", VLEN)   # stage 1 xor const
-        K2_vec = self.alloc_scratch("K2_vec", VLEN)   # stage 2 addend
-        K3_vec = self.alloc_scratch("K3_vec", VLEN)   # stage 3 add const
-        K4_vec = self.alloc_scratch("K4_vec", VLEN)   # stage 4 addend
-        K5_vec = self.alloc_scratch("K5_vec", VLEN)   # stage 5 xor const
+        const_vec_0    = self.alloc_scratch("const_vec_0", VLEN, is_vec=True)
+        const_vec_1    = self.alloc_scratch("const_vec_1", VLEN, is_vec=True)
+        const_vec_2    = self.alloc_scratch("const_vec_2", VLEN, is_vec=True)
+        const_vec_3    = self.alloc_scratch("const_vec_3", VLEN, is_vec=True)
+        const_vec_9    = self.alloc_scratch("const_vec_9", VLEN, is_vec=True)     # stage4 mult + stage3 shift
+        const_vec_16   = self.alloc_scratch("const_vec_16", VLEN, is_vec=True)   # stage5 shift
+        const_vec_19   = self.alloc_scratch("const_vec_19", VLEN, is_vec=True)   # stage1 shift
+        const_vec_33   = self.alloc_scratch("const_vec_33", VLEN, is_vec=True)   # stage2 mult
+        const_vec_4097 = self.alloc_scratch("const_vec_4097", VLEN, is_vec=True) # stage0 mult
+        K0_vec = self.alloc_scratch("K0_vec", VLEN, is_vec=True)   # stage 0 addend
+        K1_vec = self.alloc_scratch("K1_vec", VLEN, is_vec=True)   # stage 1 xor const
+        K2_vec = self.alloc_scratch("K2_vec", VLEN, is_vec=True)   # stage 2 addend
+        K3_vec = self.alloc_scratch("K3_vec", VLEN, is_vec=True)   # stage 3 add const
+        K4_vec = self.alloc_scratch("K4_vec", VLEN, is_vec=True)   # stage 4 addend
+        K5_vec = self.alloc_scratch("K5_vec", VLEN, is_vec=True)   # stage 5 xor const
         # VAR vectors: runtime values (forest_p = header broadcast; tree_preload
         # = non-uniform vload of tree[0..7]; tree0..6 = its lane broadcasts).
-        forest_p_vec = self.alloc_scratch("forest_p_vec", VLEN)
-        neg_fp1_vec  = self.alloc_scratch("neg_fp1_vec", VLEN)  # 1 - forest_p (next-addr: 2*addr + neg_fp1 + parity)
-        pos_fp5_vec  = self.alloc_scratch("pos_fp5_vec", VLEN)  # 5 + forest_p
-        tree_preload = self.alloc_scratch("tree_preload", VLEN)  # 8 words: tree[0..7]
-        tree0_vec = self.alloc_scratch("tree0_vec", VLEN)
-        tree1_vec = self.alloc_scratch("tree1_vec", VLEN)
-        tree2_vec = self.alloc_scratch("tree2_vec", VLEN)
-        tree3_vec = self.alloc_scratch("tree3_vec", VLEN)
-        tree4_vec = self.alloc_scratch("tree4_vec", VLEN)
-        tree5_vec = self.alloc_scratch("tree5_vec", VLEN)
-        tree6_vec = self.alloc_scratch("tree6_vec", VLEN)
+        forest_p_vec = self.alloc_scratch("forest_p_vec", VLEN, is_vec=True)
+        neg_fp1_vec  = self.alloc_scratch("neg_fp1_vec", VLEN, is_vec=True)  # 1 - forest_p (next-addr: 2*addr + neg_fp1 + parity)
+        pos_fp5_vec  = self.alloc_scratch("pos_fp5_vec", VLEN, is_vec=True)  # 5 + forest_p
+        tree_preload = self.alloc_scratch("tree_preload", VLEN, is_vec=True)  # 8 words: tree[0..7]
+        tree0_vec = self.alloc_scratch("tree0_vec", VLEN, is_vec=True)
+        tree1_vec = self.alloc_scratch("tree1_vec", VLEN, is_vec=True)
+        tree2_vec = self.alloc_scratch("tree2_vec", VLEN, is_vec=True)
+        tree3_vec = self.alloc_scratch("tree3_vec", VLEN, is_vec=True)
+        tree4_vec = self.alloc_scratch("tree4_vec", VLEN, is_vec=True)
+        tree5_vec = self.alloc_scratch("tree5_vec", VLEN, is_vec=True)
+        tree6_vec = self.alloc_scratch("tree6_vec", VLEN, is_vec=True)
         tree_vecs = [tree0_vec, tree1_vec, tree2_vec,
                      tree3_vec, tree4_vec, tree5_vec, tree6_vec]
 
@@ -311,7 +327,9 @@ class KernelBuilder:
         # is `load const`-ed and inp_values_p added in the body (independent per
         # group - no addr_a chain), so the vstores can issue 2/cyc as soon as
         # each group's round-15 val is ready.
-        out_addr_base = self.alloc_scratch("out_addr", n_groups)  # n_groups words
+        out_addr = [self.re.pin(Sym(f"out_addr[{g}]"), self.scratch_ptr + g)
+                    for g in range(n_groups)]
+        self.scratch_ptr += n_groups
 
         assert self.scratch_ptr <= SCRATCH_SIZE, "scratch overflow"
 
@@ -319,44 +337,40 @@ class KernelBuilder:
         # Prologue: load header; vload val[256]; broadcast consts; pause
         # =====================================================================
         for i, v in enumerate(init_vars):
-            self.add(Const(Reg(addr_a), i))                        # addr_a := i
-            self.add(Load(Reg(self.scratch[v]), Reg(addr_a)))       # scratch[v] := mem[i]
+            self.add(Const(addr_a, i))                              # addr_a := i
+            self.add(Load(self.scratch[v], addr_a))                 # scratch[v] := mem[i]
 
         # vload val[256] as 32 vectors of 8 contiguous words from mem[inp_values_p..].
-        self.add(Alu("+", Reg(addr_a), Reg(self.scratch["inp_values_p"]),
-                     Reg(const_vec_0)))
+        self.add(Alu("+", addr_a, self.scratch["inp_values_p"],
+                     const_vec_0.lane(0)))
         for k in range(n_groups):
-            self.add(VLoad(Reg(val_base + k * VLEN, True), Reg(addr_a)))
+            self.add(VLoad(val[k], addr_a))
             if k < n_groups - 1:
-                self.add(Alu("+", Reg(addr_a), Reg(addr_a), Reg(eight_const)))
+                self.add(Alu("+", addr_a, addr_a, eight_const))
 
         # Broadcast forest_values_p (from a header var, not a literal).
-        self.add(VBroadcast(Reg(forest_p_vec, True),
-                            Reg(self.scratch["forest_values_p"])))
+        self.add(VBroadcast(forest_p_vec, self.scratch["forest_values_p"]))
 
         # Create each const vector by `load const` into its own lane 0 then
         # self-broadcast (vbroadcast vec, vec reads lane 0, writes all 8). No
         # separate broadcast-source scalar needed.
-        for vec_addr, value in vec_bcasts:
-            self.add(Const(Reg(vec_addr), value))
-            self.add(VBroadcast(Reg(vec_addr, True), Reg(vec_addr)))
+        for vec_sym, value in vec_bcasts:
+            self.add(Const(vec_sym.lane(0), value))
+            self.add(VBroadcast(vec_sym, vec_sym.lane(0)))
 
         # neg_fp1 = 1 - forest_values_p (used by the next-addr update). Computed
-        self.add(VecElem("-", Reg(neg_fp1_vec, True), Reg(const_vec_1, True),
-                         Reg(forest_p_vec, True)))
+        self.add(VecElem("-", neg_fp1_vec, const_vec_1, forest_p_vec))
         # pos_fp5 = 5 + forest_values_p (used by the level 2 select). Computed
-        self.add(VecElem("+", Reg(pos_fp5_vec, True), Reg(const_vec_2, True),
-                         Reg(const_vec_3, True)))  # pos_fp5 = 5
-        self.add(VecElem("+", Reg(pos_fp5_vec, True), Reg(pos_fp5_vec, True),
-                         Reg(forest_p_vec, True)))
+        self.add(VecElem("+", pos_fp5_vec, const_vec_2, const_vec_3))  # pos_fp5 = 5
+        self.add(VecElem("+", pos_fp5_vec, pos_fp5_vec, forest_p_vec))
 
         # vload tree[0..7] (levels 0-2 = 7 nodes + 1 bonus) into tree_preload.
-        self.add(Alu("+", Reg(addr_a), Reg(self.scratch["forest_values_p"]),
-                     Reg(const_vec_0)))
-        self.add(VLoad(Reg(tree_preload, True), Reg(addr_a)))
+        self.add(Alu("+", addr_a, self.scratch["forest_values_p"],
+                     const_vec_0.lane(0)))
+        self.add(VLoad(tree_preload, addr_a))
         # Broadcast tree[0..6] into shared vector constants.
         for i in range(7):
-            self.add(VBroadcast(Reg(tree_vecs[i], True), Reg(tree_preload, True).lane(i)))
+            self.add(VBroadcast(tree_vecs[i], tree_preload.lane(i)))
 
         # Pause 1 -- match reference_kernel2's first yield (initial mem).
         self.add(Pause())
@@ -371,18 +385,17 @@ class KernelBuilder:
         # Scheduled early; ready well before the vstores need them.
         inp_values_p = self.scratch["inp_values_p"]
         for g in range(n_groups):
-            body.append(Const(Reg(out_addr_base + g), g * VLEN))   # offset 8g
-            body.append(Alu("+", Reg(out_addr_base + g), Reg(out_addr_base + g),
-                            Reg(inp_values_p)))
+            body.append(Const(out_addr[g], g * VLEN))   # offset 8g
+            body.append(Alu("+", out_addr[g], out_addr[g], inp_values_p))
         for r in range(rounds):
             for g in range(n_groups):
                 is_wrap = (r == WRAP_ROUND)
-                # per-group vectors into the SoA per-lane planes (8 contiguous words each)
-                val_vec  = val_base + g * VLEN
-                addr_vec = addr_base + g * VLEN
-                t1_g     = t1_base  + g * VLEN
-                t2_g     = t2_base  + g * VLEN
-                nv_g     = nv_base  + g * VLEN
+                # per-group vector symbols of the SoA per-lane planes
+                val_vec  = val[g]
+                addr_vec = addr[g]
+                t1_g     = t1[g]
+                t2_g     = t2[g]
+                nv_g     = nv[g]
                 base_i   = g * VLEN
                 keyval  = [(r, base_i + j, "val") for j in range(VLEN)]
                 keynv   = [(r, base_i + j, "node_val") for j in range(VLEN)]
@@ -391,27 +404,21 @@ class KernelBuilder:
                 # --- node_val gather or preload-select (rounds 0-2 use preloaded) ---
                 if r in (0, 11):
                     # Level 0: all lanes at idx=0. node_val = tree[0].
-                    body.append(VecElem("^", Reg(nv_g, True), Reg(tree0_vec, True),
-                                        Reg(const_vec_0, True)))
+                    body.append(VecElem("^", nv_g, tree0_vec, const_vec_0))
                 elif r in (1, 12):
                     # Level 1: idx in {1,2}. Recover idx = addr - forest_p,
                     # then 1 vselect on idx bit 0 (idx=1 -> tree1, idx=2 -> tree2).
                     # parity from last round was in t1_g
-                    body.append(VSelect(Reg(nv_g, True), Reg(t1_g, True),
-                                        Reg(tree2_vec, True), Reg(tree1_vec, True)))
+                    body.append(VSelect(nv_g, t1_g, tree2_vec, tree1_vec))
                 elif r in (2, 13):
                     # Level 2: idx in {3,4,5,6}. Recover idx, subtract level
                     # base (3), then 2-level select on bits 0-1 of (idx-3).
                     #   idx-3=0->tree3, 1->tree4, 2->tree5, 3->tree6
 
-                    body.append(VSelect(Reg(nv_g, True), Reg(t1_g, True),
-                                        Reg(tree4_vec, True), Reg(tree3_vec, True)))  # bit0?tree4:tree3
-                    body.append(VSelect(Reg(t2_g, True), Reg(t1_g, True),
-                                        Reg(tree6_vec, True), Reg(tree5_vec, True)))  # bit0?tree6:tree5
-                    body.append(VecElem("<", Reg(t1_g, True), Reg(addr_vec, True),
-                                        Reg(pos_fp5_vec, True)))   # low?
-                    body.append(VSelect(Reg(nv_g, True), Reg(t1_g, True),
-                                        Reg(nv_g, True), Reg(t2_g, True)))  # low?nv:t2
+                    body.append(VSelect(nv_g, t1_g, tree4_vec, tree3_vec))  # bit0?tree4:tree3
+                    body.append(VSelect(t2_g, t1_g, tree6_vec, tree5_vec))  # bit0?tree6:tree5
+                    body.append(VecElem("<", t1_g, addr_vec, pos_fp5_vec))   # low?
+                    body.append(VSelect(nv_g, t1_g, nv_g, t2_g))  # low?nv:t2
                 else:
                     # Rounds 3+: gather from mem. addr_vec already holds the
                     # tree address (idx + forest_p), so the loads read it
@@ -419,22 +426,20 @@ class KernelBuilder:
                     # each load reads addr_g+j as the address and writes nv_g+j
                     # as the value. nv_g is then read by the entry XOR below.
                     for j in range(VLEN):
-                        body.append(Load(Reg(nv_g, True).lane(j),
-                                         Reg(addr_vec, True).lane(j)))
+                        body.append(Load(nv_g.lane(j), addr_vec.lane(j)))
 
-                body.append(DebugVCompare(Reg(nv_g, True), keynv))
-                body.append(DebugVCompare(Reg(val_vec, True), keyval))  # val before xor
+                body.append(DebugVCompare(nv_g, keynv))
+                body.append(DebugVCompare(val_vec, keyval))  # val before xor
 
                 # --- entry XOR: val_vec = val_vec ^ nv_g  (a) ---
-                body.append(VecElem("^", Reg(val_vec, True), Reg(val_vec, True),
-                                    Reg(nv_g, True)))
+                body.append(VecElem("^", val_vec, val_vec, nv_g))
 
                 # --- 12-slot hash, fully on valu (8 lanes / slot) ---
                 body.extend(self.build_vec_hash(val_vec, t1_g, t2_g, r, base_i,
                                                 fma_vec_consts, irr_vec_consts))
 
                 # debug: hashed_val == v == val_vec after hash
-                body.append(DebugVCompare(Reg(val_vec, True), keyhv))
+                body.append(DebugVCompare(val_vec, keyhv))
 
                 # --- post-hash: idx update or wrap (branchless, on valu) ---
                 # --- post-hash: addr update (store addr = idx + forest_p, not
@@ -445,28 +450,25 @@ class KernelBuilder:
                 # (addr plane is not yet valid). ---
                 if is_wrap:
                     # idx -> 0, so addr = forest_p = 1 - neg_fp1.
-                    body.append(VecElem("-", Reg(addr_vec, True), Reg(const_vec_1, True),
-                                        Reg(neg_fp1_vec, True)))
+                    body.append(VecElem("-", addr_vec, const_vec_1, neg_fp1_vec))
                 else:
-                    body.append(VecElem("&", Reg(t1_g, True), Reg(val_vec, True),
-                                        Reg(const_vec_1, True)))        # parity = v & 1
+                    body.append(VecElem("&", t1_g, val_vec, const_vec_1))        # parity = v & 1
                     if r == 0:
                         # idx=0: next_addr = forest_p + 1 + parity = (2 - neg_fp1) + parity
-                        body.append(VecElem("-", Reg(t2_g, True), Reg(const_vec_2, True),
-                                            Reg(neg_fp1_vec, True)))  # 2 - neg_fp1
+                        body.append(VecElem("-", t2_g, const_vec_2, neg_fp1_vec))  # 2 - neg_fp1
                     else:
                         # next_addr base = 2*addr + neg_fp1
-                        body.append(VecFma(Reg(t2_g, True), Reg(addr_vec, True),
-                                           Reg(const_vec_2, True), Reg(neg_fp1_vec, True)))
-                    body.append(VecElem("+", Reg(addr_vec, True), Reg(t2_g, True),
-                                        Reg(t1_g, True)))        # next_addr = base + parity
+                        body.append(VecFma(t2_g, addr_vec, const_vec_2, neg_fp1_vec))
+                    body.append(VecElem("+", addr_vec, t2_g, t1_g))        # next_addr = base + parity
 
                 # --- on the final round, vstore val_g to its output address
                 # (overlaps the body tail via the idle store engine; the linear
                 # epilogue vstore loop is gone) ---
                 if r == rounds - 1:
-                    body.append(VStore(Reg(out_addr_base + g), Reg(val_vec, True)))
+                    body.append(VStore(out_addr[g], val_vec))
 
+        # Rename: symbolic -> resolved IR (all-pinned translation), then schedule.
+        body = self.re.resolve_instrs(body)
         body_instrs = self.build(body, vliw=True, seed=42, picker="weighted",
                                    weights=Weights(sink=-3, load=-1.5, raw=-0.25,
                                                    war=6, rigid=0.25, idx=-4))
