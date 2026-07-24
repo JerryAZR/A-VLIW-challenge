@@ -135,8 +135,7 @@ class ReadWriteTable:
         list isn't attached."""
         if self._instrs is None:
             return instr_id
-        from rename import rid_of
-        return rid_of(self._instrs[instr_id])
+        return self._instrs[instr_id].rid
 
     @staticmethod
     def _lanes(reg: Reg) -> list[tuple[int, int]]:
@@ -586,7 +585,7 @@ def _vec_instr_to_alu_lanes(instr: Instr, lanes) -> list[tuple]:
     """
     if isinstance(instr, VecFma):
         raise NotImplementedError("multiply_add cannot spill to alu (no scalar fma)")
-    rid = getattr(instr, "rid", -1)
+    rid = instr.rid
     if isinstance(instr, VBroadcast):
         return [TaggedSlot(("+", instr.dest.addr + j, instr.src.resolve(), 0), rid)
                 for j in lanes]

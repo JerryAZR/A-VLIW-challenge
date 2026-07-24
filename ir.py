@@ -37,7 +37,7 @@ Only the ops the kernel actually emits are modeled. PC-modifying flow ops
 prologue/epilogue and the DAG builder rejects it.
 """
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import ClassVar, Callable, Union
 
 from problem import VLEN
@@ -134,9 +134,22 @@ def _ids(ops) -> list[RegId]:
     return [o.reg_id() for o in ops]
 
 
+@dataclass(frozen=True)
 class Instr:
-    """Base class for IR instructions. ``engine`` is a ClassVar."""
+    """Base class for IR instructions. ``engine`` is a ClassVar.
+
+    ``rid`` is the stable rename id, assigned automatically at construction
+    (a process-unique, monotonically increasing id). It is keyword-only so it
+    never interferes with subclasses' positional operand fields. Because it is
+    a normal field, ``dataclasses.replace`` carries it through the rename
+    ``resolve()`` rebuild unchanged - the resolved instruction keeps the same
+    rid as its symbolic source, so an executed slot traces back end-to-end
+    (rename -> resolve -> schedule -> trace). "-1" never occurs in practice
+    (every instruction gets a fresh id at birth); it is only the nominal
+    default for documentation."""
     engine: ClassVar[str]
+    _next_rid: ClassVar[int] = 0
+    rid: int = field(default_factory=lambda: Instr._fresh_rid(), kw_only=True)
     # Operand fields read / written by this instruction (field names) -
     # they define the position order of the read_operands() /
     # write_operands() / resolve() rename contract. Reads are always
@@ -145,6 +158,12 @@ class Instr:
     # keys) are never listed and pass through untouched.
     _RD: ClassVar[tuple] = ()
     _WR: ClassVar[tuple] = ()
+
+    @classmethod
+    def _fresh_rid(cls) -> int:
+        r = Instr._next_rid
+        Instr._next_rid += 1
+        return r
 
     def reads(self) -> list[RegId]:
         raise NotImplementedError
@@ -161,15 +180,12 @@ class Instr:
 
         Returns a single ``TaggedSlot`` for scalar ops, or a list of
         ``TaggedSlot`` for ops that lower to several slots (per-lane const).
-        The rid comes from the ``rid`` attribute the rename pass stamps on the
-        instruction (-1 if it never passed through rename). The scheduler
-        emits these so a tracing simulator can recover the source id of every
-        executed slot."""
-        rid = getattr(self, "rid", -1)
+        The scheduler emits these so a tracing simulator can recover the
+        source id of every executed slot."""
         low = self.lower(res)
         if isinstance(low, list):
-            return [TaggedSlot(t, rid) for t in low]
-        return TaggedSlot(low, rid)
+            return [TaggedSlot(t, self.rid) for t in low]
+        return TaggedSlot(low, self.rid)
 
     # -- rename contract -------------------------------------------------
     # The instruction exposes its read/write operands positionally; the
@@ -187,16 +203,12 @@ class Instr:
 
     def resolve(self, rd: list, wr: list) -> "Instr":
         """Rebuild with resolved operands: position-indexed lists of the
-        same length/order as read_operands() / write_operands(). The stable
-        rename id (``rid``, attached by the rename pass, not a dataclass
-        field) is carried onto the rebuilt instruction so it survives."""
+        same length/order as read_operands() / write_operands(). ``rid`` is
+        a real field, so ``dataclasses.replace`` carries it onto the rebuilt
+        instruction automatically."""
         assert len(rd) == len(self._RD) and len(wr) == len(self._WR)
-        new = replace(self, **dict(zip(self._RD, rd)),
-                      **dict(zip(self._WR, wr)))
-        rid = getattr(self, "rid", None)
-        if rid is not None:
-            object.__setattr__(new, "rid", rid)
-        return new
+        return replace(self, **dict(zip(self._RD, rd)),
+                       **dict(zip(self._WR, wr)))
 
 
 # ---------------------------------------------------------------------------

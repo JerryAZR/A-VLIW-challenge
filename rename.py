@@ -56,28 +56,16 @@ SCALAR_POOL_WORDS = 48
 # ``None`` disables all logging.
 DEBUG_DIR: str | None = None
 
-# Monotonic source of stable instruction ids. Each instruction that enters
-# the rename pass is stamped with a unique ``rid`` (rename id) that never
-# changes, so the auto-free dump, the alloc/free log, the gather
-# decomposition log, and the DAG builder's warnings all refer to the same
-# numbering. The id is attached via ``object.__setattr__`` (bypassing frozen-
-# dataclass immutability); ``dataclasses.replace`` copies the instance dict,
-# so the id survives the ``resolve()`` rebuild onto the resolved copy.
-_next_rid = [0]
-
-
-def _stamp(instr):
-    """Assign a stable rid to an instruction (in place) if it lacks one."""
-    if getattr(instr, "rid", None) is None:
-        object.__setattr__(instr, "rid", _next_rid[0])
-        _next_rid[0] += 1
-    return instr
+# Stable instruction ids are assigned automatically at construction
+# (``Instr.rid``, a process-unique monotonically increasing id) and carried
+# through the rename ``resolve()`` rebuild unchanged, so the auto-free dump,
+# the alloc/free log, the gather decomposition log, the DAG builder's
+# warnings, and the execution trace all refer to the same numbering.
 
 
 def rid_of(instr) -> int:
-    """Public accessor: the stable rename id stamped on an instruction during
-    the rename pass. -1 if the instruction never passed through rename."""
-    return getattr(instr, "rid", -1)
+    """The stable rename id of an instruction (assigned at construction)."""
+    return instr.rid
 
 
 class _Log:
@@ -136,17 +124,12 @@ class RenameEngine:
         alloc_log = _Log("alloc.txt")
         gather_log = _Log("gather.txt")
         self._alloc_log = alloc_log          # consumed by _write / _free
-        # Stamp every input instruction with a stable rid BEFORE liveness, so
-        # the symbolic instructions and their resolved copies share the id
-        # (resolve() carries the instance dict over via dataclasses.replace).
-        instrs = [_stamp(i) for i in instrs]
         out = []
         for seq, instr in enumerate(instrs):
-            rid = rid_of(instr)
-            orig_log.write(f"{seq:6d} rid={rid:6d}  INSTR   {instr}")
+            orig_log.write(f"{seq:6d} rid={instr.rid:6d}  INSTR   {instr}")
         for seq, instr in enumerate(_auto_free(instrs)):
             # A Free carries the rid of the instruction that triggered it.
-            rid = rid_of(instr)
+            rid = instr.rid
             if isinstance(instr, Free):
                 af_log.write(f"{seq:6d} rid={rid:6d}  FREE    {instr.sym.name}")
                 self._free(instr.sym, rid)
@@ -162,7 +145,7 @@ class RenameEngine:
                     gather_log.write(
                         f"          lane{j}: Load dest={dest.addr + j} "
                         f"addr={addr.addr + j}")
-                    out.append(_stamp(Load(Reg(dest.addr + j), Reg(addr.addr + j))))
+                    out.append(Load(Reg(dest.addr + j), Reg(addr.addr + j)))
                 continue
             rd = [self.read_op(o) for o in instr.read_operands()]
             wr = [self.write_op(o, rid) for o in instr.write_operands()]
@@ -290,14 +273,11 @@ def _auto_free(instrs: list) -> list:
         # Dead-write drop: writes at least one symbol, none read downstream.
         if wr and not (wr & live):
             continue            # drop the instruction entirely (and its reads)
-        # Each Free is stamped with the rid of the instruction whose last-use
+        # Each Free carries the rid of the instruction whose last-use
         # triggered it (the instruction the Free is inserted after).
-        frees = []
-        for s in sorted(rd | wr, key=lambda s: s.name):
-            if s not in live:
-                f = Free(s)
-                object.__setattr__(f, "rid", rid_of(instr))
-                frees.append(f)
+        frees = [Free(s, rid=instr.rid)
+                 for s in sorted(rd | wr, key=lambda s: s.name)
+                 if s not in live]
         live -= wr
         live |= rd
         out.extend(frees)
