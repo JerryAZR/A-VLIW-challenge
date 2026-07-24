@@ -20,6 +20,10 @@ from collections import defaultdict
 import random
 import unittest
 
+from ir import (
+    Reg, Alu, VecElem, VecFma, VBroadcast, Load, VLoad, Const, VStore,
+    VSelect, Pause, DebugVCompare,
+)
 from scheduler import Weights
 from problem import (
     Engine,
@@ -49,19 +53,20 @@ class KernelBuilder:
     def debug_info(self):
         return DebugInfo(scratch_map=self.scratch_debug)
 
-    def build(self, slots: list[tuple[Engine, tuple]], vliw: bool = False,
+    def build(self, slots: list, vliw: bool = False,
               seed: int | None = None, picker: str = "fma_first",
               weights=None):
-        """Convert a slot list into instruction bundles.
+        """Convert an IR instruction list into instruction bundles.
 
         vliw=False: one slot per bundle (the original sequential packing).
         vliw=True:  DAG-driven VLIW scheduler - builds a dependency DAG from
-                    the slots and packs multiple independent slots per cycle
-                    respecting per-engine slot limits and read-before-write.
-                    picker selects node ordering ("fma_first", "idx", "random").
+                    the instructions and packs multiple independent slots per
+                    cycle respecting per-engine slot limits and
+                    read-before-write. picker selects node ordering
+                    ("fma_first", "idx", "random", "weighted").
         """
         if not vliw:
-            return [{engine: [slot]} for engine, slot in slots]
+            return [{s.engine: [s.lower()]} for s in slots]
         from scheduler import DAG, schedule, prune_to_stores
         dag = DAG(slots)
         pruned = prune_to_stores(dag)
@@ -72,8 +77,10 @@ class KernelBuilder:
         cap = len(slots)  # worst case: 1 slot/cycle
         return schedule(dag, seed=seed, cap=cap, picker=picker, weights=weights)
 
-    def add(self, engine, slot):
-        self.instrs.append({engine: [slot]})
+    def add(self, instr):
+        """Append a single IR instruction as a one-slot bundle (linear code:
+        prologue/epilogue). Lowered immediately - these never see the DAG."""
+        self.instrs.append({instr.engine: [instr.lower()]})
 
     def alloc_scratch(self, name=None, length=1):
         addr = self.scratch_ptr
@@ -87,7 +94,7 @@ class KernelBuilder:
     def scratch_const(self, val, name=None):
         if val not in self.const_map:
             addr = self.alloc_scratch(name)
-            self.add("load", ("const", addr, val))
+            self.add(Const(Reg(addr), val))
             self.const_map[val] = addr
         return self.const_map[val]
 
@@ -115,16 +122,20 @@ class KernelBuilder:
             if op1 == "+" and op2 == "+":
                 # Linear stage: (a + K) + (a << s) == a*(1+2^s) + K, one fma.
                 mult = (1 << val3) + 1
-                slots.append(("valu", ("multiply_add", val_vec, val_vec,
-                                       fma_vec_consts[mult], fma_vec_consts[val1])))
+                slots.append(VecFma(Reg(val_vec, True), Reg(val_vec, True),
+                                    Reg(fma_vec_consts[mult], True),
+                                    Reg(fma_vec_consts[val1], True)))
             else:
                 # Irreducible xor/add-shift stage: 2 parallel elementwise
                 # transforms of val_vec, then a `^` (or `+`) combine.
-                slots.append(("valu", (op1, t1_vec, val_vec, irr_vec_consts[val1])))
-                slots.append(("valu", (op3, t2_vec, val_vec, irr_vec_consts[val3])))
-                slots.append(("valu", (op2, val_vec, t1_vec, t2_vec)))
+                slots.append(VecElem(op1, Reg(t1_vec, True), Reg(val_vec, True),
+                                     Reg(irr_vec_consts[val1], True)))
+                slots.append(VecElem(op3, Reg(t2_vec, True), Reg(val_vec, True),
+                                     Reg(irr_vec_consts[val3], True)))
+                slots.append(VecElem(op2, Reg(val_vec, True), Reg(t1_vec, True),
+                                     Reg(t2_vec, True)))
             keys = [(r, base_i + j, "hash_stage", hi) for j in range(VLEN)]
-            slots.append(("debug", ("vcompare", val_vec, keys)))
+            slots.append(DebugVCompare(Reg(val_vec, True), keys))
         return slots
 
     def build_kernel(
@@ -308,41 +319,47 @@ class KernelBuilder:
         # Prologue: load header; vload val[256]; broadcast consts; pause
         # =====================================================================
         for i, v in enumerate(init_vars):
-            self.add("load", ("const", addr_a, i))                  # addr_a := i
-            self.add("load", ("load",  self.scratch[v], addr_a))     # scratch[v] := mem[i]
+            self.add(Const(Reg(addr_a), i))                        # addr_a := i
+            self.add(Load(Reg(self.scratch[v]), Reg(addr_a)))       # scratch[v] := mem[i]
 
         # vload val[256] as 32 vectors of 8 contiguous words from mem[inp_values_p..].
-        self.add("alu", ("+", addr_a, self.scratch["inp_values_p"], const_vec_0))
+        self.add(Alu("+", Reg(addr_a), Reg(self.scratch["inp_values_p"]),
+                     Reg(const_vec_0)))
         for k in range(n_groups):
-            self.add("load", ("vload", val_base + k * VLEN, addr_a))
+            self.add(VLoad(Reg(val_base + k * VLEN, True), Reg(addr_a)))
             if k < n_groups - 1:
-                self.add("alu", ("+", addr_a, addr_a, eight_const))
+                self.add(Alu("+", Reg(addr_a), Reg(addr_a), Reg(eight_const)))
 
         # Broadcast forest_values_p (from a header var, not a literal).
-        self.add("valu", ("vbroadcast", forest_p_vec, self.scratch["forest_values_p"]))
+        self.add(VBroadcast(Reg(forest_p_vec, True),
+                            Reg(self.scratch["forest_values_p"])))
 
         # Create each const vector by `load const` into its own lane 0 then
         # self-broadcast (vbroadcast vec, vec reads lane 0, writes all 8). No
         # separate broadcast-source scalar needed.
         for vec_addr, value in vec_bcasts:
-            self.add("load", ("const", vec_addr, value))
-            self.add("valu", ("vbroadcast", vec_addr, vec_addr))
+            self.add(Const(Reg(vec_addr), value))
+            self.add(VBroadcast(Reg(vec_addr, True), Reg(vec_addr)))
 
         # neg_fp1 = 1 - forest_values_p (used by the next-addr update). Computed
-        self.add("valu", ("-", neg_fp1_vec, const_vec_1, forest_p_vec))
+        self.add(VecElem("-", Reg(neg_fp1_vec, True), Reg(const_vec_1, True),
+                         Reg(forest_p_vec, True)))
         # pos_fp5 = 5 + forest_values_p (used by the level 2 select). Computed
-        self.add("valu", ("+", pos_fp5_vec, const_vec_2, const_vec_3)) # pos_fp5 = 5
-        self.add("valu", ("+", pos_fp5_vec, pos_fp5_vec, forest_p_vec))
+        self.add(VecElem("+", Reg(pos_fp5_vec, True), Reg(const_vec_2, True),
+                         Reg(const_vec_3, True)))  # pos_fp5 = 5
+        self.add(VecElem("+", Reg(pos_fp5_vec, True), Reg(pos_fp5_vec, True),
+                         Reg(forest_p_vec, True)))
 
         # vload tree[0..7] (levels 0-2 = 7 nodes + 1 bonus) into tree_preload.
-        self.add("alu", ("+", addr_a, self.scratch["forest_values_p"], const_vec_0))
-        self.add("load", ("vload", tree_preload, addr_a))
+        self.add(Alu("+", Reg(addr_a), Reg(self.scratch["forest_values_p"]),
+                     Reg(const_vec_0)))
+        self.add(VLoad(Reg(tree_preload, True), Reg(addr_a)))
         # Broadcast tree[0..6] into shared vector constants.
         for i in range(7):
-            self.add("valu", ("vbroadcast", tree_vecs[i], tree_preload + i))
+            self.add(VBroadcast(Reg(tree_vecs[i], True), Reg(tree_preload, True).lane(i)))
 
         # Pause 1 -- match reference_kernel2's first yield (initial mem).
-        self.add("flow", ("pause",))
+        self.add(Pause())
 
         # =====================================================================
         # Body -- unrolled rounds x 32 groups, one slot per bundle.
@@ -354,8 +371,9 @@ class KernelBuilder:
         # Scheduled early; ready well before the vstores need them.
         inp_values_p = self.scratch["inp_values_p"]
         for g in range(n_groups):
-            body.append(("load", ("const", out_addr_base + g, g * VLEN)))   # offset 8g
-            body.append(("alu", ("+", out_addr_base + g, out_addr_base + g, inp_values_p)))
+            body.append(Const(Reg(out_addr_base + g), g * VLEN))   # offset 8g
+            body.append(Alu("+", Reg(out_addr_base + g), Reg(out_addr_base + g),
+                            Reg(inp_values_p)))
         for r in range(rounds):
             for g in range(n_groups):
                 is_wrap = (r == WRAP_ROUND)
@@ -373,21 +391,27 @@ class KernelBuilder:
                 # --- node_val gather or preload-select (rounds 0-2 use preloaded) ---
                 if r in (0, 11):
                     # Level 0: all lanes at idx=0. node_val = tree[0].
-                    body.append(("valu", ("^", nv_g, tree0_vec, const_vec_0)))
+                    body.append(VecElem("^", Reg(nv_g, True), Reg(tree0_vec, True),
+                                        Reg(const_vec_0, True)))
                 elif r in (1, 12):
                     # Level 1: idx in {1,2}. Recover idx = addr - forest_p,
                     # then 1 vselect on idx bit 0 (idx=1 -> tree1, idx=2 -> tree2).
                     # parity from last round was in t1_g
-                    body.append(("flow", ("vselect", nv_g, t1_g, tree2_vec, tree1_vec)))
+                    body.append(VSelect(Reg(nv_g, True), Reg(t1_g, True),
+                                        Reg(tree2_vec, True), Reg(tree1_vec, True)))
                 elif r in (2, 13):
                     # Level 2: idx in {3,4,5,6}. Recover idx, subtract level
                     # base (3), then 2-level select on bits 0-1 of (idx-3).
                     #   idx-3=0->tree3, 1->tree4, 2->tree5, 3->tree6
 
-                    body.append(("flow", ("vselect", nv_g, t1_g, tree4_vec, tree3_vec)))  # bit0?tree4:tree3
-                    body.append(("flow", ("vselect", t2_g, t1_g, tree6_vec, tree5_vec)))  # bit0?tree6:tree5
-                    body.append(("valu", ("<", t1_g, addr_vec, pos_fp5_vec)))   # low?
-                    body.append(("flow", ("vselect", nv_g, t1_g, nv_g, t2_g)))  # low?nv:t2
+                    body.append(VSelect(Reg(nv_g, True), Reg(t1_g, True),
+                                        Reg(tree4_vec, True), Reg(tree3_vec, True)))  # bit0?tree4:tree3
+                    body.append(VSelect(Reg(t2_g, True), Reg(t1_g, True),
+                                        Reg(tree6_vec, True), Reg(tree5_vec, True)))  # bit0?tree6:tree5
+                    body.append(VecElem("<", Reg(t1_g, True), Reg(addr_vec, True),
+                                        Reg(pos_fp5_vec, True)))   # low?
+                    body.append(VSelect(Reg(nv_g, True), Reg(t1_g, True),
+                                        Reg(nv_g, True), Reg(t2_g, True)))  # low?nv:t2
                 else:
                     # Rounds 3+: gather from mem. addr_vec already holds the
                     # tree address (idx + forest_p), so the loads read it
@@ -395,20 +419,22 @@ class KernelBuilder:
                     # each load reads addr_g+j as the address and writes nv_g+j
                     # as the value. nv_g is then read by the entry XOR below.
                     for j in range(VLEN):
-                        body.append(("load", ("load", nv_g + j, addr_vec + j)))
+                        body.append(Load(Reg(nv_g, True).lane(j),
+                                         Reg(addr_vec, True).lane(j)))
 
-                body.append(("debug", ("vcompare", nv_g, keynv)))
-                body.append(("debug", ("vcompare", val_vec, keyval)))  # val before xor
+                body.append(DebugVCompare(Reg(nv_g, True), keynv))
+                body.append(DebugVCompare(Reg(val_vec, True), keyval))  # val before xor
 
                 # --- entry XOR: val_vec = val_vec ^ nv_g  (a) ---
-                body.append(("valu", ("^", val_vec, val_vec, nv_g)))
+                body.append(VecElem("^", Reg(val_vec, True), Reg(val_vec, True),
+                                    Reg(nv_g, True)))
 
                 # --- 12-slot hash, fully on valu (8 lanes / slot) ---
                 body.extend(self.build_vec_hash(val_vec, t1_g, t2_g, r, base_i,
                                                 fma_vec_consts, irr_vec_consts))
 
                 # debug: hashed_val == v == val_vec after hash
-                body.append(("debug", ("vcompare", val_vec, keyhv)))
+                body.append(DebugVCompare(Reg(val_vec, True), keyhv))
 
                 # --- post-hash: idx update or wrap (branchless, on valu) ---
                 # --- post-hash: addr update (store addr = idx + forest_p, not
@@ -419,23 +445,27 @@ class KernelBuilder:
                 # (addr plane is not yet valid). ---
                 if is_wrap:
                     # idx -> 0, so addr = forest_p = 1 - neg_fp1.
-                    body.append(("valu", ("-", addr_vec, const_vec_1, neg_fp1_vec)))
+                    body.append(VecElem("-", Reg(addr_vec, True), Reg(const_vec_1, True),
+                                        Reg(neg_fp1_vec, True)))
                 else:
-                    body.append(("valu", ("&", t1_g, val_vec, const_vec_1)))        # parity = v & 1
+                    body.append(VecElem("&", Reg(t1_g, True), Reg(val_vec, True),
+                                        Reg(const_vec_1, True)))        # parity = v & 1
                     if r == 0:
                         # idx=0: next_addr = forest_p + 1 + parity = (2 - neg_fp1) + parity
-                        body.append(("valu", ("-", t2_g, const_vec_2, neg_fp1_vec)))  # 2 - neg_fp1
+                        body.append(VecElem("-", Reg(t2_g, True), Reg(const_vec_2, True),
+                                            Reg(neg_fp1_vec, True)))  # 2 - neg_fp1
                     else:
                         # next_addr base = 2*addr + neg_fp1
-                        body.append(("valu", ("multiply_add", t2_g,
-                                               addr_vec, const_vec_2, neg_fp1_vec)))
-                    body.append(("valu", ("+", addr_vec, t2_g, t1_g)))        # next_addr = base + parity
+                        body.append(VecFma(Reg(t2_g, True), Reg(addr_vec, True),
+                                           Reg(const_vec_2, True), Reg(neg_fp1_vec, True)))
+                    body.append(VecElem("+", Reg(addr_vec, True), Reg(t2_g, True),
+                                        Reg(t1_g, True)))        # next_addr = base + parity
 
                 # --- on the final round, vstore val_g to its output address
                 # (overlaps the body tail via the idle store engine; the linear
                 # epilogue vstore loop is gone) ---
                 if r == rounds - 1:
-                    body.append(("store", ("vstore", out_addr_base + g, val_vec)))
+                    body.append(VStore(Reg(out_addr_base + g), Reg(val_vec, True)))
 
         body_instrs = self.build(body, vliw=True, seed=42, picker="weighted",
                                    weights=Weights(sink=-3, load=-1.5, raw=-0.25,
@@ -451,7 +481,7 @@ class KernelBuilder:
         # Pause 2 -- match reference_kernel2's final yield (final mem).
         # Must come AFTER the body so machine.mem holds the final values
         # when the test recommends execution on i=1 (final yield).
-        self.add("flow", ("pause",))
+        self.add(Pause())
 
 BASELINE = 147734
 

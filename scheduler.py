@@ -34,13 +34,15 @@ import heapq
 import random
 from typing import NamedTuple
 
+from ir import Instr, Pause, VecElem, VecFma, VBroadcast, RegId
 from problem import VLEN, SLOT_LIMITS
 
-# A register id: (base_addr, is_vector). is_vector=True covers the 8-lane
-# vector [addr..addr+7]; is_vector=False is the single word at addr. A vector
-# register aliases the 8 scalars in its 8-word region, which the dependency
-# table tracks so a vector read depends on per-lane scalar writes (the gather).
-Reg = tuple[int, bool]
+# A register id: (base_addr, is_vector), produced by Instr.reads()/writes().
+# is_vector=True covers the 8-lane vector [addr..addr+7]; is_vector=False is
+# the single word at addr. A vector register aliases the 8 scalars in its
+# 8-word region, which the dependency table tracks so a vector read depends
+# on per-lane scalar writes (the gather).
+Reg = RegId
 
 # Sentinel for "no downstream load" in dist_to_load (before normalization).
 NO_LOAD = 10**6
@@ -71,8 +73,9 @@ class Weights(NamedTuple):
     idx: float
 
 # Flow ops that modify the PC - the DAG cannot represent control flow.
-# Hitting one means a jump leaked into the body.
-FLOW_PANIC = {"cond_jump", "cond_jump_rel", "jump", "jump_indirect", "halt", "pause"}
+# The only such op in the IR is Pause (prologue/epilogue barrier); hitting
+# one in the DAG means a barrier leaked into the body.
+FLOW_PANIC = (Pause,)
 
 
 @dataclass
@@ -86,136 +89,9 @@ class DNode:
     """
     idx: int
     engine: str
-    instr: tuple
+    instr: Instr
     in_edges: list[tuple[int, int]] = field(default_factory=list)   # (src_idx, weight)
     out_edges: list[tuple[int, int]] = field(default_factory=list)  # (dst_idx, weight)
-
-
-def instruction_io(engine: str, instr: tuple) -> tuple[list[Reg], list[Reg]]:
-    """Return (reads, writes) for an instruction as register ids.
-
-    Each entry is ``(addr, is_vector)``. ``is_vector=True`` means the full
-    8-lane vector ``[addr..addr+7]``; ``is_vector=False`` means the single
-    word at ``addr``.
-
-    Memory accesses are NOT dependency edges (the body only reads the
-    read-only tree; scratch has no indirect reads).
-    """
-    reads: list[Reg] = []
-    writes: list[Reg] = []
-
-    if engine == "alu":
-        # ("op", dest, a1, a2) - binary scalar
-        _, dest, a1, a2 = instr
-        reads = [(a1, False), (a2, False)]
-        writes = [(dest, False)]
-
-    elif engine == "valu":
-        op = instr[0]
-        if op == "vbroadcast":
-            # ("vbroadcast", dest, src) - dest is vec, src is scalar
-            _, dest, src = instr
-            reads = [(src, False)]
-            writes = [(dest, True)]
-        elif op == "multiply_add":
-            # ("multiply_add", dest, a, b, c) - all vec (VLEN=8)
-            _, dest, a, b, c = instr
-            reads = [(a, True), (b, True), (c, True)]
-            writes = [(dest, True)]
-        else:
-            # (op, dest, a1, a2) - elementwise over VLEN=8 lanes
-            _, dest, a1, a2 = instr
-            reads = [(a1, True), (a2, True)]
-            writes = [(dest, True)]
-
-    elif engine == "load":
-        op = instr[0]
-        if op == "load":
-            # ("load", dest, addr) - scalar; addr holds mem ptr
-            _, dest, addr = instr
-            reads = [(addr, False)]
-            writes = [(dest, False)]
-        elif op == "load_offset":
-            # ("load_offset", dest, addr, offset) - offset is a literal int
-            _, dest, addr, offset = instr
-            reads = [(addr + offset, False)]
-            writes = [(dest + offset, False)]
-        elif op == "vload":
-            # ("vload", dest, addr) - addr is scalar (mem base ptr)
-            _, dest, addr = instr
-            reads = [(addr, False)]
-            writes = [(dest, True)]
-        elif op == "const":
-            # ("const", dest, val) - val is literal, no reads
-            _, dest, _val = instr
-            writes = [(dest, False)]
-        else:
-            raise NotImplementedError(f"Unknown load op: {op}")
-
-    elif engine == "store":
-        op = instr[0]
-        if op == "store":
-            # ("store", addr, src) - reads addr (mem ptr) + src (data); no writes
-            _, addr, src = instr
-            reads = [(addr, False), (src, False)]
-        elif op == "vstore":
-            # ("vstore", addr, src) - reads addr (scalar) + src..src+7 (vec)
-            _, addr, src = instr
-            reads = [(addr, False), (src, True)]
-        else:
-            raise NotImplementedError(f"Unknown store op: {op}")
-
-    elif engine == "flow":
-        op = instr[0]
-        if op in FLOW_PANIC:
-            raise NotImplementedError(
-                f"Flow op '{op}' at instruction {instr} modifies PC - "
-                f"cannot be represented in the DAG")
-        elif op == "select":
-            # ("select", dest, cond, a, b) - scalar
-            _, dest, cond, a, b = instr
-            reads = [(cond, False), (a, False), (b, False)]
-            writes = [(dest, False)]
-        elif op == "vselect":
-            # ("vselect", dest, cond, a, b) - vec
-            _, dest, cond, a, b = instr
-            reads = [(cond, True), (a, True), (b, True)]
-            writes = [(dest, True)]
-        elif op == "add_imm":
-            # ("add_imm", dest, a, imm) - imm is literal
-            _, dest, a, _imm = instr
-            reads = [(a, False)]
-            writes = [(dest, False)]
-        elif op == "coreid":
-            # ("coreid", dest) - writes dest, no reads
-            _, dest = instr
-            writes = [(dest, False)]
-        elif op == "trace_write":
-            # ("trace_write", val) - reads val
-            _, val = instr
-            reads = [(val, False)]
-        else:
-            raise NotImplementedError(f"Unknown flow op: {op}")
-
-    elif engine == "debug":
-        op = instr[0]
-        if op == "compare":
-            # ("compare", loc, key) - reads loc (scalar)
-            _, loc, _key = instr
-            reads = [(loc, False)]
-        elif op == "vcompare":
-            # ("vcompare", loc, keys) - reads loc..loc+7 (vec)
-            _, loc, _keys = instr
-            reads = [(loc, True)]
-        elif op == "comment":
-            pass  # no deps
-        else:
-            pass  # unknown debug ops are no-ops for dependency purposes
-
-    else:
-        raise NotImplementedError(f"Unknown engine: {engine}")
-
-    return reads, writes
 
 
 class ReadWriteTable:
@@ -353,7 +229,7 @@ class DAG:
     ``advance()`` is the only place RAW blockers decrease (end of cycle).
     """
 
-    def __init__(self, instructions: list[tuple[str, tuple]]):
+    def __init__(self, instructions: list[Instr]):
         self.nodes: list[DNode] = self._build_nodes(instructions)
         self._finish_init()
 
@@ -458,14 +334,15 @@ class DAG:
     # -- construction -----------------------------------------------------
 
     @staticmethod
-    def _build_nodes(instructions: list[tuple[str, tuple]]) -> list[DNode]:
-        """Build nodes + deduped bidirectional edges from an instruction list.
+    def _build_nodes(instructions: list[Instr]) -> list[DNode]:
+        """Build nodes + deduped bidirectional edges from an IR instruction list.
 
         Dependency blockers come from a ``ReadWriteTable`` that tracks
         last-writer (RAW) and readers-since (WAR) per (region, lane) as
         instructions are added in program order. Instruction->register
-        translation (``instruction_io``) stays out of the table; this loop
-        feeds it register ids.
+        translation lives on the IR instructions themselves
+        (``instr.reads()``/``instr.writes()``); this loop just feeds the
+        table register ids.
 
         Each instruction writes at most one register, so WAR blockers come
         from a single ``write`` call. Reads can span several registers (and
@@ -476,22 +353,25 @@ class DAG:
         """
         nodes: list[DNode] = []
         table = ReadWriteTable()
-        for idx, (engine, instr) in enumerate(instructions):
-            reads, writes = instruction_io(engine, instr)
-            node = DNode(idx=idx, engine=engine, instr=instr)
+        for idx, instr in enumerate(instructions):
+            if isinstance(instr, FLOW_PANIC):
+                raise NotImplementedError(
+                    f"Instruction {instr} modifies PC - "
+                    f"cannot be represented in the DAG")
+            node = DNode(idx=idx, engine=instr.engine, instr=instr)
             nodes.append(node)
 
             raw_seen: set[int] = set()
-            for reg in dict.fromkeys(reads):          # dedup duplicate operands
-                for src in table.read(idx, reg):      # RAW (weight 1)
+            for reg in dict.fromkeys(instr.reads()):    # dedup duplicate operands
+                for src in table.read(idx, reg):        # RAW (weight 1)
                     if src not in raw_seen:
                         raw_seen.add(src)
                         node.in_edges.append((src, 1))
                         nodes[src].out_edges.append((idx, 1))
 
             war_seen: set[int] = set()
-            for reg in dict.fromkeys(writes):         # <=1 register per instruction
-                for src in table.write(idx, reg):     # WAR (weight 0)
+            for reg in dict.fromkeys(instr.writes()):   # <=1 register per instruction
+                for src in table.write(idx, reg):       # WAR (weight 0)
                     if src not in war_seen:
                         war_seen.add(src)
                         node.in_edges.append((src, 0))
@@ -662,8 +542,8 @@ class _Placement:
 
 def _classify(n: DNode) -> _Placement:
     """Classify a node for placement (kind, lanes, native engine)."""
-    eng = n.engine
-    op = n.instr[0] if n.instr else ""
+    instr = n.instr
+    eng = instr.engine
     if eng == "alu":
         return _Placement(_KIND_ATOMIC_SCALAR, 1, "alu")
     if eng == "load":
@@ -675,27 +555,26 @@ def _classify(n: DNode) -> _Placement:
     if eng == "debug":
         return _Placement(_KIND_DEBUG, 0, "debug")
     if eng == "valu":
-        if op == "multiply_add":
+        if isinstance(instr, VecFma):
             return _Placement(_KIND_VEC_FMA, 1, "valu")    # rigid: no scalar fma
         return _Placement(_KIND_VEC_ELEM, VLEN, "valu")    # spillable to alu
     raise NotImplementedError(f"Unknown engine: {eng}")
 
 
-def _vec_instr_to_alu_lanes(instr: tuple, lanes) -> list[tuple]:
+def _vec_instr_to_alu_lanes(instr: Instr, lanes) -> list[tuple]:
     """Materialise one elementwise ``valu`` instruction as per-lane ``alu`` tuples.
 
-    (op, dest, a1, a2) elementwise -> lane j: (op, dest+j, a1+j, a2+j)
-    (vbroadcast, dest, src)         -> lane j: ("+", dest+j, src, 0)
-    multiply_add cannot spill (no scalar fma in the ISA) and raises.
+    VecElem(op, dest, a1, a2)  -> lane j: (op, dest+j, a1+j, a2+j)
+    VBroadcast(dest, src)      -> lane j: ("+", dest+j, src, 0)
+    VecFma cannot spill (no scalar fma in the ISA) and raises.
     """
-    op = instr[0]
-    if op == "multiply_add":
+    if isinstance(instr, VecFma):
         raise NotImplementedError("multiply_add cannot spill to alu (no scalar fma)")
-    if op == "vbroadcast":
-        _, dest, src = instr
-        return [("+", dest + j, src, 0) for j in lanes]
-    _, dest, a1, a2 = instr
-    return [(op, dest + j, a1 + j, a2 + j) for j in lanes]
+    if isinstance(instr, VBroadcast):
+        return [("+", instr.dest.addr + j, instr.src.resolve(), 0) for j in lanes]
+    assert isinstance(instr, VecElem)
+    return [(instr.op, instr.dest.addr + j, instr.a1.addr + j, instr.a2.addr + j)
+            for j in lanes]
 
 
 class FuncUnitPool:
@@ -851,10 +730,11 @@ def schedule(dag: DAG, *, seed: int | None = None,
                        (a ``Weights`` of sink/load/raw/war/rigid)
 
     Returns a list of bundles (``dict[engine, list[instruction]]``), one per
-    cycle that placed at least one instruction. Debug-only bundles cost 0
-    cycles in the simulator (only bundles with a non-debug engine advance
-    ``cycle``), so a trailing debug flush contributes nothing to the cycle
-    count.
+    cycle that placed at least one instruction. IR instructions are lowered
+    to simulator slot tuples here (per-lane alu spill materialises as tuples
+    directly). Debug-only bundles cost 0 cycles in the simulator (only
+    bundles with a non-debug engine advance ``cycle``), so a trailing debug
+    flush contributes nothing to the cycle count.
     """
     rng = random.Random(seed)
     placements = [_classify(n) for n in dag.nodes]
@@ -909,4 +789,8 @@ def schedule(dag: DAG, *, seed: int | None = None,
                 f"scheduler: cycle count {C} exceeded cap {cap} - "
                 f"regressed below unscheduled baseline")
 
-    return bundles
+    # Lower IR instructions to simulator slot tuples (spilled alu lanes are
+    # already tuples).
+    return [{e: [s.lower() if isinstance(s, Instr) else s for s in slots]
+             for e, slots in bundle.items()}
+            for bundle in bundles]
