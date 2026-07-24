@@ -59,26 +59,29 @@ class RenameEngine:
 
     def rename(self, instrs: list) -> list:
         """Symbolic -> resolved, single forward pass. Refresh directives
-        are consumed (re-homing their symbol) and dropped from the output;
-        everything else is returned with resolved operands, reads renamed
-        before writes."""
+        are consumed (re-homing their symbol) and dropped from the output.
+        For every other instruction: map its read operands, then its write
+        operands (reads first - a self-read-write instruction must see the
+        OLD home on its reads), and rebuild it resolved."""
         out = []
         for instr in instrs:
             if isinstance(instr, Refresh):
                 if instr.vec not in self._pins:   # no-op on pinned symbols
                     self._write(instr.vec)
                 continue
-            out.append(instr.rename(self))
+            rd = [self.read_op(o) for o in instr.read_operands()]
+            wr = [self.write_op(o) for o in instr.write_operands()]
+            out.append(instr.resolve(rd, wr))
         return out
 
     def read_op(self, o):
-        """Resolve a read operand against current homes (Instr.rename hook)."""
+        """Resolve a read operand against current homes (rename contract)."""
         if isinstance(o, LaneRef):
             return LaneRef(self._home(o.vec), o.j)
         return self._home(o)
 
     def write_op(self, o):
-        """Resolve a write operand (Instr.rename hook). Whole-symbol writes
+        """Resolve a write operand (rename contract). Whole-symbol writes
         to temps re-home; lane writes resolve against the current home."""
         if isinstance(o, LaneRef):
             return LaneRef(self._home(o.vec), o.j)

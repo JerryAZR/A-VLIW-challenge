@@ -115,9 +115,10 @@ def _ids(ops) -> list[RegId]:
 class Instr:
     """Base class for IR instructions. ``engine`` is a ClassVar."""
     engine: ClassVar[str]
-    # Operand fields read / written by this instruction (field names).
-    # rename() applies the engine's read_op to _RD fields and write_op to
-    # _WR fields (reads first - a self-read-write instruction must see the
+    # Operand fields read / written by this instruction (field names) -
+    # they define the position order of the read_operands() /
+    # write_operands() / resolve() rename contract. Reads are always
+    # resolved before writes (a self-read-write instruction must see the
     # OLD home on its reads). Non-operand fields (op strings, immediates,
     # keys) are never listed and pass through untouched.
     _RD: ClassVar[tuple] = ()
@@ -133,12 +134,26 @@ class Instr:
         """The simulator slot tuple (without the engine tag)."""
         raise NotImplementedError
 
-    def rename(self, re) -> "Instr":
-        """Apply a rename engine to this instruction's operands, returning
-        the resolved instruction (reads renamed before writes)."""
-        vals = {f: re.read_op(getattr(self, f)) for f in self._RD}
-        vals.update({f: re.write_op(getattr(self, f)) for f in self._WR})
-        return replace(self, **vals)
+    # -- rename contract -------------------------------------------------
+    # The instruction exposes its read/write operands positionally; the
+    # rename engine maps each operand and hands back position-indexed
+    # lists; resolve() rebuilds. Neither side pokes into the other's
+    # internals.
+
+    def read_operands(self) -> tuple:
+        """Read operands, in field order."""
+        return tuple(getattr(self, f) for f in self._RD)
+
+    def write_operands(self) -> tuple:
+        """Write operands, in field order."""
+        return tuple(getattr(self, f) for f in self._WR)
+
+    def resolve(self, rd: list, wr: list) -> "Instr":
+        """Rebuild with resolved operands: position-indexed lists of the
+        same length/order as read_operands() / write_operands()."""
+        assert len(rd) == len(self._RD) and len(wr) == len(self._WR)
+        return replace(self, **dict(zip(self._RD, rd)),
+                       **dict(zip(self._WR, wr)))
 
 
 # ---------------------------------------------------------------------------
