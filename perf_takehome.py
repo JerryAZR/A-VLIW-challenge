@@ -110,7 +110,7 @@ class KernelBuilder:
         t1_vec / t2_vec : 8-word stage-scratch vectors. Live only within a
             single irreducible xor/add-shift stage (2 parallel transforms +
             `^` combine), dead between stages. After the hash they are reused
-            for the branchless idx update (they're dead post-final-combine).
+            for the branchless addr update (they're dead post-final-combine).
         fma_vec_consts : {value: addr} of broadcast vectors for the 3 linear
             stages (0/2/4): keys are the multiplier (1+2^s) and the addend K.
         irr_vec_consts : {value: addr} of broadcast vectors for the 3
@@ -140,47 +140,39 @@ class KernelBuilder:
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
         prune: bool = True,
     ):
-        """v3a: 8-lane-per-group kernel. Cross-lane vectorization over the
-        `valu` unit (VLEN=8 lanes per group, 32 groups), still one slot per
-        bundle (vliw=False) -- sophisticated VLIW packing is deliberately
-        postponed; this pass is the functional 8-lane-vectorization chunk.
+        """8-lane-per-group kernel. Cross-lane vectorization over the
+        `valu` unit (VLEN=8 lanes per group, 32 groups), packed by the
+        DAG-driven VLIW scheduler (vliw=True, weighted picker).
 
-        Layout (all pipeline state resident in scratch across all rounds;
-        see notes/scratch_map_canonical.md for the rationale):
-          - val[256] : plane 0 of the per-lane sector; carried across rounds
-            AND the running hash register during each round's hash (entry XOR
-            writes `a` into it; the final hash stage leaves `v` there for the
-            next round -- zero copy-out ops). Stored as 32 contiguous VLEN=8
-            vectors.
-          - idx[256] : plane 1; zero-initialized (scratch clears to 0, initial
-            idx is 0 -> no init).
-          - consts : the 6 hash constants + shift amounts + idx helper
-            constants broadcast once at prologue as VLEN=8 vectors and reused
-            across all 32 groups x 16 rounds of hashes.
-
-        Each group's 8 per-lane scratch words live in per-lane SoA planes
-        (see layout below): val/idx persistent state + t1/t2 per-lane stage
-        scratch + a per-lane node_val landing plane. Per-lane t1/t2/nv means
-        distinct groups' in-flight stages never alias -- VLIW-packable without
-        rename management.
+        Layout (all pipeline state lives in scratch; only const_vec_0 is
+        pinned - everything else is a versioned temporary allocated by the
+        rename engine, see notes/scratch_map_canonical.md for the rationale):
+          - val[256] : per-lane carried state AND the running hash register
+            during each round's hash (entry XOR writes `a` into it; the final
+            hash stage leaves `v` there for the next round - zero copy-out).
+            Stored as 32 VLEN=8 vectors.
+          - addr[256] : per-lane tree ADDRESS (idx + forest_p); the gather
+            reads it directly. Carried across rounds.
+          - parity[256] : per-lane (val & 1), persists across the round
+            boundary to drive the next round's level-1/2 select.
+          - t1/t2/nv : short-lived loop-body temps (hash stage scratch, addr
+            base, node_val landing) shared as tags across groups; the rename
+            engine re-homes them per write so groups never alias.
+          - consts : the 6 hash constants + shift amounts, broadcast once at
+            prologue as VLEN=8 vectors and reused across all hashes.
 
         Gather (non-contiguous tree.values[idx[i]]) is the one operation that
-        cannot be vectorized (the ISA has no scatter/gather): for each group of
-        8 lanes we compute all 8 gather addresses in one `valu` `+` (idx plus
-        the broadcast forest pointer), then issue 8 scalar `load`s landing in
-        the per-lane nv plane. This is the "naive loader" stage -- prefetch /
-        dual-port packing / speculative both-branch loads are deferred. With
-        one slot per bundle the gather is 1 (addr) + 8 (loads) = 9 cycles, then
-        entry XOR (1) + 12-slot hash + idx (3, or 1 on the uniform wrap round).
+        cannot be vectorized (the ISA has no scatter/gather): for each group
+        one Gather op reads the per-lane addr vector and is decomposed by the
+        rename engine into 8 scalar loads landing in the nv plane.
 
-        Branchless idx update: parity = v & 1; base = idx*2 + 1 (valu fma);
-        next = base + parity (valu `+`). Equals the reference's
-        `2*idx + (1 if even else 2)` bit-exactly (parity=0 -> +1, parity=1 -> +2).
+        Branchless addr update: parity = val & 1; base = 2*addr + neg_fp1
+        (valu fma); next_addr = base + parity (valu `+`). Bit-exact with the
+        reference's `2*idx + (1 if even else 2)` in idx terms.
 
         Wrap is a build-time-known per-round decision (verified uniform wrap
         on round=height for the canonical shape): on that round we skip the
-        branchless idx update and write idx := 0 for all lanes (one `valu`
-        `& idx,zero`).
+        branchless update and write addr := forest_p (one `valu` `-`).
 
         Canonical shape assumed: forest_height=10, n_nodes=2047, batch_size=256.
         """
@@ -195,27 +187,12 @@ class KernelBuilder:
         WRAP_ROUND = forest_height   # verified: all lanes at leaf on round=h -> wrap to root
 
         # =====================================================================
-        # Scratch layout: planes, then vector section (CONST, VAR), then scalar
-        # section (CONST, VAR). All 8-word vectors follow the 5x256 plane sector
-        # so every vector is 8-aligned (one vector == one region); scalars are
-        # packed after.
-        #
-        #   [   0..1279]  per-lane planes: val, idx, t1, t2, nv (5 x 256)
-        #   [1280.. ...]  vector section (8 words each):
-        #                   CONST vecs: mult4097/K0/mult33/K2/mult9/K4/K1/K3/
-        #                     K5/shift19/shift9/shift16/two/one/zero/three (16)
-        #                   VAR vecs: forest_p/tree_preload/tree0..tree6 (9)
-        #   [ ... .. ...]  scalar section (1 word each):
-        #                   CONST scalars: zero/eight/three + 13 bcast sources (16)
-        #                   VAR scalars: 7 header vars + addr_a (8)
-        #   [ ... ..1535]  free (32 words)
-        #
-        # Planes-first guarantees every val_vec = base + 8g is 8-aligned so a
-        # vector write covers exactly one region - essential for the DAG
-        # builder's region-keyed last_writer/readers_since bookkeeping.
-        # No addr_vec/sel_lo_vec/sel_hi_vec: those short-lived temporaries reuse
-        # per-group planes (nv_g for gather addr via self-addressing loads; t2_g
-        # for the level-2 select intermediate) -> no cross-group WAR chains.
+        # Scratch layout: the rename engine owns all scratch space. Only
+        # const_vec_0 is pinned (at address 0; scratch starts all-zero, so it
+        # needs no write). Every other symbol is a versioned temporary,
+        # dynamically allocated by the rename engine from its free pools
+        # (8-aligned vector granules, then a scalar pool at the top). No
+        # hand-laid-out map - the engine assigns addresses on rename.
         # =====================================================================
 
         init_vars = [
@@ -224,13 +201,13 @@ class KernelBuilder:
         ]
 
         # ---- Pinned symbol declarations ----
+        # ---- Symbol declarations ----
         # The builder defines symbols; the engine owns all scratch space and
-        # assigns addresses (vectors first, stable order, then scalars -
-        # reproducing the historical hand-laid-out map: planes [0..1279],
-        # const vecs [1280..1487], scalars [1488..1528]).
+        # assigns addresses on rename. Only const_vec_0 is pinned; the rest
+        # are versioned temporaries.
         #
-        # Per-lane SoA planes as 32 group-vector symbols each: val[g] is
-        # lanes 8g..8g+7 of the plane.
+        # Per-lane SoA state as 32 group-vector symbols each: val[g] /
+        # addr[g] / parity[g] are lanes 8g..8g+7 of a logical plane.
         val  = [Sym(f"val[{g}]",  True) for g in range(n_groups)]  # running hash + carried state
         addr = [Sym(f"addr[{g}]", True) for g in range(n_groups)]  # tree ADDRESS = idx + forest_p (stored, not idx)
         # Local temporaries: ONE shared tag each across all groups (loop-body
@@ -435,7 +412,7 @@ class KernelBuilder:
                 # debug: hashed_val == v == val_vec after hash
                 body.append(DebugVCompare(val_vec, keyhv))
 
-                # --- post-hash: idx update or wrap (branchless, on valu) ---
+                # --- post-hash: addr update or wrap (branchless, on valu) ---
                 # --- post-hash: addr update (store addr = idx + forest_p, not
                 # idx; gather reads addr directly). next_addr = 2*addr +
                 # (1-forest_p) + parity = 2*addr + neg_fp1 + parity. Wrap sets

@@ -146,7 +146,7 @@ class Instr:
     (a process-unique, monotonically increasing id). It is keyword-only so it
     never interferes with subclasses' positional operand fields. Because it is
     a normal field, ``dataclasses.replace`` carries it through the rename
-    ``resolve()`` rebuild unchanged - the resolved instruction keeps the same
+    ``rebuild()`` unchanged - the resolved instruction keeps the same
     rid as its symbolic source, so an executed slot traces back end-to-end
     (rename -> resolve -> schedule -> trace). "-1" never occurs in practice
     (every instruction gets a fresh id at birth); it is only the nominal
@@ -188,7 +188,7 @@ class Instr:
     # -- rename contract -------------------------------------------------
     # The instruction exposes its read/write operands positionally; the
     # rename engine maps each operand and hands back position-indexed
-    # lists; resolve() rebuilds. Neither side pokes into the other's
+    # lists; rebuild() rebuilds. Neither side pokes into the other's
     # internals.
 
     def read_operands(self) -> tuple:

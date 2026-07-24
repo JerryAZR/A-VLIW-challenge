@@ -461,8 +461,8 @@ class DAG:
 # ---------------------------------------------------------------------------
 
 def prune_to_stores(dag: DAG) -> DAG:
-    """Prune nodes that do not contribute to the final stores, in place on a
-    compacted copy of ``dag``.
+    """Prune nodes that do not contribute to the final stores, returning a new
+    compacted DAG (the input is unchanged).
 
     Pass 1: backward walk from the store sinks following RAW (weight-1,
     true data dependency) edges only, marking nodes "useful". WAR edges are
@@ -704,7 +704,8 @@ def _make_picker(picker: str, placements: list[_Placement], rng: random.Random,
             return (_KIND_PRIORITY.get(placements[idx].kind, 9), idx)
         return _key
     if picker == "weighted":
-        # score = sink*sink - load*load + raw*raw + war*war + rigid*is_rigid_now;
+        # score = sink*sink - load*load + raw*raw + war*war + rigid*is_rigid_now
+        #         + idx*idx;
         # higher = scheduled first (max-heap via negation). is_rigid_now is
         # mutable placement state: a node is rigid unless it's a fresh
         # (un-spilled) vec_elem. Computed at push time, so partial vec_elem
@@ -752,7 +753,7 @@ def schedule(dag: DAG, *, seed: int | None = None,
       ``"idx"``       - program order
       ``"random"``    - random key per node (uses ``seed``)
       ``"weighted"``  - score = Σ weight·property (max-heap); pass ``weights``
-                       (a ``Weights`` of sink/load/raw/war/rigid)
+                       (a ``Weights`` of sink/load/raw/war/rigid/idx)
 
     Returns a list of bundles (``dict[engine, list[instruction]]``), one per
     cycle that placed at least one instruction. IR instructions are lowered

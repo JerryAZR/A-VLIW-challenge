@@ -58,7 +58,7 @@ DEBUG_DIR: str | None = None
 
 # Stable instruction ids are assigned automatically at construction
 # (``Instr.rid``, a process-unique monotonically increasing id) and carried
-# through the rename ``resolve()`` rebuild unchanged, so the auto-free dump,
+# through the rename ``rebuild()`` unchanged, so the auto-free dump,
 # the alloc/free log, the gather decomposition log, the DAG builder's
 # warnings, and the execution trace all refer to the same numbering.
 
