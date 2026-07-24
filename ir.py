@@ -180,16 +180,10 @@ class Instr:
         raise NotImplementedError
 
     def tagged_lower(self, res: Resolver = _ident):
-        """``lower()`` with the stable rename id attached, as ``TaggedSlot``(s).
-
-        Returns a single ``TaggedSlot`` for scalar ops, or a list of
-        ``TaggedSlot`` for ops that lower to several slots (per-lane const).
+        """``lower()`` with the stable rename id attached, as a ``TaggedSlot``.
         The scheduler emits these so a tracing simulator can recover the
         source id of every executed slot."""
-        low = self.lower(res)
-        if isinstance(low, list):
-            return [TaggedSlot(t, self.rid) for t in low]
-        return TaggedSlot(low, self.rid)
+        return TaggedSlot(self.lower(res), self.rid)
 
     # -- rename contract -------------------------------------------------
     # The instruction exposes its read/write operands positionally; the

@@ -641,11 +641,6 @@ class FuncUnitPool:
         self.free = dict(self._CAPACITY)
         self.bundle = {}
 
-    @property
-    def has_work(self) -> bool:
-        """True if any non-debug slot was emitted this cycle."""
-        return any(e != "debug" for e in self.bundle)
-
     def place(self, node: DNode, p: _Placement) -> bool | None:
         """Try to place a single node this cycle.
 

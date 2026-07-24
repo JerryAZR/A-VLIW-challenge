@@ -27,9 +27,7 @@ from ir import (
 from rename import RenameEngine
 from scheduler import Weights
 from problem import (
-    Engine,
     DebugInfo,
-    SLOT_LIMITS,
     VLEN,
     N_CORES,
     SCRATCH_SIZE,
@@ -75,9 +73,6 @@ class KernelBuilder:
         from scheduler import DAG, schedule, prune_to_stores
         dag = DAG(slots)
         pruned = prune_to_stores(dag)
-        if len(pruned) != len(dag):
-            print(f"prune_to_stores: {len(dag)} -> {len(pruned)} nodes "
-                  f"({len(dag) - len(pruned)} dead)")
         dag = pruned
         cap = len(slots)  # worst case: 1 slot/cycle
         return schedule(dag, seed=seed, cap=cap, picker=picker, weights=weights)
@@ -455,8 +450,6 @@ class KernelBuilder:
         # boundary, then split: the prologue has no Gather, so its resolved
         # length == its symbolic length. Emit the prologue linearly (one slot
         # per bundle); schedule the body on the DAG.
-        print(f"Prologue length = {len(prologue)}")
-        print(f"body length = {len(body)}")
         resolved = self.re.rename(prologue + body)
         prologue_res = resolved[:len(prologue)]
         body = resolved[len(prologue):]
