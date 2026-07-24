@@ -404,6 +404,32 @@ class Pause(Instr):
 
 
 # ---------------------------------------------------------------------------
+# Rename-engine directives (never reach the resolved program)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Free(Instr):
+    """Compiler directive: this symbol's value is dead from here -
+    return its home to the rename engine's free pool. Inserted by the
+    auto-free liveness pass (backward last-use analysis); consumed by
+    rename and dropped from the output. No-op on pinned symbols and on
+    symbols with no current home."""
+    engine: ClassVar[str] = "debug"
+    sym: Operand
+
+    def reads(self):
+        return []
+
+    def writes(self):
+        return []
+
+    def lower(self, res=_ident):
+        raise NotImplementedError(
+            "Free is a rename-engine directive - it must be consumed by "
+            "RenameEngine.rename() and never lowered")
+
+
+# ---------------------------------------------------------------------------
 # debug (0-cycle, disabled at grading)
 # ---------------------------------------------------------------------------
 
