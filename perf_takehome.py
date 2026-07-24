@@ -41,6 +41,12 @@ from problem import (
 )
 
 
+# Picker weights for the production VLIW schedule (tuned by sweep/train).
+# Negative terms invert the documented "higher = more urgent" direction for
+# those properties - see scheduler.Weights.
+BODY_WEIGHTS = Weights(sink=-3, load=-1.5, raw=-0.25, war=6, rigid=0.25, idx=-4)
+
+
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
@@ -53,11 +59,17 @@ class KernelBuilder:
         self.resolved_body = None
 
     def debug_info(self):
+        """The simulator's debug scratch map. Only valid after build_kernel()
+        has run (the rename engine that owns scratch is created there)."""
+        if self.re is None:
+            raise RuntimeError(
+                "debug_info() called before build_kernel() - the rename "
+                "engine (and its scratch map) does not exist yet")
         return DebugInfo(scratch_map=self.re.debug_map())
 
     def build(self, slots: list, vliw: bool = False,
               seed: int | None = None, picker: str = "fma_first",
-              weights=None):
+              weights=None, prune: bool = True):
         """Convert an IR instruction list into instruction bundles.
 
         vliw=False: one slot per bundle (the original sequential packing).
@@ -66,14 +78,17 @@ class KernelBuilder:
                     cycle respecting per-engine slot limits and
                     read-before-write. picker selects node ordering
                     ("fma_first", "idx", "random", "weighted").
+        prune:      run prune_to_stores dead-code elimination before
+                    scheduling. Disable to keep debug oracle nodes (which have
+                    no path to a store) in the scheduled program.
         """
         if not vliw:
             return [{s.engine: [s.lower()]} for s in slots]
         self.resolved_body = list(slots)
         from scheduler import DAG, schedule, prune_to_stores
         dag = DAG(slots)
-        pruned = prune_to_stores(dag)
-        dag = pruned
+        if prune:
+            dag = prune_to_stores(dag)
         cap = len(slots)  # worst case: 1 slot/cycle
         return schedule(dag, seed=seed, cap=cap, picker=picker, weights=weights)
 
@@ -122,7 +137,8 @@ class KernelBuilder:
         return slots
 
     def build_kernel(
-        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int
+        self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
+        prune: bool = True,
     ):
         """v3a: 8-lane-per-group kernel. Cross-lane vectorization over the
         `valu` unit (VLEN=8 lanes per group, 32 groups), still one slot per
@@ -458,8 +474,7 @@ class KernelBuilder:
         # Pause 1 -- match reference_kernel2's first yield (initial mem).
         self.add(Pause())
         body_instrs = self.build(body, vliw=True, seed=42, picker="weighted",
-                                   weights=Weights(sink=-3, load=-1.5, raw=-0.25,
-                                                   war=6, rigid=0.25, idx=-4))
+                                   weights=BODY_WEIGHTS, prune=prune)
         self.instrs.extend(body_instrs)
 
         # =====================================================================

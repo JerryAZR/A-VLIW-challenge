@@ -27,7 +27,6 @@ import random
 import sys
 
 import rename
-import scheduler
 from problem import (Tree, Input, build_mem_image, N_CORES,
                      reference_kernel2)
 import perf_takehome as pt
@@ -51,13 +50,12 @@ def main():
         pass
 
     # Point the rename engine's logs at outdir, then build the kernel.
-    # (unpruned schedule: keep the debug vcompare nodes so the build matches
-    # what the oracle-checker sees.)
+    # prune=False: keep the debug vcompare nodes so the build matches what the
+    # oracle-checker sees.
     rename.DEBUG_DIR = outdir
-    scheduler.prune_to_stores = lambda dag: dag
 
     kb = pt.KernelBuilder()
-    kb.build_kernel(10, 2047, 256, 16)
+    kb.build_kernel(10, 2047, 256, 16, prune=False)
 
     # Run the tracing simulator over the built program.
     trace_path = os.path.join(outdir, "trace.txt")
