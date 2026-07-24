@@ -277,19 +277,17 @@ class KernelBuilder:
         addr_a = Sym("addr_a")
         out_addr = [Sym(f"out_addr[{g}]") for g in range(n_groups)]
 
-        # The engine owns scratch space from here on.
-        self.re = RenameEngine([
-            *val, *addr,
-            const_vec_0, const_vec_1, const_vec_2, const_vec_3, const_vec_9,
-            const_vec_16, const_vec_19, const_vec_33, const_vec_4097,
-            K0_vec, K1_vec, K2_vec, K3_vec, K4_vec, K5_vec,
-            forest_p_vec, neg_fp1_vec, pos_fp5_vec, tree_preload, *tree_vecs,
-            eight_const, *header.values(), addr_a, *out_addr,
-        ])
+        # The engine owns scratch space from here on. The ONLY pin is
+        # const_vec_0: scratch starts all-zero, so it needs no write - just a
+        # reserved home (address 0) that stays 0. Every other symbol is a
+        # versioned temporary, dynamically allocated by the rename engine.
+        self.re = RenameEngine([const_vec_0])
 
         # (vec, literal) pairs: the prologue `load const` lane 0 + self-broadcast.
+        # const_vec_0 is EXCLUDED: scratch starts all-zero, so it needs no
+        # const-load + broadcast (and it is the one reserved home - see above).
         vec_bcasts = [
-            (const_vec_0, 0),    (const_vec_1, 1),    (const_vec_2, 2),
+            (const_vec_1, 1),    (const_vec_2, 2),
             (const_vec_3, 3),    (const_vec_9, 9),    (const_vec_16, 16),
             (const_vec_19, 19),  (const_vec_33, 33),  (const_vec_4097, 4097),
             (K0_vec, 0x7ED55D16), (K1_vec, 0xC761C23C), (K2_vec, 0x165667B1),
@@ -310,47 +308,52 @@ class KernelBuilder:
         }
 
         # =====================================================================
-        # Prologue: load header; vload val[256]; broadcast consts; pause
+        # Prologue: load header; vload val[256]; broadcast consts.
+        # Collected SYMBOLICALLY (not self.add) and renamed together with the
+        # body below: with no app pins, prologue-written temps (val, consts,
+        # header, out_addr) are read in the body, so liveness must span both.
         # =====================================================================
-        self.add(Const(eight_const, 8))        # vload/vstore stride
+        prologue = []
+        prologue.append(Const(eight_const, 8))     # vload/vstore stride
         for i, v in enumerate(init_vars):
-            self.add(Const(addr_a, i))                              # addr_a := i
-            self.add(Load(header[v], addr_a))                       # header[v] := mem[i]
+            prologue.append(Const(addr_a, i))                      # addr_a := i
+            prologue.append(Load(header[v], addr_a))               # header[v] := mem[i]
 
         # vload val[256] as 32 vectors of 8 contiguous words from mem[inp_values_p..].
-        self.add(Alu("+", addr_a, header["inp_values_p"],
-                     const_vec_0.lane(0)))
+        prologue.append(Alu("+", addr_a, header["inp_values_p"],
+                            const_vec_0.lane(0)))
         for k in range(n_groups):
-            self.add(VLoad(val[k], addr_a))
+            prologue.append(VLoad(val[k], addr_a))
             if k < n_groups - 1:
-                self.add(Alu("+", addr_a, addr_a, eight_const))
+                prologue.append(Alu("+", addr_a, addr_a, eight_const))
 
         # Broadcast forest_values_p (from a header var, not a literal).
-        self.add(VBroadcast(forest_p_vec, header["forest_values_p"]))
+        prologue.append(VBroadcast(forest_p_vec, header["forest_values_p"]))
 
-        # Create each const vector by `load const` into its own lane 0 then
-        # self-broadcast (vbroadcast vec, vec reads lane 0, writes all 8). No
-        # separate broadcast-source scalar needed.
+        # Create each const vector: a whole-vector VBroadcast births the temp's
+        # home (the current engine does not support LaneRef writes on temps),
+        # reading a named scalar-const broadcast source. One scalar const per
+        # distinct value. (const_vec_0 excluded: it stays 0 from scratch init.)
+        scalar_consts = {}
         for vec_sym, value in vec_bcasts:
-            self.add(Const(vec_sym.lane(0), value))
-            self.add(VBroadcast(vec_sym, vec_sym.lane(0)))
+            if value not in scalar_consts:
+                scalar_consts[value] = Sym(f"const_{value}")
+                prologue.append(Const(scalar_consts[value], value))
+            prologue.append(VBroadcast(vec_sym, scalar_consts[value]))
 
         # neg_fp1 = 1 - forest_values_p (used by the next-addr update). Computed
-        self.add(VecElem("-", neg_fp1_vec, const_vec_1, forest_p_vec))
+        prologue.append(VecElem("-", neg_fp1_vec, const_vec_1, forest_p_vec))
         # pos_fp5 = 5 + forest_values_p (used by the level 2 select). Computed
-        self.add(VecElem("+", pos_fp5_vec, const_vec_2, const_vec_3))  # pos_fp5 = 5
-        self.add(VecElem("+", pos_fp5_vec, pos_fp5_vec, forest_p_vec))
+        prologue.append(VecElem("+", pos_fp5_vec, const_vec_2, const_vec_3))  # pos_fp5 = 5
+        prologue.append(VecElem("+", pos_fp5_vec, pos_fp5_vec, forest_p_vec))
 
         # vload tree[0..7] (levels 0-2 = 7 nodes + 1 bonus) into tree_preload.
-        self.add(Alu("+", addr_a, header["forest_values_p"],
-                     const_vec_0.lane(0)))
-        self.add(VLoad(tree_preload, addr_a))
+        prologue.append(Alu("+", addr_a, header["forest_values_p"],
+                            const_vec_0.lane(0)))
+        prologue.append(VLoad(tree_preload, addr_a))
         # Broadcast tree[0..6] into shared vector constants.
         for i in range(7):
-            self.add(VBroadcast(tree_vecs[i], tree_preload.lane(i)))
-
-        # Pause 1 -- match reference_kernel2's first yield (initial mem).
-        self.add(Pause())
+            prologue.append(VBroadcast(tree_vecs[i], tree_preload.lane(i)))
 
         # =====================================================================
         # Body -- unrolled rounds x 32 groups, one slot per bundle.
@@ -443,8 +446,19 @@ class KernelBuilder:
                 if r == rounds - 1:
                     body.append(VStore(out_addr[g], val_vec))
 
-        # Rename: symbolic -> resolved IR (single pass), then schedule.
-        body = self.re.rename(body)
+        # Rename prologue + body together (single pass) so liveness spans the
+        # boundary, then split: the prologue has no Gather, so its resolved
+        # length == its symbolic length. Emit the prologue linearly (one slot
+        # per bundle); schedule the body on the DAG.
+        print(f"Prologue length = {len(prologue)}")
+        print(f"body length = {len(body)}")
+        resolved = self.re.rename(prologue + body)
+        prologue_res = resolved[:len(prologue)]
+        body = resolved[len(prologue):]
+        for r in prologue_res:
+            self.instrs.append({r.engine: [r.lower()]})
+        # Pause 1 -- match reference_kernel2's first yield (initial mem).
+        self.add(Pause())
         body_instrs = self.build(body, vliw=True, seed=42, picker="weighted",
                                    weights=Weights(sink=-3, load=-1.5, raw=-0.25,
                                                    war=6, rigid=0.25, idx=-4))

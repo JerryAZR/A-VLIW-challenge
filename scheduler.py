@@ -34,7 +34,7 @@ import heapq
 import random
 from typing import NamedTuple
 
-from ir import Instr, Pause, VecElem, VecFma, VBroadcast, RegId
+from ir import Instr, Pause, VecElem, VecFma, VBroadcast, RegId, TaggedSlot
 from problem import VLEN, SLOT_LIMITS
 
 # A register id: (base_addr, is_vector), produced by Instr.reads()/writes().
@@ -127,6 +127,16 @@ class ReadWriteTable:
     def __init__(self):
         self._last_writer: dict[int, int | list] = {}
         self._readers: dict[tuple[int, int], list[int]] = {}
+        self._instrs: list | None = None   # optional, for rid-tagged warnings
+
+    def _rid(self, instr_id: int) -> int:
+        """The stable rename id of a node index, for cross-referencing the
+        rename-pass logs. Falls back to the node index when the instruction
+        list isn't attached."""
+        if self._instrs is None:
+            return instr_id
+        from rename import rid_of
+        return rid_of(self._instrs[instr_id])
 
     @staticmethod
     def _lanes(reg: Reg) -> list[tuple[int, int]]:
@@ -186,8 +196,10 @@ class ReadWriteTable:
             if old is None:
                 continue
             if not self._readers.get((r, lane)):
-                print(f"WARN: dead write - instr {instr_id} overwrites "
-                      f"unread writer {old} at region {r} lane {lane}")
+                raise RuntimeError(
+                    f"dead write - instr {instr_id} (rid={self._rid(instr_id)}) "
+                    f"overwrites unread writer {old} (rid={self._rid(old)}) "
+                    f"at region {r} lane {lane}")
 
         # Clear readers for the written lanes; become the last writer.
         for r, lane in lanes:
@@ -353,6 +365,7 @@ class DAG:
         """
         nodes: list[DNode] = []
         table = ReadWriteTable()
+        table._instrs = instructions     # for rid-tagged dead-write warnings
         for idx, instr in enumerate(instructions):
             if isinstance(instr, FLOW_PANIC):
                 raise NotImplementedError(
@@ -567,13 +580,20 @@ def _vec_instr_to_alu_lanes(instr: Instr, lanes) -> list[tuple]:
     VecElem(op, dest, a1, a2)  -> lane j: (op, dest+j, a1+j, a2+j)
     VBroadcast(dest, src)      -> lane j: ("+", dest+j, src, 0)
     VecFma cannot spill (no scalar fma in the ISA) and raises.
+
+    Each lane is a ``TaggedSlot`` carrying the source instruction's rename id
+    so a tracing simulator can attribute the spilled lane to its origin.
     """
     if isinstance(instr, VecFma):
         raise NotImplementedError("multiply_add cannot spill to alu (no scalar fma)")
+    rid = getattr(instr, "rid", -1)
     if isinstance(instr, VBroadcast):
-        return [("+", instr.dest.addr + j, instr.src.resolve(), 0) for j in lanes]
+        return [TaggedSlot(("+", instr.dest.addr + j, instr.src.resolve(), 0), rid)
+                for j in lanes]
     assert isinstance(instr, VecElem)
-    return [(instr.op, instr.dest.addr + j, instr.a1.addr + j, instr.a2.addr + j)
+    return [TaggedSlot(
+                (instr.op, instr.dest.addr + j, instr.a1.addr + j, instr.a2.addr + j),
+                rid)
             for j in lanes]
 
 
@@ -790,7 +810,8 @@ def schedule(dag: DAG, *, seed: int | None = None,
                 f"regressed below unscheduled baseline")
 
     # Lower IR instructions to simulator slot tuples (spilled alu lanes are
-    # already tuples).
-    return [{e: [s.lower() if isinstance(s, Instr) else s for s in slots]
+    # already TaggedSlots). tagged_lower() attaches the stable rename id so a
+    # tracing simulator can attribute every slot to its source instruction.
+    return [{e: [s.tagged_lower() if isinstance(s, Instr) else s for s in slots]
              for e, slots in bundle.items()}
             for bundle in bundles]

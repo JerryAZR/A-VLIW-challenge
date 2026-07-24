@@ -69,6 +69,13 @@ class Sym:
         assert 0 <= j < VLEN
         return LaneRef(self, j)
 
+    def __eq__(self, value: object) -> bool:
+        return (isinstance(value, Sym) and self.name == value.name
+                and self.is_vec == value.is_vec)
+
+    def __hash__(self):
+        return hash((self.name, self.is_vec))
+
 
 @dataclass(frozen=True)
 class Reg:
@@ -108,6 +115,21 @@ class LaneRef:
 Operand = Union[Sym, Reg, LaneRef]
 
 
+class TaggedSlot(tuple):
+    """A simulator slot tuple carrying the stable rename id (``rid``) of the
+    IR instruction that produced it. Behaves exactly like a plain tuple -
+    pattern matching, indexing, equality, and hashing all ignore the tag -
+    so the simulator needs no changes. The tag gives an end-to-end traceable
+    id: rename stamps it, the scheduler's lowered slots carry it, and a
+    tracing simulator can read ``slot.rid`` to tie an executed slot back to
+    its source instruction."""
+
+    def __new__(cls, t, rid: int = -1):
+        obj = super().__new__(cls, t)
+        obj.rid = rid
+        return obj
+
+
 def _ids(ops) -> list[RegId]:
     return [o.reg_id() for o in ops]
 
@@ -134,6 +156,21 @@ class Instr:
         """The simulator slot tuple (without the engine tag)."""
         raise NotImplementedError
 
+    def tagged_lower(self, res: Resolver = _ident):
+        """``lower()`` with the stable rename id attached, as ``TaggedSlot``(s).
+
+        Returns a single ``TaggedSlot`` for scalar ops, or a list of
+        ``TaggedSlot`` for ops that lower to several slots (per-lane const).
+        The rid comes from the ``rid`` attribute the rename pass stamps on the
+        instruction (-1 if it never passed through rename). The scheduler
+        emits these so a tracing simulator can recover the source id of every
+        executed slot."""
+        rid = getattr(self, "rid", -1)
+        low = self.lower(res)
+        if isinstance(low, list):
+            return [TaggedSlot(t, rid) for t in low]
+        return TaggedSlot(low, rid)
+
     # -- rename contract -------------------------------------------------
     # The instruction exposes its read/write operands positionally; the
     # rename engine maps each operand and hands back position-indexed
@@ -150,10 +187,16 @@ class Instr:
 
     def resolve(self, rd: list, wr: list) -> "Instr":
         """Rebuild with resolved operands: position-indexed lists of the
-        same length/order as read_operands() / write_operands()."""
+        same length/order as read_operands() / write_operands(). The stable
+        rename id (``rid``, attached by the rename pass, not a dataclass
+        field) is carried onto the rebuilt instruction so it survives."""
         assert len(rd) == len(self._RD) and len(wr) == len(self._WR)
-        return replace(self, **dict(zip(self._RD, rd)),
-                       **dict(zip(self._WR, wr)))
+        new = replace(self, **dict(zip(self._RD, rd)),
+                      **dict(zip(self._WR, wr)))
+        rid = getattr(self, "rid", None)
+        if rid is not None:
+            object.__setattr__(new, "rid", rid)
+        return new
 
 
 # ---------------------------------------------------------------------------
