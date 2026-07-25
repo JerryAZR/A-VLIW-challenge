@@ -40,8 +40,18 @@ def try_config(name, trials, greedy, sw):
 
 if __name__ == "__main__":
     import time
-    for rd in (-1, -2, -4, -8, -16):
+    R = ScoreWeights(reads=1, reg_delta=-1)
+    configs = [
+        ("reads=2 rd=-1 K=6", 6, 1, ScoreWeights(reads=2, reg_delta=-1)),
+        ("reads=2 rd=-1 K=10", 10, 1, ScoreWeights(reads=2, reg_delta=-1)),
+        ("reads=4 rd=-1 K=6", 6, 1, ScoreWeights(reads=4, reg_delta=-1)),
+        ("reads=2 rd=0 K=6", 6, 1, ScoreWeights(reads=2, reg_delta=0)),
+        ("reads=2 rd=-2 K=6", 6, 1, ScoreWeights(reads=2, reg_delta=-2)),
+        ("reads=3 rd=-1 K=6", 6, 1, ScoreWeights(reads=3, reg_delta=-1)),
+        ("reads=2 rd=-1 oblig=-0.5 K=6", 6, 1, ScoreWeights(reads=2, reg_delta=-1, obligations=-0.5)),
+        ("reads=2 rd=-1 alu=0.1 K=6", 6, 1, ScoreWeights(reads=2, reg_delta=-1, alu_work=0.1)),
+    ]
+    for name, trials, greedy, sw in configs:
         t0 = time.time()
-        try_config(f"reg_delta={rd} frontier=0.1 K=6", 6, 1,
-                   ScoreWeights(alu_work=1.0, reg_delta=rd, frontier=0.1))
+        try_config(name, trials, greedy, sw)
         print(f"    ({time.time() - t0:.1f}s)", flush=True)

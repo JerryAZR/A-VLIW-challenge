@@ -124,9 +124,12 @@ class TestDeadlock(unittest.TestCase):
 
 class TestScoring(unittest.TestCase):
     def test_score_is_linear_dot(self):
-        w = ScoreWeights(alu_work=2.0, reg_delta=-3.0, frontier=0.5)
-        feats = {"alu_work": 10, "reg_delta": 4, "frontier": 30}
-        self.assertAlmostEqual(_score(feats, w), 2 * 10 - 3 * 4 + 0.5 * 30)
+        w = ScoreWeights(alu_work=2.0, reg_delta=-3.0, frontier=0.5,
+                         reads=1.5, obligations=-2.0)
+        feats = {"alu_work": 10, "reg_delta": 4, "frontier": 30,
+                 "reads": 6, "obligations": 12}
+        self.assertAlmostEqual(_score(feats, w),
+                               2 * 10 - 3 * 4 + 0.5 * 30 + 1.5 * 6 - 2 * 12)
 
 
 if __name__ == "__main__":

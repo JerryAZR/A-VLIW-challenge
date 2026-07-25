@@ -44,36 +44,58 @@ class ScoreWeights:
     (alu_work), pressure (reg_delta), flexibility (frontier). Raw counts,
     no normalization; meant to be trained/swept once the structure works.
 
-    Default: pure register-delta pressure (alu_work and frontier zeroed -
-    the only signal is "net allocations, lower is better")."""
+    Default: reads=+2, reg_delta=-1, K=6 - the sweep_rollout winner (1413
+    cyc at 1536 scratch, correct on all rounds). reads (reward consuming
+    read obligations) is the metric that meters in-flight chains and avoids
+    the free_vec=0 deadlock; reg_delta is the pressure tiebreaker.
+    reg_delta=0 or reads=1/3/4 are all worse; K=4 deadlocks, K=10 is not
+    better (more trials can pick flashier-but-doomed orders).
+
+    Obligation metrics (0 by default): reads counts obligations CONSUMED
+    (each placed read decrements a tag's remaining count); obligations
+    counts obligations CREATED (sum of read_count over freshly written
+    tags). Their difference is the delta of total outstanding read
+    obligations - a leading indicator of future frees, vs reg_delta's
+    lagging one. Kept as separate features: a negative weight on
+    obligations pushes high-fanout writes back, which may or may not be
+    desirable under pressure."""
     alu_work: float = 0.0
     reg_delta: float = -1.0
     frontier: float = 0.0
+    reads: float = 2.0
+    obligations: float = 0.0
 
 
-def _features(dag, allocator, pool, n_committed, ready_n, allocs, frees):
+def _features(dag, allocator, pool, stats, ready_n):
     """Post-advance state features for one trial (raw counts, no caps):
 
-      alu_work  - (v)alu slots used this cycle, lane-weighted:
-                  scalar alu slots + 8 x valu slots (a valu slot does 8
-                  lanes of work). Load/store/flow slots are not scored.
-      reg_delta - register allocations minus frees this cycle (pressure;
-                  lower is better, weight should be negative).
-      frontier  - next-cycle ready set size (post-advance; raw count).
+      alu_work    - (v)alu slots used this cycle, lane-weighted:
+                    scalar alu slots + 8 x valu slots (a valu slot does 8
+                    lanes of work). Load/store/flow slots are not scored.
+      reg_delta   - register allocations minus frees this cycle (pressure;
+                    lower is better, weight should be negative).
+      frontier    - next-cycle ready set size (post-advance; raw count).
+      reads       - read operands consumed this cycle (obligations -1 each).
+      obligations - sum of read_count over freshly allocated write tags
+                    (obligations created this cycle).
     """
     cap = FuncUnitPool._CAPACITY
     return {
         "alu_work": (cap["alu"] - pool.free["alu"])
                     + 8 * (cap["valu"] - pool.free["valu"]),
-        "reg_delta": allocs - frees,
+        "reg_delta": stats["allocs"] - stats["frees"],
         "frontier": dag.frontier_size(),
+        "reads": stats["reads"],
+        "obligations": stats["obligations"],
     }
 
 
 def _score(feats, w: ScoreWeights) -> float:
     return (w.alu_work * feats["alu_work"]
             + w.reg_delta * feats["reg_delta"]
-            + w.frontier * feats["frontier"])
+            + w.frontier * feats["frontier"]
+            + w.reads * feats["reads"]
+            + w.obligations * feats["obligations"])
 
 
 def _run_cycle(order, dag, allocator, placements, pool, emit):
@@ -86,11 +108,38 @@ def _run_cycle(order, dag, allocator, placements, pool, emit):
     emit=True (winner replay): identical decisions plus resolved operands
         and emitted slots into ``pool.bundle``.
 
-    Returns (n_committed, n_allocs, n_frees); allocs/frees are this cycle's
-    register allocate/free counts (from the allocator's monotonic counters).
+    Returns a stats dict: committed (nodes), allocs/frees (register
+    allocate/free counts from the allocator's monotonic counters), reads
+    (read operands consumed), obligations (sum of read_count over freshly
+    allocated write tags).
     """
     n_committed = 0
+    n_reads = 0
+    n_obligations = 0
     a0, f0 = allocator.n_alloc, allocator.n_free
+
+    def _commit_reads(instr):
+        nonlocal n_reads
+        for op in instr.read_operands():
+            b = _base(op)
+            if b in allocator.assigned:
+                allocator.read(b)
+                n_reads += 1
+
+    def _alloc_writes(instr):
+        nonlocal n_obligations
+        wr_tags = [_base(o) for o in instr.write_operands()]
+        if not all(allocator.can_write(t) for t in wr_tags):
+            allocator.exhaustion_warnings += 1
+            return None
+        fresh = []
+        for t in wr_tags:
+            if t not in allocator.assigned:     # fresh allocation (not sticky)
+                n_obligations += allocator._read_count[t]
+                fresh.append(t)
+            allocator.write(t)
+        return wr_tags, fresh
+
     for idx in order:
         node = dag[idx]
         p = placements[idx]
@@ -102,10 +151,7 @@ def _run_cycle(order, dag, allocator, placements, pool, emit):
                 resolved_node = DNode(idx=idx, engine=node.engine,
                                       instr=_resolve_operands(instr, allocator))
                 pool.place(resolved_node, p)
-            for op in instr.read_operands():
-                b = _base(op)
-                if b in allocator.assigned:
-                    allocator.read(b)
+            _commit_reads(instr)
             dag.commit(idx)
             n_committed += 1
             continue
@@ -113,11 +159,11 @@ def _run_cycle(order, dag, allocator, placements, pool, emit):
             # Gather = one node emitting VLEN scalar loads (partial
             # completion). Allocate nv (sticky), land as many lanes as free
             # load slots allow; commit reads on completion.
-            wr_tags = [_base(o) for o in instr.write_operands()]
-            if not all(allocator.can_write(t) for t in wr_tags):
-                allocator.exhaustion_warnings += 1
+            aw = _alloc_writes(instr)
+            if aw is None:
                 continue
-            dest = allocator.write(wr_tags[0])     # nv vector granule
+            wr_tags, _ = aw
+            dest = allocator.addr_of(wr_tags[0])     # nv vector granule
             take = min(p.lanes_total - p.lanes_done, pool.free["load"])
             if take == 0:
                 continue                           # no load slot this cycle
@@ -129,20 +175,15 @@ def _run_cycle(order, dag, allocator, placements, pool, emit):
             pool.free["load"] -= take
             p.lanes_done += take
             if p.lanes_done == p.lanes_total:      # all 8 lanes landed
-                for op in instr.read_operands():
-                    b = _base(op)
-                    if b in allocator.assigned:
-                        allocator.read(b)
+                _commit_reads(instr)
                 dag.commit(idx)
                 n_committed += 1
             continue
         # Regular write node: placeable only with a unit slot AND registers.
-        wr_tags = [_base(o) for o in instr.write_operands()]
-        if not all(allocator.can_write(t) for t in wr_tags):
-            allocator.exhaustion_warnings += 1
+        aw = _alloc_writes(instr)
+        if aw is None:
             continue   # leave for next cycle (a read may free a register)
-        for t in wr_tags:
-            allocator.write(t)
+        wr_tags, fresh = aw
         if emit:
             resolved_node = DNode(idx=idx, engine=node.engine,
                                   instr=_resolve_operands(instr, allocator))
@@ -156,15 +197,16 @@ def _run_cycle(order, dag, allocator, placements, pool, emit):
             if p.lanes_done == 0:
                 for t in wr_tags:
                     allocator.unwrite(t)
+                for t in fresh:      # no lasting obligation was created
+                    n_obligations -= allocator._read_count[t]
             continue
         if placed:   # fully placed -> commit reads, free at 0
-            for op in instr.read_operands():
-                b = _base(op)
-                if b in allocator.assigned:
-                    allocator.read(b)
+            _commit_reads(instr)
             dag.commit(idx)
             n_committed += 1
-    return n_committed, allocator.n_alloc - a0, allocator.n_free - f0
+    return {"committed": n_committed, "allocs": allocator.n_alloc - a0,
+            "frees": allocator.n_free - f0, "reads": n_reads,
+            "obligations": n_obligations}
 
 
 def schedule_rollout(dag, read_count, *, seed: int = 42, trials: int = 6,
@@ -240,18 +282,18 @@ def schedule_rollout(dag, read_count, *, seed: int = 42, trials: int = 6,
             ta = allocator.checkpoint()
             tp = _Placement.checkpoint()
             pool.reset()
-            n_com, n_al, n_fr = _run_cycle(o, dag, allocator, placements,
-                                           pool, emit=False)
+            stats = _run_cycle(o, dag, allocator, placements, pool,
+                               emit=False)
             dag.advance()
             slots_used = sum(FuncUnitPool._CAPACITY[e] - pool.free[e]
                              for e in FuncUnitPool._CAPACITY)
-            if slots_used == 0 and n_com == 0:
+            if slots_used == 0 and stats["committed"] == 0:
                 # Nothing placed with work remaining: the same empty cycle
                 # would repeat forever - a hard deadlock, not a stall.
                 score = float("-inf")
             else:
-                score = _score(_features(dag, allocator, pool, n_com,
-                                         len(ready), n_al, n_fr),
+                score = _score(_features(dag, allocator, pool, stats,
+                                         len(ready)),
                                score_weights)
             _Placement.rollback(tp)
             allocator.rollback(ta)
@@ -270,10 +312,10 @@ def schedule_rollout(dag, read_count, *, seed: int = 42, trials: int = 6,
         # Winner replay: same order, emission on, no logging (checkpoints
         # all rolled back to token 0, so the logs are closed).
         pool.reset()
-        n_com, _, _ = _run_cycle(best_order, dag, allocator, placements,
-                                 pool, emit=True)
+        stats = _run_cycle(best_order, dag, allocator, placements, pool,
+                           emit=True)
         dag.advance()
-        committed += n_com
+        committed += stats["committed"]
         bundle = {eng: [s.tagged_lower() if isinstance(s, Instr) else s
                         for s in slots]
                   for eng, slots in pool.bundle.items()}

@@ -5,7 +5,7 @@ Living planning document (updated as the plan evolves). The optimization log
 holds the current tier matrix, the next levers, and forward-looking design
 notes.
 
-## Current tier status (after step 15: 1458 cyc)
+## Current tier status (after step 18: 1413 cyc)
 
 | tier                     | threshold | status |
 |--------------------------|-----------|--------|
@@ -16,66 +16,28 @@ notes.
 | opus45-2hr               | 1 579     | PASS   |
 | sonnet45                 | 1 548     | PASS   |
 | opus45-11hr              | 1 487     | PASS   |
-| opus45-improved-harness  | 1 363     | FAIL (95 cyc short) |
+| opus45-improved-harness  | 1 363     | FAIL (50 cyc short) |
 
-Shipped config: rounds-outer loop, trained weighted picker (6 properties)
-`Weights(sink=-3, load=-1.5, raw=-0.25, war=6, rigid=0.25, idx=-4)` = **1459 cyc**.
-
-## DAG quality (unchanged since step 12; steps 13-14 are picker-only)
-
-| metric              | idx (s10) | addr (s11) | addr+parity (s12-14) |
-|---------------------|----------:|-----------:|---------------------:|
-| nodes               | 16 864    | 16 160     | 15 776               |
-| height (crit path)  | 223       | 216        | 204                  |
-| RAW edges           | 23 840    | 23 104     | 22 720               |
-| WAR edges           | 14 208    | 20 416     | 20 352               |
-| valu nodes          | 8 832     | 8 640      | 8 256                |
-| cycles              | 1 546     | 1 559      | 1 535 -> 1522 -> **1 459** |
-
-The addr direction (steps 11-12) cut structure; steps 13-14 trained the picker
-(5 props -> 6 props with idx). The 5-prop picker plateaued at 1514; adding idx
-(reverse program order, idx=-4) broke through to 1459. Picker training
-converged (coordinate descent + DE + random search all agree on the optimum).
+Shipped config: rollout scheduler (per-cycle trial-and-score, K=6, trial 0
+= weighted greedy + shuffles), `ScoreWeights(reads=2, reg_delta=-1)` =
+**1413 cyc** at 1536 scratch, level-3 preload-select kernel active.
 
 ## Next levers
 
-The picker has plateaued at 1459 with 6 linear properties. To go lower:
-1. **Richer features**: property interactions (e.g. sink×load, war×rigid) or
-   new properties (engine-specific urgency, remaining-capacity-aware).
-2. **Structural reductions**: reduce WAR edges (20k, the addr-plane churn) or
-   reduce the prologue (123 cyc of setup).
-3. **Direction 2 (IR + register allocator)**: automate scratch management for
-   further kernel restructuring.
-
-## Next levers (order = do the clear wins first, then train)
-
-1. **Reduce op counts / dependency edges** (clear wins, pre-train): fewer
-   slots and fewer edges both shrink the scheduling problem and the resource
-   floor. Candidates:
-   - hash-stage algebraic reductions beyond the verified 12-slot form,
-   - collapsing the idx-update ops,
-   - trimming debug edges (debug vcompares are 0-cycle but still graph nodes).
-2. **Fill the remaining ~134 body cycles over the load floor** - overlap
-   gather-round loads with select-round compute across groups. The weighted
-   picker (load=+4, war=+7) already pushes this; a better load-feeding
-   strategy (prefetch / both load ports) could close more.
-3. **Real picker training** (planned): the weighted picker's 5 weights were
-   found by ~180 random samples + refinement. Real training (e.g. gradient /
-   Bayesian opt over weights, or a learned scoring net) needs a stable
-   architecture first - land the op/edge reductions, then train.
-
-## Deferred: Direction 2 (IR + register allocator)
-
-Introduce an IR with pinned globals + renamed temporaries and a group-aware
-register allocator that never coalesces across groups (so cross-group WAR
-can't return). Future-proofs scratch management for further kernel
-restructuring. Not needed while scratch fits the 5-plane coalesced layout
-(step 8 reduced scratch usage). Trigger: when we need more scratch space for
-other work, or when performance is done and we want to optimize scratch
-usage instead.
-
-Register renaming is familiar territory (hardware/CPU background); the
-algorithm can be sketched jointly when we start.
+1. **Close the 50-cyc gap to 1363**: the big-scratch validation of the same
+   dataflow ran 1389 (recompute) / 1363 (retention). Retention
+   (`RECOMPUTE_PATH_BITS=False`, ~26 cyc cheaper) needed +64 granules the
+   greedy scheduler couldn't fit - retry it under the rollout scheduler,
+   which meters pressure by construction.
+2. **Score/feature training**: the reads=2/rd=-1 point is a manual sweep
+   minimum; coordinate descent over ScoreWeights (and K) may find more.
+3. **Horizon depth** (parked, non-trivial): trials = 1 decided cycle + H
+   greedy continuation cycles, scoring the horizon state. Unlocks both
+   deadlock-avoidance foresight and performance tuning. Needs careful
+   planning before attempting.
+4. **Slot-fill performance terms**: with pressure solved, alu_work /
+   load-fill terms become performance levers rather than feasibility
+   noise - retrain with feasibility secured.
 
 ## Tools
 

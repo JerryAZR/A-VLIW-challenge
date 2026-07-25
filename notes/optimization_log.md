@@ -690,3 +690,49 @@ constraint; the real floor is the load floor ~1 242.
 Passes correctness; regalloc path beats the one-pass FIFO rename (1 466 vs
 1 827) and is within 8 cycles of the pre-rename scratch-register scheme
 (step 15, 1 458).
+
+---
+
+## Step 18 - rollout scheduler (per-cycle trial-and-score)   1 413 cyc   104.6×
+
+Commits `9631e92` (infra), (this step). The level-3 preload-select kernel
+(`36a1a23`) deadlocked the greedy regalloc scheduler at SCRATCH_SIZE=1536:
+too many in-flight hash chains -> free_vec=0 with ~170 live tags at one
+read remaining, their last-reader nodes mechanically unplaceable
+(allocation precedes freeing). Replaced the single global priority order
+with a per-cycle search (rollout.py):
+
+- **Trial-and-score loop**: each cycle, K candidate orderings of the
+  (fixed, RAW-only) ready set are simulated as placement *decisions* (no
+  operand resolution/emission - the pool is per-cycle scratch), scored on
+  the post-`advance()` state, rolled back, and the winner replayed with
+  emission on. Trial 0 = the incumbent weighted-greedy order (load-bearing:
+  pure shuffles deadlock at C=65); trials 1..K-1 = uniform shuffles.
+- **Uniform structure-owned rollback**: DAG / RegisterAllocator /
+  _Placement each implement `checkpoint() -> token` / `rollback(token)`
+  with internal undo logs; rollout.py orchestrates. Greedy path untouched
+  (logs None = zero overhead).
+- **The metric that matters**: `reads` - read obligations *consumed* this
+  cycle (weight +2), plus reg_delta (-1) as pressure tiebreaker. Rewarding
+  obligation consumption meters chain openings against closings. Failed
+  alternatives (all deadlock): reg_delta alone (any weight -1..-16),
+  frontier, alu_work, obligations=-w (starves chain starts, deadlocks
+  C=99). Key equivalence: post-cycle pool level == start - reg_delta, so
+  level and delta give identical trial rankings - one of them only.
+- K=6 (K=4 deadlocks; K=10 no better). ~5s per scheduling pass.
+
+Result: **1 413 cyc at 1536 scratch, correct on all rounds** - the
+level-3 kernel (deadlocked under greedy) now schedules, beating the
+previous 1536-feasible best (step 17, 1 466) and landing 50 cyc short of
+the big-scratch validation of the same dataflow (1 389).
+
+Passes correctness (8 seeds) and **eight** tiers: everything except
+`opus45-improved-harness < 1363` (50 cyc short).
+
+Dev tooling: `sweep_rollout.py` (weight/K sweep), `diag_deadlock.py`
+(live-tag autopsy at the wall), `diag_liveness.py` (committed-liveness
+profile; peak 220 at big scratch = scheduler artifact, not a capacity
+proof). dev_tests/ (14 unit tests): randomized rollback equivalence for
+all three structures, golden greedy-equivalence (trials=1 reproduces
+regalloc.schedule byte-for-byte), determinism, allocator hygiene,
+deadlock detection.
