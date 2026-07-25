@@ -8,3 +8,5 @@ trace_sim.log
 warn.txt
 slots_regalloc.png
 __pycache__/
+trace.json
+_trace.py

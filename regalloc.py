@@ -284,12 +284,13 @@ def schedule(dag: DAG, read_count, *, seed: int | None = None,
              prio=None):
     """List-schedule a RAW-only DAG, allocating registers at schedule time.
 
-    Mirrors scheduler.schedule's loop/picker but resolves tags to physical
-    registers via a RegisterAllocator instead of using pre-resolved operands.
-    A write node is placeable only when a unit slot AND a free register are
-    both available; reads are consumed (and their register freed) on commit.
-    Pass ``allocator`` to continue an existing allocation (e.g. from a
-    linearly-emitted prologue); a fresh one is created otherwise.
+    A standard list-scheduling loop over the DAG's ready set (driven by the
+    shared ``FuncUnitPool``/picker), but resolving tags to physical registers
+    via a ``RegisterAllocator`` as nodes are placed. A write node is placeable
+    only when a unit slot AND a free register are both available; reads are
+    consumed (and their register freed) on commit. Pass ``allocator`` to
+    continue an existing allocation (e.g. from a linearly-emitted prologue);
+    a fresh one is created otherwise.
 
     ``prio``: optional priority-fn factory ``(allocator, base_key_fn) ->
     key_fn`` to override node ordering (default: pressure-aware freeing bias).

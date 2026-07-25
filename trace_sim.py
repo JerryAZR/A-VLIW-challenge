@@ -13,8 +13,9 @@ Each log line:
     cycle C  rid R  engine  slot=(op, ...)  read  addr=v ...  write  addr=v ...
 
 The rid is recovered by matching the executed (lowered) slot back to the IR
-instruction that produced it, via the rename pass's stable ids. Slots that
-don't map to a renamed IR instruction (e.g. raw prologue tuples) get rid=-1.
+instruction that produced it, via the stable instruction ids carried on
+TaggedSlots. Slots that don't map to an IR instruction (e.g. raw prologue
+tuples) get rid=-1.
 
 Design notes:
 - Values are captured at the moment the slot executes: reads from
@@ -56,9 +57,9 @@ class TracingMachine(Machine):
     # -- per-engine wrappers that log around the real op -------------------
 
     def _log_slot(self, core, engine, slot, read_pairs, write_pairs):
-        # The slot is a TaggedSlot carrying the stable rename id end-to-end
-        # (rename stamps it, the scheduler's tagged_lower() attaches it).
-        # Plain prologue tuples (self.add) have no tag -> rid=-1.
+        # The slot is a TaggedSlot carrying the stable instruction id
+        # end-to-end (assigned at construction; the scheduler's tagged_lower()
+        # attaches it). Plain prologue tuples have no tag -> rid=-1.
         rid = getattr(slot, "rid", -1)
         self._log.write(
             f"cycle {self.cycle:6d}  rid {rid:6d}  {engine:5s}  {slot}\n"

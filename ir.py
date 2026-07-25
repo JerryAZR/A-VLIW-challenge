@@ -28,10 +28,9 @@ Register references:
                               like indexing a declared vector in a programming
                               language: the lane is a view, not its own symbol
 
-``reads()``/``writes()`` return the same (addr, is_vec) tuple pairs the
-DAG's ReadWriteTable has always consumed, so the dependency machinery is
-unchanged. Immediates (const values, vcompare keys) are plain ints, not
-registers.
+``reads()``/``writes()`` return the (addr, is_vec) tuple pairs the
+dependency machinery consumes. Immediates (const values, vcompare keys)
+are plain ints, not registers.
 
 Only the ops the kernel actually emits are modeled. PC-modifying flow ops
 (jumps/halt/pause) are not schedulable: ``Pause`` exists for the linear
@@ -43,8 +42,8 @@ from typing import ClassVar, Callable, Union
 
 from problem import VLEN
 
-# A resolved register id, as consumed by the scheduler's ReadWriteTable:
-# (base_addr, is_vector). is_vector=True covers [addr..addr+VLEN-1].
+# A resolved register id: (base_addr, is_vector).
+# is_vector=True covers [addr..addr+VLEN-1].
 RegId = tuple[int, bool]
 
 # resolve hook: maps a Reg to its base address (identity when pinned).
