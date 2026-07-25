@@ -621,3 +621,72 @@ Passes correctness (8 seeds) and **seven** tiers (unchanged): `baseline`,
 `updated-starting`, `opus4-many-hours`, `opus45-casual`, `opus45-2hr < 1579`,
 `sonnet45 < 1548`, `opus45-11hr < 1487`. 95 cyc short of
 `opus45-improved-harness < 1363`.
+
+---
+
+## Step 16 - two-phase register allocation (parallel path)   1 628 cyc
+
+The one-pass FIFO rename engine (step a9f00d8+) had regressed the body to
+1 765 via cross-group WAR chains: the auto-free FIFO recycled t1/t2/nv homes
+across groups, and the DAG's no-WAW-edge design meant a dead write silently
+broke the reader-bridged ordering chain. Replaced with a clean two-phase
+architecture in `regalloc.py` (new module, FIFO path kept for comparison):
+
+1. **`tag_raw_chains`** - forward SSA pass. Each write becomes a unique
+   version tag (`sym#n`); reads map to the current tag; `read_count[tag]`
+   records how many readers. Tags are unique by construction, so the DAG has
+   **RAW edges only** - no false WAR/WAW by design.
+2. **`build_dag`** - weight-1 RAW edges from each tag's unique writer.
+   Prologue-written tags are pre-committed inputs (no edge).
+3. **`RegisterAllocator` + `schedule`** - registers allocated at writer
+   placement (sticky across partial nodes), freed when all reads commit. A
+   write node is placeable only when a unit slot AND a free register are both
+   available. Gather = one partial-completion node (8 scalar loads, sticky nv
+   register). Dead writes are dropped (they'd have no reader to free).
+4. **Pressure-aware priority** - a node that is the last reader of a tag frees
+   its register on commit; under low free-pool, prefer such nodes so chains
+   finish instead of piling up un-freed temps.
+
+Key correctness fixes: resolve operands at allocation time (not emit time, when
+read tags may already be freed); `unwrite` rollback only when `lanes_done==0`
+(a partial node's dest register must not be freed mid-spill).
+
+Result: **1 628 cyc** (all-temps, 0/256) vs FIFO 1 827. `b1d4bb7`, `78a7f0b`.
+
+## Step 17 - always-on freeing bias + tuned weights   1 466 cyc   100.7×
+
+- The register-freeing priority is now **always-on** (not threshold-gated):
+  always prefer a node whose commit frees a register. A sweep
+  (`sweep_regalloc.py`) showed always-free beats threshold-gating (1 455 vs
+  1 482 body) and the bias weight barely matters. The bias is also *required*
+  for the schedule to complete at all under register pressure (the pure
+  weighted base deadlocks - 47 ready nodes, none placeable).
+- Base picker weights tuned for the RAW-only DAG via random search + local
+  refinement + DE: `REGALLOC_WEIGHTS = (sink=-1, load=5, raw=1, war=1,
+  rigid=1, idx=-4)`, distinct from the FIFO path's `BODY_WEIGHTS`.
+
+Result: **1 466 cyc** (body 1 273), all rounds correct. `26c708f`.
+
+### The body is now LOAD-bound, not valu-bound (structural ceiling)
+
+`analyze_slots.py --regalloc` on the body (1 273 cyc):
+
+| engine | slots used | capacity | util | idle cycles |
+|--------|-----------:|---------:|-----:|------------:|
+| valu   | 6 168      | 7 638    | 80.8%| 192 |
+| **load** | **2 484** | **2 546**| **97.6%** | **31** |
+| alu    | 11 948     | 15 276   | 78.2%| 274 |
+| flow   | 249        | 1 273    | 19.6%| 1 024 |
+
+**Load is saturated at 97.6%.** 2 484 load slots / 2-per-cycle = a **1 242-cycle
+load floor**; the body is 1 273, only 31 cycles of slack. The hogs are the
+**320 Gathers** (tree-node value lookups), each decomposed to 8 scalar loads =
+2 560 load slots. valu has headroom (80.8%) but cannot help - the load unit is
+the wall. Further body gains require *reducing load slots* (fewer/cheaper
+gathers), not better scheduling. The earlier "valu resource bound ~1 088" was
+computed before counting the 8x gather decomposition and is not the binding
+constraint; the real floor is the load floor ~1 242.
+
+Passes correctness; regalloc path beats the one-pass FIFO rename (1 466 vs
+1 827) and is within 8 cycles of the pre-rename scratch-register scheme
+(step 15, 1 458).
