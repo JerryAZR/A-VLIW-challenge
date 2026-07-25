@@ -59,6 +59,11 @@ ROLLOUT_SORT_FUNCS = None    # explicit trial set override; None -> default
 ROLLOUT_SEED = 42
 ROLLOUT_SCORE_WEIGHTS = None  # None -> rollout.ScoreWeights() defaults
 
+# Which small const vectors are COMPUTED on valu (vs const+vbroadcast).
+# Measured incrementally (sweep_consts.py); dependencies (19/33/4097 read
+# const_vec_16, etc.) work with either form of their source.
+COMPUTED_CONSTS = {1, 2, 3, 9, 16, 19, 33, 4097}
+
 # Level-3 path-bit recompute toggle. The level-3 select needs the three
 # descent path bits (d0,d1,d2). They can either be RETAINED from rounds 0-2
 # (the path_g[0..2] writes in the addr update) or RECOMPUTED here from addr
@@ -305,6 +310,12 @@ class KernelBuilder:
             (K0_vec, 0x7ED55D16), (K1_vec, 0xC761C23C), (K2_vec, 0x165667B1),
             (K3_vec, 0xD3A2646C), (K4_vec, 0xFD7046C5), (K5_vec, 0xB55A4F09),
         ]
+        # Small consts NOT in COMPUTED_CONSTS fall back to const+vbroadcast.
+        _small_syms = {1: const_vec_1, 2: const_vec_2, 3: const_vec_3,
+                       9: const_vec_9, 16: const_vec_16, 19: const_vec_19,
+                       33: const_vec_33, 4097: const_vec_4097}
+        vec_bcasts += [(sym, v) for v, sym in _small_syms.items()
+                       if v not in COMPUTED_CONSTS]
 
         # Hash-stage consts by value. The literal `9` is shared (stage-4 mult +
         # stage-3 shift both read const_vec_9); kept in two dicts only because
@@ -354,20 +365,30 @@ class KernelBuilder:
             prologue.append(VBroadcast(vec_sym, scalar_consts[value]))
 
         # Small const vectors COMPUTED from each other on valu (instead of
-        # const load + vbroadcast): 8 loads + 8 valu -> 9 valu, and the load
-        # engine is the busier one in the ramp-up window.
-        const_vec_64 = Sym("const_vec_64", True)   # temp for 4097
-        prologue.append(VecElem("==", const_vec_1, const_vec_0, const_vec_0))  # 1 = (0==0)
-        prologue.append(VecElem("+", const_vec_2, const_vec_1, const_vec_1))  # 2 = 1+1
-        prologue.append(VecElem("+", const_vec_3, const_vec_1, const_vec_2))  # 3 = 1+2
-        prologue.append(VecElem("*", const_vec_9, const_vec_3, const_vec_3))     # 9 = 3*3
-        prologue.append(VecElem("<<", const_vec_16, const_vec_2, const_vec_3))  # 16 = 2<<3
-        prologue.append(VecElem("+", const_vec_19, const_vec_16, const_vec_3))  # 19 = 16+3
-        prologue.append(VecFma(const_vec_33, const_vec_16, const_vec_2,
-                               const_vec_1))                                   # 33 = 16*2+1
-        prologue.append(VecElem("<<", const_vec_64, const_vec_16, const_vec_2))  # 64 = 16<<2
-        prologue.append(VecFma(const_vec_4097, const_vec_64, const_vec_64,
-                               const_vec_1))                                   # 4097 = 64*64+1
+        # const load + vbroadcast): trades const-load slots for ~1 net valu
+        # op each and fewer prologue nodes. Set membership: COMPUTED_CONSTS.
+        # Fallback forms (const+vbroadcast) are added to vec_bcasts above;
+        # dependencies work with either form of their source.
+        if 1 in COMPUTED_CONSTS:
+            prologue.append(VecElem("==", const_vec_1, const_vec_0, const_vec_0))  # 1 = (0==0)
+        if 2 in COMPUTED_CONSTS:
+            prologue.append(VecElem("+", const_vec_2, const_vec_1, const_vec_1))  # 2 = 1+1
+        if 3 in COMPUTED_CONSTS:
+            prologue.append(VecElem("+", const_vec_3, const_vec_1, const_vec_2))  # 3 = 1+2
+        if 9 in COMPUTED_CONSTS:
+            prologue.append(VecElem("*", const_vec_9, const_vec_3, const_vec_3))  # 9 = 3*3
+        if 16 in COMPUTED_CONSTS:
+            prologue.append(VecElem("<<", const_vec_16, const_vec_2, const_vec_3))  # 16 = 2<<3
+        if 19 in COMPUTED_CONSTS:
+            prologue.append(VecElem("+", const_vec_19, const_vec_16, const_vec_3))  # 19 = 16+3
+        if 33 in COMPUTED_CONSTS:
+            prologue.append(VecFma(const_vec_33, const_vec_16, const_vec_2,
+                                   const_vec_1))                               # 33 = 16*2+1
+        if 4097 in COMPUTED_CONSTS:
+            const_vec_64 = Sym("const_vec_64", True)   # temp for 4097
+            prologue.append(VecElem("<<", const_vec_64, const_vec_16, const_vec_2))  # 64 = 16<<2
+            prologue.append(VecFma(const_vec_4097, const_vec_64, const_vec_64,
+                                   const_vec_1))                               # 4097 = 64*64+1
 
         # neg_fp1 = 1 - forest_values_p (used by the next-addr update). Computed
         prologue.append(VecElem("-", neg_fp1_vec, const_vec_1, forest_p_vec))
