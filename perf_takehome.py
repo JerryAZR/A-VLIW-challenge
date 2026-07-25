@@ -298,10 +298,10 @@ class KernelBuilder:
         # (vec, literal) pairs: the prologue `load const` lane 0 + self-broadcast.
         # const_vec_0 is EXCLUDED: scratch starts all-zero, so it needs no
         # const-load + broadcast (and it is the one reserved home - see above).
+        # SMALL consts (1, 2, 3, 9, 16, 19, 33, 4097) are NOT here: they are
+        # COMPUTED from each other on valu (see below), trading 8 const loads
+        # + 8 broadcasts for 9 valu ops on the less-loaded engines.
         vec_bcasts = [
-            (const_vec_1, 1),    (const_vec_2, 2),
-            (const_vec_3, 3),    (const_vec_9, 9),    (const_vec_16, 16),
-            (const_vec_19, 19),  (const_vec_33, 33),  (const_vec_4097, 4097),
             (K0_vec, 0x7ED55D16), (K1_vec, 0xC761C23C), (K2_vec, 0x165667B1),
             (K3_vec, 0xD3A2646C), (K4_vec, 0xFD7046C5), (K5_vec, 0xB55A4F09),
         ]
@@ -352,6 +352,22 @@ class KernelBuilder:
                 scalar_consts[value] = Sym(f"const_{value}")
                 prologue.append(Const(scalar_consts[value], value))
             prologue.append(VBroadcast(vec_sym, scalar_consts[value]))
+
+        # Small const vectors COMPUTED from each other on valu (instead of
+        # const load + vbroadcast): 8 loads + 8 valu -> 9 valu, and the load
+        # engine is the busier one in the ramp-up window.
+        const_vec_64 = Sym("const_vec_64", True)   # temp for 4097
+        prologue.append(VecElem("==", const_vec_1, const_vec_0, const_vec_0))  # 1 = (0==0)
+        prologue.append(VecElem("+", const_vec_2, const_vec_1, const_vec_1))  # 2 = 1+1
+        prologue.append(VecElem("+", const_vec_3, const_vec_1, const_vec_2))  # 3 = 1+2
+        prologue.append(VecElem("*", const_vec_9, const_vec_3, const_vec_3))     # 9 = 3*3
+        prologue.append(VecElem("<<", const_vec_16, const_vec_2, const_vec_3))  # 16 = 2<<3
+        prologue.append(VecElem("+", const_vec_19, const_vec_16, const_vec_3))  # 19 = 16+3
+        prologue.append(VecFma(const_vec_33, const_vec_16, const_vec_2,
+                               const_vec_1))                                   # 33 = 16*2+1
+        prologue.append(VecElem("<<", const_vec_64, const_vec_16, const_vec_2))  # 64 = 16<<2
+        prologue.append(VecFma(const_vec_4097, const_vec_64, const_vec_64,
+                               const_vec_1))                                   # 4097 = 64*64+1
 
         # neg_fp1 = 1 - forest_values_p (used by the next-addr update). Computed
         prologue.append(VecElem("-", neg_fp1_vec, const_vec_1, forest_p_vec))
