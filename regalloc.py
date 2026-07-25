@@ -197,6 +197,9 @@ class RegisterAllocator:
         scalar_start = SCRATCH_SIZE - SCALAR_POOL_WORDS
         self.free_vec = deque(range(vec_start, scalar_start, VLEN))
         self.free_scalar = deque(range(scalar_start, SCRATCH_SIZE))
+        # Initial pool sizes (for pressure features / normalization).
+        self.vec_pool_size = len(self.free_vec)
+        self.scalar_pool_size = len(self.free_scalar)
         self.assigned: dict[Sym, int] = {}     # tag -> base addr
         self.remaining: dict[Sym, int] = {}    # tag -> reads left before free
         self.exhaustion_warnings = 0
@@ -205,6 +208,8 @@ class RegisterAllocator:
         # addr -> (base name, length) for the simulator's debug scratch map.
         # Recorded at allocation time; tags strip the "#n" version suffix.
         self._names: dict[int, tuple[str, int]] = {0: ("const_vec_0", VLEN)}
+        # Undo log for checkpoint()/rollback() (None = not recording).
+        self._log: list | None = None
 
     def _pool(self, is_vec):
         return self.free_vec if is_vec else self.free_scalar
@@ -229,7 +234,10 @@ class RegisterAllocator:
         self.remaining[tag] = self._read_count[tag]
         self.n_alloc += 1
         # Record the base name (strip the "#n" version suffix) for debug_map.
+        old_name = self._names.get(addr)
         self._names[addr] = (tag.name.split("#")[0], VLEN if tag.is_vec else 1)
+        if self._log is not None:
+            self._log.append(("W", tag, addr, old_name))
         return addr
 
     def unwrite(self, tag: Sym) -> None:
@@ -240,15 +248,68 @@ class RegisterAllocator:
             addr = self.assigned.pop(tag)
             self._pool(tag.is_vec).appendleft(addr)
             del self.remaining[tag]
+            if self._log is not None:
+                self._log.append(("U", tag, addr))
 
     def read(self, tag: Sym) -> None:
         """One read of ``tag`` committed; free its register when all are done."""
         self.remaining[tag] -= 1
+        if self._log is not None:
+            self._log.append(("R", tag))
         if self.remaining[tag] == 0:
             addr = self.assigned.pop(tag)
             self._pool(tag.is_vec).append(addr)
             del self.remaining[tag]
             self.n_free += 1
+            if self._log is not None:
+                self._log.append(("F", tag, addr))
+
+    # -- checkpoint / rollback --------------------------------------------
+    # Same interface as DAG.checkpoint()/rollback(): mutations above append
+    # inverse records to ``_log`` while it is open; rollback(token) undoes
+    # everything past the token in reverse. Rolling back to token 0 closes
+    # the log. Diagnostic counters (n_alloc/n_free/exhaustion_warnings) are
+    # intentionally NOT rolled back (monotonic stats; per-trial deltas are
+    # computed by subtraction around a trial).
+
+    def checkpoint(self) -> int:
+        """Start recording mutations; returns an opaque rollback token."""
+        if self._log is None:
+            self._log = []
+        return len(self._log)
+
+    def rollback(self, token: int) -> None:
+        """Undo all mutations recorded since ``token`` (reverse order)."""
+        log = self._log
+        assert log is not None, "rollback without an open checkpoint"
+        while len(log) > token:
+            entry = log.pop()
+            kind = entry[0]
+            if kind == "W":                     # undo an allocation
+                _, tag, addr, old_name = entry
+                del self.assigned[tag]
+                del self.remaining[tag]
+                self._pool(tag.is_vec).appendleft(addr)
+                if old_name is None:
+                    self._names.pop(addr, None)
+                else:
+                    self._names[addr] = old_name
+            elif kind == "R":                   # undo a consumed read
+                self.remaining[entry[1]] += 1
+            elif kind == "F":                   # undo a free
+                _, tag, addr = entry
+                self._pool(tag.is_vec).remove(addr)
+                self.assigned[tag] = addr
+                self.remaining[tag] = 0
+            elif kind == "U":                   # undo an unwrite (redo write)
+                _, tag, addr = entry
+                self._pool(tag.is_vec).remove(addr)
+                self.assigned[tag] = addr
+                self.remaining[tag] = self._read_count[tag]
+            else:
+                raise AssertionError(f"unknown allocator log entry: {entry}")
+        if token == 0:
+            self._log = None
 
     # -- queries for the scheduler ----------------------------------------
 

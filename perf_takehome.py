@@ -45,6 +45,15 @@ from problem import (
 # the remaining work best. (Found by random search + local refinement.)
 REGALLOC_WEIGHTS = Weights(sink=-1, load=5, raw=1, war=1, rigid=1, idx=-4)
 
+# Body scheduler selection: "greedy" (regalloc.schedule, weighted picker +
+# freeing bias) or "rollout" (rollout.schedule_rollout: per-cycle
+# trial-and-score search over placement orderings).
+SCHEDULER_MODE = "rollout"
+ROLLOUT_TRIALS = 6           # candidate orderings scored per cycle
+ROLLOUT_GREEDY_TRIALS = 1    # of those, how many are the incumbent greedy order
+ROLLOUT_SEED = 42
+ROLLOUT_SCORE_WEIGHTS = None  # None -> rollout.ScoreWeights() defaults
+
 # Level-3 path-bit recompute toggle. The level-3 select needs the three
 # descent path bits (d0,d1,d2). They can either be RETAINED from rounds 0-2
 # (the path_g[0..2] writes in the addr update) or RECOMPUTED here from addr
@@ -557,8 +566,17 @@ class KernelBuilder:
             dag = prune_to_stores(dag)
             read_count = recompute_read_count(
                 [n.instr for n in dag.nodes], pinned={"const_vec_0"})
-        body_instrs = reg_schedule(dag, read_count, seed=42, picker="weighted",
-                                   weights=REGALLOC_WEIGHTS, allocator=allocator)
+        if SCHEDULER_MODE == "rollout":
+            from rollout import schedule_rollout
+            body_instrs = schedule_rollout(
+                dag, read_count, seed=ROLLOUT_SEED, trials=ROLLOUT_TRIALS,
+                greedy_trials=ROLLOUT_GREEDY_TRIALS, weights=REGALLOC_WEIGHTS,
+                score_weights=ROLLOUT_SCORE_WEIGHTS, allocator=allocator)
+        else:
+            body_instrs = reg_schedule(dag, read_count, seed=42,
+                                       picker="weighted",
+                                       weights=REGALLOC_WEIGHTS,
+                                       allocator=allocator)
         self.instrs.extend(body_instrs)
         # Kept for dev tools (_validate.py): the scheduled body's RAW-only
         # DAG and the tagged body instructions (map rid -> instruction).

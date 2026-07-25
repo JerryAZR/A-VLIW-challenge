@@ -32,7 +32,7 @@ carries no edges in practice.
 from dataclasses import dataclass, field
 import heapq
 import random
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 from ir import Instr, Pause, VecElem, VecFma, VBroadcast, RegId, TaggedSlot, Gather
 from problem import VLEN, SLOT_LIMITS
@@ -147,6 +147,10 @@ class DAG:
             if self._raw[i] == 0 and self._war[i] == 0:
                 self._frontier.add(i)
 
+        # Undo log for checkpoint()/rollback() (None = not recording; the
+        # greedy scheduler path never records and pays nothing).
+        self._log: list | None = None
+
         self.props: list[NodeProps] = self._compute_props()
 
     # -- queries ----------------------------------------------------------
@@ -175,19 +179,31 @@ class DAG:
         buffered in ``_pending`` and applied by ``advance()`` (so the child
         becomes ready next cycle, reflecting read-before-write latency).
         """
+        log = self._log
         self._committed[idx] = True
-        self._frontier.discard(idx)
+        if log is not None:
+            log.append(("C", idx))
+        if idx in self._frontier:
+            self._frontier.discard(idx)
+            if log is not None:
+                log.append(("F-", idx))
         unlocked: list[int] = []
         for dst, w in self.nodes[idx].out_edges:
             if self._committed[dst]:
                 continue
             if w == 0:                       # WAR - same-cycle-safe
                 self._war[dst] -= 1
+                if log is not None:
+                    log.append(("W", dst))
                 if self._unblocked(dst) and dst not in self._frontier:
                     self._frontier.add(dst)
+                    if log is not None:
+                        log.append(("F+", dst))
                     unlocked.append(dst)
             else:                            # RAW - deferred
                 self._pending[dst] += 1
+                if log is not None:
+                    log.append(("P", dst))
         return unlocked
 
     def advance(self) -> list[int]:
@@ -197,18 +213,66 @@ class DAG:
         become fully unblocked are added to the frontier (ready next
         cycle).  Returns the newly-ready node indices.
         """
+        log = self._log
         unlocked: list[int] = []
         for i in range(len(self.nodes)):
             if self._pending[i] == 0:
                 continue
             self._raw[i] -= self._pending[i]
+            if log is not None:
+                log.append(("R", i, self._pending[i]))
+                log.append(("Z", i, self._pending[i]))  # pending reset to 0
             self._pending[i] = 0
             if (not self._committed[i]
                     and self._unblocked(i)
                     and i not in self._frontier):
                 self._frontier.add(i)
+                if log is not None:
+                    log.append(("F+", i))
                 unlocked.append(i)
         return unlocked
+
+    # -- checkpoint / rollback --------------------------------------------
+    # Uniform trial-rollback interface (used by the rollout scheduler):
+    # checkpoint() starts (or continues) recording mutations and returns an
+    # opaque token; rollback(token) undoes every mutation recorded after the
+    # token was taken, in reverse order. Rolling back to token 0 closes the
+    # log (subsequent mutations are unrecorded and free).
+
+    def checkpoint(self) -> int:
+        """Start recording mutations; returns an opaque rollback token."""
+        if self._log is None:
+            self._log = []
+        return len(self._log)
+
+    def rollback(self, token: int) -> None:
+        """Undo all mutations recorded since ``token`` (reverse order)."""
+        log = self._log
+        assert log is not None, "rollback without an open checkpoint"
+        while len(log) > token:
+            entry = log.pop()
+            kind = entry[0]
+            if kind == "C":
+                self._committed[entry[1]] = False
+            elif kind == "F-":
+                self._frontier.add(entry[1])
+            elif kind == "F+":
+                self._frontier.discard(entry[1])
+            elif kind == "W":
+                self._war[entry[1]] += 1
+            elif kind == "P":
+                self._pending[entry[1]] -= 1
+            elif kind == "Z":
+                self._pending[entry[1]] = entry[2]
+            elif kind == "R":
+                self._raw[entry[1]] += entry[2]
+            else:
+                raise AssertionError(f"unknown DAG log entry: {entry}")
+        if token == 0:
+            self._log = None
+
+    def frontier_size(self) -> int:
+        return len(self._frontier)
 
     def _unblocked(self, idx: int) -> bool:
         """Node has zero unresolved in-edges (frontier-eligible)."""
@@ -371,12 +435,45 @@ class _Placement:
 
     Owned by the scheduler (persists across cycles); mutated by the
     ``FuncUnitPool`` during placement.
+
+    Trial rollback: mutations of ``lanes_done`` / ``engine_choice`` are
+    recorded in a class-level undo log while a checkpoint is open
+    (``_Placement.checkpoint()`` / ``_Placement.rollback(token)`` - the same
+    interface as ``DAG`` and ``RegisterAllocator``). One log covers all
+    instances (a trial touches placements across many nodes). The log is
+    None on the greedy path: no recording, no overhead.
     """
     kind: str
     lanes_total: int                  # 1 atomic; 8 spillable vec_elem; 0 debug
     native_engine: str                # alu / load / store / flow / valu / debug
     lanes_done: int = 0               # lanes landed so far
     engine_choice: str | None = None  # sticky once the first lane lands
+
+    _log: ClassVar[list | None] = None
+
+    def __setattr__(self, name, value):
+        log = _Placement._log
+        if log is not None and name in ("lanes_done", "engine_choice"):
+            log.append((self, name, getattr(self, name, None)))
+        object.__setattr__(self, name, value)
+
+    @classmethod
+    def checkpoint(cls) -> int:
+        """Start recording field mutations; returns an opaque token."""
+        if cls._log is None:
+            cls._log = []
+        return len(cls._log)
+
+    @classmethod
+    def rollback(cls, token: int) -> None:
+        """Undo all field mutations recorded since ``token``."""
+        log = cls._log
+        assert log is not None, "rollback without an open checkpoint"
+        while len(log) > token:
+            obj, name, old = log.pop()
+            object.__setattr__(obj, name, old)
+        if token == 0:
+            cls._log = None
 
 
 def _classify(n: DNode) -> _Placement:
@@ -459,7 +556,7 @@ class FuncUnitPool:
         self.free = dict(self._CAPACITY)
         self.bundle = {}
 
-    def place(self, node: DNode, p: _Placement) -> bool | None:
+    def place(self, node: DNode, p: _Placement, dry: bool = False) -> bool | None:
         """Try to place a single node this cycle.
 
         Updates occupation state and ``p`` (lanes landed / sticky engine)
@@ -468,40 +565,49 @@ class FuncUnitPool:
           True  - yes: placed and complete (caller commits to the DAG)
           False - partial: placed some lanes, needs more cycles
           None  - no: no unit had room; nothing changed
+
+        ``dry=True`` makes the *decision* only (slot budgets and ``p`` are
+        updated exactly as a real placement) but skips materialising slot
+        tuples into ``bundle`` - used by rollout trials, which only need the
+        resulting state, not the emitted slots.
         """
         if p.kind == _KIND_DEBUG:
-            self.bundle.setdefault("debug", []).append(node.instr)
+            if not dry:
+                self.bundle.setdefault("debug", []).append(node.instr)
             return True
 
         if p.kind == _KIND_VEC_ELEM:
             if p.lanes_done > 0:              # sticky alu continuation
-                return self._spill_alu(node, p)
+                return self._spill_alu(node, p, dry)
             if self.free["valu"] > 0:         # fresh: prefer one valu slot
-                self.bundle.setdefault("valu", []).append(node.instr)
+                if not dry:
+                    self.bundle.setdefault("valu", []).append(node.instr)
                 self.free["valu"] -= 1
                 p.lanes_done = p.lanes_total
                 p.engine_choice = "valu"
                 return True
-            return self._spill_alu(node, p)   # else spill to alu
+            return self._spill_alu(node, p, dry)   # else spill to alu
 
         # Atomic: alu / load / store / flow / vec_fma
         eng = p.native_engine
         if self.free[eng] == 0:
             return None
-        self.bundle.setdefault(eng, []).append(node.instr)
+        if not dry:
+            self.bundle.setdefault(eng, []).append(node.instr)
         self.free[eng] -= 1
         p.lanes_done = p.lanes_total
         p.engine_choice = eng
         return True
 
-    def _spill_alu(self, node: DNode, p: _Placement) -> bool | None:
+    def _spill_alu(self, node: DNode, p: _Placement, dry: bool = False) -> bool | None:
         """Land as many remaining vec_elem lanes as fit on the alu unit."""
         take = min(p.lanes_total - p.lanes_done, self.free["alu"])
         if take == 0:
             return None
-        for s in _vec_instr_to_alu_lanes(
-                node.instr, range(p.lanes_done, p.lanes_done + take)):
-            self.bundle.setdefault("alu", []).append(s)
+        if not dry:
+            for s in _vec_instr_to_alu_lanes(
+                    node.instr, range(p.lanes_done, p.lanes_done + take)):
+                self.bundle.setdefault("alu", []).append(s)
         self.free["alu"] -= take
         p.lanes_done += take
         p.engine_choice = "alu"
