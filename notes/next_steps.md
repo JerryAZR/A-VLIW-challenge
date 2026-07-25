@@ -5,7 +5,7 @@ Living planning document (updated as the plan evolves). The optimization log
 holds the current tier matrix, the next levers, and forward-looking design
 notes.
 
-## Current tier status (after step 19: 1289 cyc)
+## Current tier status (after step 20: 1203 cyc)
 
 | tier                     | threshold | status |
 |--------------------------|-----------|--------|
@@ -16,24 +16,33 @@ notes.
 | opus45-2hr               | 1 579     | PASS   |
 | sonnet45                 | 1 548     | PASS   |
 | opus45-11hr              | 1 487     | PASS   |
-| opus45-improved-harness  | 1 363     | **PASS (1289, 74 clear)** |
+| opus45-improved-harness  | 1 363     | **PASS (1203, 160 clear)** |
 
-All nine tiers pass. Shipped config: rollout scheduler (K=6, sort funcs
-[greedy] + [random]*5), `ScoreWeights(reads=2, reg_delta=-1)`,
-`REGALLOC_WEIGHTS = Weights(sink=-1, load=5, raw=1, war=1, rigid=1,
-idx=-4, group=-4)` (group priority: finish earlier DAG sink groups first).
+All nine tiers pass. Shipped config: rollout scheduler **K=1** (greedy
+priority only; K=6 adds just 2 cyc - raise K again after other parts
+settle), `ScoreWeights(reads=2, reg_delta=-1)`, `REGALLOC_WEIGHTS =
+Weights(sink=-1, load=5, raw=1, war=1, rigid=1, idx=-4, group=-4)`.
+Prologue is merged into the body DAG (no serial prologue); pauses ride
+existing bundles' flow slots.
+
+## Current bottleneck (step-20 utilization)
+
+**valu-bound**: 6 870 valu slots -> 1 145-cyc floor vs 1 203 actual (58
+cyc slack). load 88.7%, alu 88.0%, flow 58.7%. Former-prologue ramp-up
+(first ~60 cyc) runs ~60% utilized.
 
 ## Next levers
 
-1. **Score/feature training**: coordinate descent over ScoreWeights +
-   REGALLOC_WEIGHTS (now 7 dims incl. group) around the manual minimum.
-2. **Sort-func mix**: with group=-4 the greedy trial dominates (K=3 ties
-   K=6); try K=2-3 for iteration speed, or interp variants once the base
-   weights are retrained.
-3. **Retention retry** (`RECOMPUTE_PATH_BITS=False`, ~26 cyc cheaper at big
-   scratch): pressure is now metered by group priority - retest at 1536.
-4. **Slot-fill performance terms** (alu_work / load-fill) now that
-   feasibility is secured.
+1. **valu op-count reduction** (the floor): prologue tricks (compute
+   small consts instead of const+vbroadcast - but keep them OFF valu;
+   const loads ride the 88.7% load engine, alu-computed trades load->alu),
+   select-tree op reductions, anything cutting valu slots in early rounds.
+2. **Score/feature training**: coordinate descent over ScoreWeights +
+   REGALLOC_WEIGHTS (7 dims) at K=1 (1.6 s/eval - cheap).
+3. **Retention retry** (`RECOMPUTE_PATH_BITS=False`, ~26 cyc cheaper at
+   big scratch): pressure is metered by group priority - retest at 1536.
+4. **Raise K** (search trials) after structural work settles: worth ~2
+   cyc at current shape.
 5. **Horizon depth** (parked, non-trivial): trials = 1 decided cycle + H
    greedy continuation cycles, scoring the horizon state.
 

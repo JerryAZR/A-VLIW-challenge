@@ -774,6 +774,48 @@ _classify) - the dag.props / placements side lists are gone.
 Passes correctness (8 seeds) and **all nine** tiers, including
 `opus45-improved-harness < 1363` (1 289, 74 cyc clear).
 
+---
+
+## Step 20 - prologue merged into the body DAG   1 203 cyc   122.8×
+
+Commit `3c3ea98`. The prologue (const loads, vbroadcasts, header loads,
+val/tree vloads) was still emitted linearly - one slot per bundle, 133
+cycles at ~5% utilization - because `_emit_regalloc` pre-committed its
+registers before building the body DAG. Merged both into ONE DAG:
+
+- `tag_raw_chains(prologue + body)` -> single `build_dag` -> single
+  schedule. Setup work now interleaves with early body compute through
+  the scheduler (the pattern was proven in step 10 when out_addr consts
+  moved into the body). Prologue nodes reach all 32 stores, so the group
+  prop assigns them group ~1 - the group=-4 priority naturally schedules
+  them first.
+- **Pauses ride existing bundles** (`_insert_pauses`): the two dev-oracle
+  barriers (pause 1 = initial-mem barrier before any store, pause 2 =
+  final-mem barrier) are injected into existing bundles' flow slots
+  instead of standalone bundles. At grading (`enable_pause=False`) they
+  now cost 0 cycles (were 2 standalone bundles).
+- K=1 shipped (greedy priority only, no search trials): with group=-4
+  the priority fn alone lands within 2 cyc of K=6 (1291 vs 1289) at 5x
+  the scheduling speed. K will be raised again after other parts settle.
+
+Result: 1 289 -> **1 203 cyc** (-86). Merged-schedule utilization:
+
+| engine | slots | cap | util |
+|--------|------:|----:|-----:|
+| valu   | 6 870 | 7 218 | **95.2%** (the wall: floor 1 145) |
+| load   | 2 133 | 2 406 | 88.7% |
+| alu    | 12 706 | 14 436 | 88.0% |
+| flow   | 706   | 1 203 | 58.7% |
+
+First 60 cycles (former-prologue ramp-up): valu 61.9%, load 65.8%,
+alu 56.9%, flow 11.7%. Remaining levers: valu op-count reduction (the
+floor), prologue op tricks (const loads ride the 88.7% load engine;
+alu-computed consts trade load->alu, slightly freer), the 58 cyc of
+valu slack.
+
+Passes correctness (8 seeds) and **all nine** tiers (1 203 < 1 363,
+160 cyc clear).
+
 Dev tooling: `sweep_rollout.py` (weight/K sweep), `diag_deadlock.py`
 (live-tag autopsy at the wall), `diag_liveness.py` (committed-liveness
 profile; peak 220 at big scratch = scheduler artifact, not a capacity
