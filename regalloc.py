@@ -104,6 +104,25 @@ def tag_raw_chains(instrs, pinned=()):
     return tagged, read_count
 
 
+def recompute_read_count(instrs, pinned=()):
+    """Recompute read_count over a (possibly pruned) instruction list.
+
+    After pruning drops nodes (e.g. debug or dead code), the read counts from
+    tag_raw_chains (computed over the full stream) overcount for tags whose
+    readers were dropped - their registers would never free. Recompute counts
+    from the surviving instructions' read operands so freeing matches what
+    will actually commit.
+    """
+    counts: dict[Sym, int] = {}
+    for instr in instrs:
+        for op in instr.read_operands():
+            b = _base(op)
+            if b.name in pinned:
+                continue
+            counts[b] = counts.get(b, 0) + 1
+    return counts
+
+
 # ===========================================================================
 # Step 2: RAW-only DAG
 # ===========================================================================

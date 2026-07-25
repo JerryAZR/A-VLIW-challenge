@@ -511,6 +511,15 @@ class KernelBuilder:
 
         # Body: RAW-only DAG + allocating schedule, continuing the allocator.
         dag = build_dag(tagged_body, pinned={"const_vec_0"})
+        if prune:
+            # Drop debug/dead nodes, then recompute read counts over the
+            # survivors so registers free when their last surviving reader
+            # commits (the pruned readers no longer exist).
+            from scheduler import prune_to_stores
+            from regalloc import recompute_read_count
+            dag = prune_to_stores(dag)
+            read_count = recompute_read_count(
+                [n.instr for n in dag.nodes], pinned={"const_vec_0"})
         body_instrs = reg_schedule(dag, read_count, seed=42, picker="weighted",
                                    weights=BODY_WEIGHTS, allocator=allocator)
         self.instrs.extend(body_instrs)
