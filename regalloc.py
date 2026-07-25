@@ -271,7 +271,8 @@ def _resolve_operands(instr, allocator):
 
 def schedule(dag: DAG, read_count, *, seed: int | None = None,
              picker: str = "fma_first", weights: Weights | None = None,
-             cap: int | None = None, allocator: RegisterAllocator | None = None):
+             cap: int | None = None, allocator: RegisterAllocator | None = None,
+             prio=None):
     """List-schedule a RAW-only DAG, allocating registers at schedule time.
 
     Mirrors scheduler.schedule's loop/picker but resolves tags to physical
@@ -280,6 +281,9 @@ def schedule(dag: DAG, read_count, *, seed: int | None = None,
     both available; reads are consumed (and their register freed) on commit.
     Pass ``allocator`` to continue an existing allocation (e.g. from a
     linearly-emitted prologue); a fresh one is created otherwise.
+
+    ``prio``: optional priority-fn factory ``(allocator, base_key_fn) ->
+    key_fn`` to override node ordering (default: pressure-aware freeing bias).
     """
     import heapq
     import random
@@ -292,10 +296,11 @@ def schedule(dag: DAG, read_count, *, seed: int | None = None,
         cap = len(dag) + 1
     key_fn = _make_picker(picker, placements, rng, dag.props, weights)
 
-    # Register-pressure-aware priority: a node that is the LAST reader of a
-    # tag frees that tag's register when it commits. Under high pressure,
-    # prioritize such register-freeing nodes over register-allocating ones so
-    # chains finish (freeing registers) instead of piling up un-freed temps.
+    # Register-freeing priority: a node that is the LAST reader of a tag
+    # frees that tag's register when it commits. ALWAYS prefer such nodes
+    # (better than threshold-gated: chains finish, freeing registers, instead
+    # of piling up un-freed temps). This bias is also required for the
+    # schedule to complete at all under register pressure.
     def freeing_read(idx) -> int:
         """#registers this node's commit would free (reads with 1 remaining)."""
         n = 0
@@ -307,10 +312,10 @@ def schedule(dag: DAG, read_count, *, seed: int | None = None,
 
     def pressured_key(idx):
         base = key_fn(idx)
-        # Only apply pressure bias when the vector pool is running low.
-        if len(allocator.free_vec) < PRESSURE_THRESHOLD:
-            return (base[0] if isinstance(base, tuple) else base) - freeing_read(idx) * 1000
-        return base
+        b0 = base[0] if isinstance(base, tuple) else base
+        return b0 - freeing_read(idx) * 1000
+
+    active_key = prio(allocator, key_fn, freeing_read) if prio else pressured_key
 
     pool = FuncUnitPool()
     bundles: list[dict] = []
@@ -325,7 +330,7 @@ def schedule(dag: DAG, read_count, *, seed: int | None = None,
                 f"regalloc schedule: frontier empty with {total - committed} "
                 f"uncommitted nodes at C={C} - cyclic DAG or counter bug")
         pool.reset()
-        working = [(pressured_key(i), i) for i in ready]
+        working = [(active_key(i), i) for i in ready]
         heapq.heapify(working)
 
         while working:
@@ -344,7 +349,7 @@ def schedule(dag: DAG, read_count, *, seed: int | None = None,
                     if b in allocator.assigned:
                         allocator.read(b)
                 for u in dag.commit(idx):
-                    heapq.heappush(working, (pressured_key(u), u))
+                    heapq.heappush(working, (active_key(u), u))
                 continue
             if p.kind == _KIND_GATHER:
                 # Gather = one node emitting VLEN scalar loads (partial
@@ -371,7 +376,7 @@ def schedule(dag: DAG, read_count, *, seed: int | None = None,
                         if b in allocator.assigned:
                             allocator.read(b)
                     for u in dag.commit(idx):
-                        heapq.heappush(working, (pressured_key(u), u))
+                        heapq.heappush(working, (active_key(u), u))
                 continue
             # Register check: every write tag must be allocatable.
             wr_tags = [_base(o) for o in node.instr.write_operands()]
@@ -403,7 +408,7 @@ def schedule(dag: DAG, read_count, *, seed: int | None = None,
                     if b in allocator.assigned:
                         allocator.read(b)
                 for u in dag.commit(idx):
-                    heapq.heappush(working, (pressured_key(u), u))
+                    heapq.heappush(working, (active_key(u), u))
 
         # Emit the cycle's bundle (slots are already resolved/lowered).
         bundle = {eng: [s.tagged_lower() if isinstance(s, Instr) else s

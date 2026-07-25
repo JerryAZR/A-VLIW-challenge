@@ -46,6 +46,11 @@ from problem import (
 # those properties - see scheduler.Weights.
 BODY_WEIGHTS = Weights(sink=-3, load=-1.5, raw=-0.25, war=6, rigid=0.25, idx=-4)
 
+# Picker weights tuned for the regalloc (RAW-only DAG) path by sweep_regalloc -
+# the register-freeing bias is always-on there, and these base weights order
+# the remaining work best. (Found by random search + local refinement.)
+REGALLOC_WEIGHTS = Weights(sink=-1, load=5, raw=1, war=1, rigid=1, idx=-4)
+
 
 class KernelBuilder:
     def __init__(self):
@@ -521,7 +526,7 @@ class KernelBuilder:
             read_count = recompute_read_count(
                 [n.instr for n in dag.nodes], pinned={"const_vec_0"})
         body_instrs = reg_schedule(dag, read_count, seed=42, picker="weighted",
-                                   weights=BODY_WEIGHTS, allocator=allocator)
+                                   weights=REGALLOC_WEIGHTS, allocator=allocator)
         self.instrs.extend(body_instrs)
 
 BASELINE = 147734
