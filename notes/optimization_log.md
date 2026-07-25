@@ -832,6 +832,19 @@ hash addends (K0..K5) remain const+vbroadcast. 1 203 -> **1 190** (-13).
 
 Passes correctness (8 seeds) and **all nine** tiers (173 cyc clear).
 
+---
+
+## Step 22 - path-bit retention (recompute off)   1 179 cyc   125.2×
+
+Commit `7a9ae1c`. `RECOMPUTE_PATH_BITS=False`: the level-3 selects (rounds
+3/14) consume the path bits RETAINED from rounds 0-2 instead of
+recomputing them from addr (the 5-op offset/shift/and chain per group per
+level-3 round). This version deadlocked the greedy scheduler at 1536 (the
++64 granules of round 0-2 retention pressure) - the rollout scheduler's
+group priority meters it without effort. 1 190 -> **1 179** (-11).
+
+Passes correctness (8 seeds) and **all nine** tiers (184 cyc clear).
+
 Dev tooling: `sweep_rollout.py` (weight/K sweep), `diag_deadlock.py`
 (live-tag autopsy at the wall), `diag_liveness.py` (committed-liveness
 profile; peak 220 at big scratch = scheduler artifact, not a capacity
