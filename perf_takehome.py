@@ -45,6 +45,21 @@ from problem import (
 # the remaining work best. (Found by random search + local refinement.)
 REGALLOC_WEIGHTS = Weights(sink=-1, load=5, raw=1, war=1, rigid=1, idx=-4)
 
+# Level-3 path-bit recompute toggle. The level-3 select needs the three
+# descent path bits (d0,d1,d2). They can either be RETAINED from rounds 0-2
+# (the path_g[0..2] writes in the addr update) or RECOMPUTED here from addr
+# (offset = addr-(forest_p+7); d0=offset>>2, d1=(offset>>1)&1, d2=offset&1).
+#
+# Retention is cheaper (no extra valu) but keeps 3 path registers live across
+# rounds 0-3, raising peak vector pressure ~64 granules - the greedy scheduler
+# deadlocks on that at SCRATCH_SIZE=1536. The recompute breaks the liveness
+# chain (round 0-2 versions free early) at the cost of ~5 valu ops/group/round.
+#
+# With more scratch space, or once a pressure-aware scheduler can fit the
+# retained version, set this False to drop the recompute and use pure retention
+# (validated correct via _check_big.py: 1363 cyc retention vs 1389 recompute).
+RECOMPUTE_PATH_BITS = True
+
 
 class KernelBuilder:
     def __init__(self):
@@ -188,13 +203,17 @@ class KernelBuilder:
         # re-homes them per write, so different groups' in-flight values
         # still land in different physical homes (no cross-group WAR chains
         # by construction), and homes recycle through the free pool.
-        t1 = Sym("t1", True)   # hash stage scratch + level-2 select low bit
+        t1 = Sym("t1", True)   # hash stage scratch + select tree intermediate
         t2 = Sym("t2", True)   # hash stage scratch + addr-update base
+        t3 = Sym("t3", True)   # select tree intermediate (level 3)
         nv = Sym("nv", True)   # node_val landing / gather pad
-        # Parity (hash & 1) is NOT a temporary: it is produced by the addr
-        # update and consumed by the NEXT round's level-1/2 select, so it
-        # must persist across the round boundary -> per-group symbol.
-        parity = [Sym(f"parity[{g}]", True) for g in range(n_groups)]
+        # Parity (hash & 1) doubles as the descent path bit: path[g][l] holds
+        # the bit computed at level l of a descent (rounds 0-9 / 11-15 map to
+        # levels 0-9 / 0-4). Levels 0-2 stay live until the level-3 select
+        # (rounds 3/14); levels 3+ are read only by their own round's addr
+        # update and freed right after.
+        path = [[Sym(f"path[{g}][{l}]", True) for l in range(forest_height)]
+                for g in range(n_groups)]
 
         # CONST vectors: uniform value*8. Small reusable ones are named
         # const_vec_<value> and sorted by value (not tied to a step - e.g. 9 is
@@ -222,7 +241,8 @@ class KernelBuilder:
         # = non-uniform vload of tree[0..7]; tree0..6 = its lane broadcasts).
         forest_p_vec = Sym("forest_p_vec", True)
         neg_fp1_vec  = Sym("neg_fp1_vec", True)  # 1 - forest_p (next-addr: 2*addr + neg_fp1 + parity)
-        pos_fp5_vec  = Sym("pos_fp5_vec", True)  # 5 + forest_p
+        pos_fp5_vec  = Sym("pos_fp5_vec", True)  # 5 + forest_p (level-2 select)
+        pos_fp7_vec  = Sym("pos_fp7_vec", True)  # 7 + forest_p (level-3 path recompute)
         tree_preload = Sym("tree_preload", True)  # 8 words: tree[0..7]
         tree0_vec = Sym("tree0_vec", True)
         tree1_vec = Sym("tree1_vec", True)
@@ -233,6 +253,19 @@ class KernelBuilder:
         tree6_vec = Sym("tree6_vec", True)
         tree_vecs = [tree0_vec, tree1_vec, tree2_vec,
                      tree3_vec, tree4_vec, tree5_vec, tree6_vec]
+        # Level-3 preload: nodes 7-14. tree7 = tree_preload.lane(7) (the bonus
+        # 8th word of the tree[0..7] vload); tree8-14 = tree_preload2.lane(0..6).
+        tree_preload2 = Sym("tree_preload2", True)  # 8 words: tree[8..15]
+        tree7_vec = Sym("tree7_vec", True)
+        tree8_vec = Sym("tree8_vec", True)
+        tree9_vec = Sym("tree9_vec", True)
+        tree10_vec = Sym("tree10_vec", True)
+        tree11_vec = Sym("tree11_vec", True)
+        tree12_vec = Sym("tree12_vec", True)
+        tree13_vec = Sym("tree13_vec", True)
+        tree14_vec = Sym("tree14_vec", True)
+        tree8_14 = [tree8_vec, tree9_vec, tree10_vec, tree11_vec,
+                    tree12_vec, tree13_vec, tree14_vec]
 
         # Scalars: `eight` (vload/vstore stride of 8 - the only CONST scalar);
         # header vars (loaded from mem); addr_a (vload/vstore ptr); per-group
@@ -311,14 +344,26 @@ class KernelBuilder:
         # pos_fp5 = 5 + forest_values_p (used by the level 2 select). Computed
         prologue.append(VecElem("+", pos_fp5_vec, const_vec_2, const_vec_3))  # pos_fp5 = 5
         prologue.append(VecElem("+", pos_fp5_vec, pos_fp5_vec, forest_p_vec))
+        # pos_fp7 = 7 + forest_values_p (level-3 path-bit recompute offset).
+        prologue.append(VecElem("+", pos_fp7_vec, const_vec_2, const_vec_2))  # 4
+        prologue.append(VecElem("+", pos_fp7_vec, pos_fp7_vec, const_vec_3))  # 7
+        prologue.append(VecElem("+", pos_fp7_vec, pos_fp7_vec, forest_p_vec))
 
-        # vload tree[0..7] (levels 0-2 = 7 nodes + 1 bonus) into tree_preload.
+        # vload tree[0..7] (levels 0-2 = 7 nodes + node 7 as the bonus 8th
+        # word) into tree_preload, then tree[8..15] into tree_preload2.
         prologue.append(Alu("+", addr_a, header["forest_values_p"],
                             const_vec_0.lane(0)))
         prologue.append(VLoad(tree_preload, addr_a))
+        prologue.append(Alu("+", addr_a, addr_a, eight_const))  # forest_p + 8
+        prologue.append(VLoad(tree_preload2, addr_a))
         # Broadcast tree[0..6] into shared vector constants.
         for i in range(7):
             prologue.append(VBroadcast(tree_vecs[i], tree_preload.lane(i)))
+        # Broadcast the level-3 nodes: tree7 from preload.lane(7), tree8-14
+        # from preload2.lane(0..6).
+        prologue.append(VBroadcast(tree7_vec, tree_preload.lane(7)))
+        for i in range(7):
+            prologue.append(VBroadcast(tree8_14[i], tree_preload2.lane(i)))
 
         # =====================================================================
         # Body -- unrolled rounds x 32 groups, one slot per bundle.
@@ -333,37 +378,70 @@ class KernelBuilder:
             body.append(Const(out_addr[g], g * VLEN))   # offset 8g
             body.append(Alu("+", out_addr[g], out_addr[g], inp_values_p))
         for r in range(rounds):
+            # level of this round within its descent (rounds 0-9 -> 0-9,
+            # round 10 wraps, rounds 11-15 -> 0-4).
+            level = r if r < WRAP_ROUND else r - WRAP_ROUND - 1
             for g in range(n_groups):
                 is_wrap = (r == WRAP_ROUND)
                 # per-group vector symbols of the SoA per-lane planes
                 val_vec  = val[g]
                 addr_vec = addr[g]
-                parity_g = parity[g]   # persists to the next round's select
+                path_g   = path[g]      # per-level path bits; path_g[level] is
+                                        # this round's parity destination
                 # t1 / t2 / nv : the shared loop-body local tags
                 base_i   = g * VLEN
                 keyval  = [(r, base_i + j, "val") for j in range(VLEN)]
                 keynv   = [(r, base_i + j, "node_val") for j in range(VLEN)]
                 keyhv   = [(r, base_i + j, "hashed_val") for j in range(VLEN)]
 
-                # --- node_val gather or preload-select (rounds 0-2 use preloaded) ---
+                # --- node_val gather or preload-select (rounds 0-3 use preloaded) ---
                 if r in (0, 11):
                     # Level 0: all lanes at idx=0. node_val = tree[0].
                     body.append(VecElem("^", nv, tree0_vec, const_vec_0))
                 elif r in (1, 12):
-                    # Level 1: idx in {1,2}. idx = 1 + parity, so the parity
-                    # carried from last round IS the select bit (idx=1 -> tree1,
-                    # idx=2 -> tree2).
-                    body.append(VSelect(nv, parity_g, tree2_vec, tree1_vec))
+                    # Level 1: idx in {1,2}. idx = 1 + d0, so the level-0 path
+                    # bit IS the select bit (idx=1 -> tree1, idx=2 -> tree2).
+                    body.append(VSelect(nv, path_g[0], tree2_vec, tree1_vec))
                 elif r in (2, 13):
-                    # Level 2: idx in {3,4,5,6}. bit0(idx-3) = last round's
-                    # parity; high bit = addr < forest_p + 5.
+                    # Level 2: idx in {3,4,5,6} = 3 + 2*d0 + d1. Select among
+                    # the 4 preloaded nodes, consuming path bits in order
+                    # (d0=path[0] first, then d1=path[1]) so d0 frees early.
                     #   idx-3=0->tree3, 1->tree4, 2->tree5, 3->tree6
-                    body.append(VSelect(nv, parity_g, tree4_vec, tree3_vec))  # bit0?tree4:tree3
-                    body.append(VSelect(t2, parity_g, tree6_vec, tree5_vec))  # bit0?tree6:tree5
-                    body.append(VecElem("<", t1, addr_vec, pos_fp5_vec))   # low?
-                    body.append(VSelect(nv, t1, nv, t2))  # low?nv:t2
+                    body.append(VSelect(t1, path_g[0], tree5_vec, tree3_vec))  # d0?t5:t3
+                    body.append(VSelect(t2, path_g[0], tree6_vec, tree4_vec))  # d0?t6:t4
+                    body.append(VSelect(nv, path_g[1], t2, t1))              # d1?(d0=1):(d0=0)
+                elif r in (3, 14):
+                    # Level 3: idx in {7..14} = 7 + 4*d0 + 2*d1 + d2. 3-level
+                    # vselect tree consuming path bits in strict order
+                    # d0 -> d1 -> d2, so each path bit frees as early as
+                    # possible. t1/t2/t3/nv are the tree's intermediates.
+                    #
+                    # Path-bit RECOMPUTE (breaks the round 0-2 retention
+                    # chain): the path bits were written at rounds 0-2 but are
+                    # only needed here. Instead of keeping them live across 3
+                    # rounds, recompute them from addr (which is live anyway):
+                    # offset = addr - (forest_p + 7); then d0=offset>>2,
+                    # d1=(offset>>1)&1, d2=offset&1, written back into the same
+                    # path_g[0..2] storage. The round 0-2 versions free early.
+                    #
+                    # Gated by RECOMPUTE_PATH_BITS: with enough scratch (or a
+                    # pressure-aware scheduler) the retained version alone is
+                    # correct and ~26 cyc cheaper - flip the flag off then.
+                    if RECOMPUTE_PATH_BITS:
+                        body.append(VecElem("-", t2, addr_vec, pos_fp7_vec))      # offset = addr - (forest_p+7)
+                        body.append(VecElem(">>", path_g[0], t2, const_vec_2))  # d0 = offset >> 2
+                        body.append(VecElem(">>", t1, t2, const_vec_1))         # tmp = offset >> 1
+                        body.append(VecElem("&", path_g[1], t1, const_vec_1))   # d1 = tmp & 1
+                        body.append(VecElem("&", path_g[2], t2, const_vec_1))   # d2 = offset & 1
+                    body.append(VSelect(t1, path_g[0], tree11_vec, tree7_vec))   # d0?t11:t7
+                    body.append(VSelect(t2, path_g[0], tree12_vec, tree8_vec))   # d0?t12:t8
+                    body.append(VSelect(t3, path_g[0], tree13_vec, tree9_vec))   # d0?t13:t9
+                    body.append(VSelect(nv, path_g[0], tree14_vec, tree10_vec))  # d0?t14:t10
+                    body.append(VSelect(t1, path_g[1], t3, t1))                  # d1?s10:s00
+                    body.append(VSelect(t2, path_g[1], nv, t2))                  # d1?s11:s01
+                    body.append(VSelect(nv, path_g[2], t2, t1))                  # d2?u1:u0
                 else:
-                    # Rounds 3+: gather from mem. addr_vec already holds the
+                    # Rounds 4+: gather from mem. addr_vec already holds the
                     # tree address (idx + forest_p), so the loads read it
                     # directly - no per-round address-add valu. One Gather op
                     # (nv = mem[addr[0..7]]); the allocator re-homes the
@@ -395,15 +473,18 @@ class KernelBuilder:
                     # idx -> 0, so addr = forest_p = 1 - neg_fp1.
                     body.append(VecElem("-", addr_vec, const_vec_1, neg_fp1_vec))
                 else:
-                    # parity = v & 1 - persists to the next round's select.
-                    body.append(VecElem("&", parity_g, val_vec, const_vec_1))
+                    # path bit = v & 1. Levels 0-2 persist to the level-3
+                    # select (rounds 3/14); levels 3+ feed only this addr
+                    # update.
+                    pdest = path_g[level]
+                    body.append(VecElem("&", pdest, val_vec, const_vec_1))
                     if r == 0:
                         # idx=0: next_addr = forest_p + 1 + parity = (2 - neg_fp1) + parity
                         body.append(VecElem("-", t2, const_vec_2, neg_fp1_vec))  # 2 - neg_fp1
                     else:
                         # next_addr base = 2*addr + neg_fp1
                         body.append(VecFma(t2, addr_vec, const_vec_2, neg_fp1_vec))
-                    body.append(VecElem("+", addr_vec, t2, parity_g))        # next_addr = base + parity
+                    body.append(VecElem("+", addr_vec, t2, pdest))        # next_addr = base + pathbit
 
                 # --- on the final round, vstore val_g to its output address
                 # (overlaps the body tail via the idle store engine; the linear
