@@ -1,8 +1,8 @@
 """Two-phase register allocation: SSA tag chains + schedule-time allocation.
 
-This is the parallel path to the FIFO rename engine (rename.py). Instead of
-assigning physical addresses up front (which forces false WAR/WAW sharing of
-recycled homes), it:
+This is the kernel's register-allocation path (it replaced a one-pass FIFO
+rename engine that assigned physical addresses up front, forcing false
+WAR/WAW sharing of recycled homes). It:
 
   1. ``tag_raw_chains`` - rewrites each symbolic operand into a unique version
      tag, one per RAW chain (a write and all reads of that written value).
@@ -202,6 +202,9 @@ class RegisterAllocator:
         self.exhaustion_warnings = 0
         self.n_alloc = 0
         self.n_free = 0
+        # addr -> (base name, length) for the simulator's debug scratch map.
+        # Recorded at allocation time; tags strip the "#n" version suffix.
+        self._names: dict[int, tuple[str, int]] = {0: ("const_vec_0", VLEN)}
 
     def _pool(self, is_vec):
         return self.free_vec if is_vec else self.free_scalar
@@ -225,6 +228,8 @@ class RegisterAllocator:
         self.assigned[tag] = addr
         self.remaining[tag] = self._read_count[tag]
         self.n_alloc += 1
+        # Record the base name (strip the "#n" version suffix) for debug_map.
+        self._names[addr] = (tag.name.split("#")[0], VLEN if tag.is_vec else 1)
         return addr
 
     def unwrite(self, tag: Sym) -> None:
@@ -258,6 +263,10 @@ class RegisterAllocator:
         if isinstance(op, Sym) and op not in self.assigned:
             return 0                   # pinned const_vec_0
         return self.assigned[op]
+
+    def debug_map(self) -> dict[int, tuple[str, int]]:
+        """addr -> (base name, length) for the simulator's debug scratch map."""
+        return dict(self._names)
 
 
 def _resolve_operands(instr, allocator):

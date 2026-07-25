@@ -1,50 +1,38 @@
-"""Validate the schedule against the DAG, matching nodes to cycles by NODE
-INDEX (not lowered tuple - many distinct nodes lower to identical tuples).
+"""Validate the regalloc schedule against the RAW-only DAG.
 
-We re-run schedule() with a hook that records the cycle each node index is
-placed, then check every in-edge: RAW parents must be strictly earlier, WAR
-parents same-or-earlier.
+The emitted body bundles carry TaggedSlots (with rid), so we derive the cycle
+each DAG node committed directly from the built program - no re-running the
+scheduler. Then we check every RAW in-edge: a parent must commit STRICTLY
+earlier than its consumer (read-before-write / 1-cycle latency).
+
+The regalloc DAG is RAW-only (all edges weight 1): tags are unique per write,
+so there are no WAR/WAW anti-dependencies to validate.
 """
-import heapq
 import perf_takehome as pt
-from scheduler import DAG, FuncUnitPool, _make_picker, _classify, Weights
-from rename import rid_of
 
-# The resolved body is kept on the builder after build_kernel (no monkeypatch).
-kb = pt.KernelBuilder(); kb.build_kernel(10, 2047, 256, 16)
-body = kb.resolved_body
-dag = DAG(body)
+kb = pt.KernelBuilder()
+kb.build_kernel(10, 2047, 256, 16)
+dag = kb.body_dag
 
-placements = [_classify(n) for n in dag.nodes]
-key_fn = _make_picker("weighted", placements, __import__('random').Random(42),
-                      dag.props, Weights(sink=-3, load=-1.5, raw=-0.25, war=6,
-                                         rigid=0.25, idx=-4))
+# Cycle each node committed, keyed by rid (from the emitted body bundles).
+# A node's commit cycle = the LAST cycle any of its slots appears (a partial
+# node like a gather or spilled vec_elem commits only when its final lane
+# lands; reads of its register happen at/after that).
+cycle_of_rid = {}
+pause_idxs = [i for i, instr in enumerate(kb.instrs)
+              if "flow" in instr and instr["flow"][0][0] == "pause"]
+body_start = pause_idxs[0] + 1
+for rel_cyc, bundle in enumerate(kb.instrs[body_start:]):
+    for slot in bundle.values():
+        for s in slot:
+            rid = getattr(s, "rid", -1)
+            if rid >= 0:
+                cycle_of_rid[rid] = rel_cyc  # keep last occurrence
 
-# Re-run the schedule loop, recording the cycle each node commits.
-cycle_of = {}
-pool = FuncUnitPool()
-C = 0
-committed = 0
-total = len(dag)
-cap_cycles = total + 1
-while committed < total:
-    ready = dag.ready()
-    pool.reset()
-    working = [(key_fn(i), i) for i in ready]
-    heapq.heapify(working)
-    while working:
-        _, idx = heapq.heappop(working)
-        if pool.place(dag[idx], placements[idx]):
-            cycle_of[idx] = C
-            committed += 1
-            for u in dag.commit(idx):
-                heapq.heappush(working, (key_fn(u), u))
-    dag.advance()
-    C += 1
-    if C > cap_cycles:
-        raise RuntimeError("stuck")
-
-print(f"scheduled {committed}/{total} nodes in {C} cycles")
+cycle_of = {n.idx: cycle_of_rid[n.instr.rid] for n in dag.nodes
+            if n.instr.rid in cycle_of_rid}
+print(f"placed {len(cycle_of)}/{len(dag)} nodes over "
+      f"{max(cycle_of.values(), default=-1) + 1} body cycles")
 
 viol = 0
 for n in dag.nodes:
@@ -55,14 +43,11 @@ for n in dag.nodes:
         cs = cycle_of.get(src)
         if cs is None:
             continue
-        if w == 1 and not (cn > cs):
+        assert w == 1, f"unexpected non-RAW edge weight {w}"
+        if not (cn > cs):
             if viol < 12:
-                print(f"RAW viol: node {n.idx}(rid={rid_of(n.instr)},cyc{cn}) "
-                      f"<= parent {src}(rid={rid_of(dag.nodes[src].instr)},cyc{cs})  {n.instr}")
-            viol += 1
-        elif w == 0 and not (cn >= cs):
-            if viol < 12:
-                print(f"WAR viol: node {n.idx}(rid={rid_of(n.instr)},cyc{cn}) "
-                      f"< parent {src}(rid={rid_of(dag.nodes[src].instr)},cyc{cs})  {n.instr}")
+                print(f"RAW viol: node {n.idx}(rid={n.instr.rid},cyc{cn}) "
+                      f"<= parent {src}(rid={dag.nodes[src].instr.rid},cyc{cs})"
+                      f"  {n.instr}")
             viol += 1
 print(f"violations: {viol}")

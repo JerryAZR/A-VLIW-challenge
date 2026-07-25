@@ -14,9 +14,10 @@ Programs exist in two phases:
 
   - **symbolic** - operands are ``Sym`` (declared variables) or ``LaneRef``
     views of them. This is what the kernel builder emits.
-  - **resolved** - a ``RenameEngine`` has translated every ``Sym`` to a
-    ``Reg`` (a physical scratch address) via its pin table. ``reads()`` /
-    ``writes()`` / the DAG operate on resolved instructions only.
+  - **resolved** - the two-phase register allocator (``regalloc.py``) has
+    translated every ``Sym`` to a ``Reg`` (a physical scratch address).
+    ``reads()`` / ``writes()`` / the DAG operate on resolved instructions
+    only.
 
 Register references:
 
@@ -58,7 +59,7 @@ def _ident(r: "Reg") -> int:
 class Sym:
     """A declared variable - the symbolic-phase operand. Shape (scalar or
     8-lane vector) is fixed at declaration. Becomes a ``Reg`` (physical
-    address) when the RenameEngine resolves it."""
+    address) when the register allocator assigns it a home."""
     name: str
     is_vec: bool = False
 
@@ -120,13 +121,13 @@ Operand = Union[Sym, Reg, LaneRef]
 
 
 class TaggedSlot(tuple):
-    """A simulator slot tuple carrying the stable rename id (``rid``) of the
-    IR instruction that produced it. Behaves exactly like a plain tuple -
+    """A simulator slot tuple carrying the stable instruction id (``rid``) of
+    the IR instruction that produced it. Behaves exactly like a plain tuple -
     pattern matching, indexing, equality, and hashing all ignore the tag -
     so the simulator needs no changes. The tag gives an end-to-end traceable
-    id: rename stamps it, the scheduler's lowered slots carry it, and a
-    tracing simulator can read ``slot.rid`` to tie an executed slot back to
-    its source instruction."""
+    id: assigned at instruction construction, carried by the scheduler's
+    lowered slots, so a tracing simulator can read ``slot.rid`` to tie an
+    executed slot back to its source instruction."""
 
     def __new__(cls, t, rid: int = -1):
         obj = super().__new__(cls, t)
@@ -142,13 +143,13 @@ def _ids(ops) -> list[RegId]:
 class Instr:
     """Base class for IR instructions. ``engine`` is a ClassVar.
 
-    ``rid`` is the stable rename id, assigned automatically at construction
-    (a process-unique, monotonically increasing id). It is keyword-only so it
-    never interferes with subclasses' positional operand fields. Because it is
-    a normal field, ``dataclasses.replace`` carries it through the rename
-    ``rebuild()`` unchanged - the resolved instruction keeps the same
+    ``rid`` is the stable instruction id, assigned automatically at
+    construction (a process-unique, monotonically increasing id). It is
+    keyword-only so it never interferes with subclasses' positional operand
+    fields. Because it is a normal field, ``dataclasses.replace`` carries it
+    through ``rebuild()`` unchanged - the resolved instruction keeps the same
     rid as its symbolic source, so an executed slot traces back end-to-end
-    (rename -> resolve -> schedule -> trace). "-1" never occurs in practice
+    (tag -> resolve -> schedule -> trace). "-1" never occurs in practice
     (every instruction gets a fresh id at birth); it is only the nominal
     default for documentation."""
     engine: ClassVar[str]
@@ -156,7 +157,7 @@ class Instr:
     rid: int = field(default_factory=lambda: Instr._fresh_rid(), kw_only=True)
     # Operand fields read / written by this instruction (field names) -
     # they define the position order of the read_operands() /
-    # write_operands() / rebuild() rename contract. Reads are always
+    # write_operands() / rebuild() resolution contract. Reads are always
     # resolved before writes (a self-read-write instruction must see the
     # OLD home on its reads). Non-operand fields (op strings, immediates,
     # keys) are never listed and pass through untouched.
@@ -180,14 +181,14 @@ class Instr:
         raise NotImplementedError
 
     def tagged_lower(self, res: Resolver = _ident):
-        """``lower()`` with the stable rename id attached, as a ``TaggedSlot``.
-        The scheduler emits these so a tracing simulator can recover the
-        source id of every executed slot."""
+        """``lower()`` with the stable instruction id attached, as a
+        ``TaggedSlot``. The scheduler emits these so a tracing simulator can
+        recover the source id of every executed slot."""
         return TaggedSlot(self.lower(res), self.rid)
 
-    # -- rename contract -------------------------------------------------
+    # -- operand-resolution contract -----------------------------------------
     # The instruction exposes its read/write operands positionally; the
-    # rename engine maps each operand and hands back position-indexed
+    # register allocator resolves each operand and hands back position-indexed
     # lists; rebuild() rebuilds. Neither side pokes into the other's
     # internals.
 
@@ -350,12 +351,11 @@ class VLoad(Instr):
 class Gather(Instr):
     """Vector gather: dest[j] = mem[scratch[addr+j]] for j in [0, VLEN).
 
-    The ISA has no gather; the rename engine decomposes this into VLEN
-    scalar loads AFTER renaming (lane addresses are plain arithmetic on
-    resolved homes). At rename time it is a whole-vector read of addr and
-    a whole-vector write of dest - rename-on-write re-homes dest per
-    gather, so no lane-access discipline (and no Refresh directive) is
-    needed. Never reaches the DAG or the simulator."""
+    The ISA has no gather; the scheduler (``regalloc.schedule``) decomposes
+    this into VLEN scalar loads as a partial-completion node: one DAG node
+    that places lanes across multiple cycles, holding its dest register
+    sticky until all VLEN lanes land. Never reaches the simulator as a whole
+    vector op - only the decomposed scalar loads do."""
     engine: ClassVar[str] = "load"
     _RD: ClassVar[tuple] = ("addr",)
     _WR: ClassVar[tuple] = ("dest",)
@@ -371,7 +371,7 @@ class Gather(Instr):
     def lower(self, res=_ident):
         raise NotImplementedError(
             "Gather must be decomposed into scalar loads by "
-            "RenameEngine.rename() before lowering")
+            "regalloc.schedule() before lowering")
 
 
 @dataclass(frozen=True)
@@ -454,32 +454,6 @@ class Pause(Instr):
 
     def lower(self, res=_ident):
         return ("pause",)
-
-
-# ---------------------------------------------------------------------------
-# Rename-engine directives (never reach the resolved program)
-# ---------------------------------------------------------------------------
-
-@dataclass(frozen=True)
-class Free(Instr):
-    """Compiler directive: this symbol's value is dead from here -
-    return its home to the rename engine's free pool. Inserted by the
-    auto-free liveness pass (backward last-use analysis); consumed by
-    rename and dropped from the output. No-op on pinned symbols and on
-    symbols with no current home."""
-    engine: ClassVar[str] = "debug"
-    sym: Operand
-
-    def reads(self):
-        return []
-
-    def writes(self):
-        return []
-
-    def lower(self, res=_ident):
-        raise NotImplementedError(
-            "Free is a rename-engine directive - it must be consumed by "
-            "RenameEngine.rename() and never lowered")
 
 
 # ---------------------------------------------------------------------------

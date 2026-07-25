@@ -24,7 +24,6 @@ from ir import (
     Sym, Alu, VecElem, VecFma, VBroadcast, Load, VLoad, Const, VStore,
     VSelect, Pause, DebugVCompare, Gather,
 )
-from rename import RenameEngine
 from scheduler import Weights
 from problem import (
     DebugInfo,
@@ -41,11 +40,6 @@ from problem import (
 )
 
 
-# Picker weights for the production VLIW schedule (tuned by sweep/train).
-# Negative terms invert the documented "higher = more urgent" direction for
-# those properties - see scheduler.Weights.
-BODY_WEIGHTS = Weights(sink=-3, load=-1.5, raw=-0.25, war=6, rigid=0.25, idx=-4)
-
 # Picker weights tuned for the regalloc (RAW-only DAG) path by sweep_regalloc -
 # the register-freeing bias is always-on there, and these base weights order
 # the remaining work best. (Found by random search + local refinement.)
@@ -55,9 +49,9 @@ REGALLOC_WEIGHTS = Weights(sink=-1, load=5, raw=1, war=1, rigid=1, idx=-4)
 class KernelBuilder:
     def __init__(self):
         self.instrs = []
-        # Rename engine: owns all scratch space. Created by build_kernel
-        # once the pinned symbols are declared.
-        self.re = None
+        # Register allocator: owns all scratch space, created by
+        # _emit_regalloc during build_kernel. Kept for debug_info().
+        self.allocator = None
         # The resolved (address-assigned) body instructions, kept from the
         # last build() so a tracing harness can map rid -> instruction for
         # operand-level read/write capture.
@@ -65,44 +59,18 @@ class KernelBuilder:
 
     def debug_info(self):
         """The simulator's debug scratch map. Only valid after build_kernel()
-        has run (the rename engine that owns scratch is created there)."""
-        if self.re is None:
+        has run (the register allocator that owns scratch is created there)."""
+        if self.allocator is None:
             raise RuntimeError(
-                "debug_info() called before build_kernel() - the rename "
-                "engine (and its scratch map) does not exist yet")
-        return DebugInfo(scratch_map=self.re.debug_map())
+                "debug_info() called before build_kernel() - the register "
+                "allocator (and its scratch map) does not exist yet")
+        return DebugInfo(scratch_map=self.allocator.debug_map())
 
-    def build(self, slots: list, vliw: bool = False,
-              seed: int | None = None, picker: str = "fma_first",
-              weights=None, prune: bool = True):
-        """Convert an IR instruction list into instruction bundles.
-
-        vliw=False: one slot per bundle (the original sequential packing).
-        vliw=True:  DAG-driven VLIW scheduler - builds a dependency DAG from
-                    the instructions and packs multiple independent slots per
-                    cycle respecting per-engine slot limits and
-                    read-before-write. picker selects node ordering
-                    ("fma_first", "idx", "random", "weighted").
-        prune:      run prune_to_stores dead-code elimination before
-                    scheduling. Disable to keep debug oracle nodes (which have
-                    no path to a store) in the scheduled program.
-        """
-        if not vliw:
-            return [{s.engine: [s.lower()]} for s in slots]
-        self.resolved_body = list(slots)
-        from scheduler import DAG, schedule, prune_to_stores
-        dag = DAG(slots)
-        if prune:
-            dag = prune_to_stores(dag)
-        cap = len(slots)  # worst case: 1 slot/cycle
-        return schedule(dag, seed=seed, cap=cap, picker=picker, weights=weights)
-
-    def add(self, instr):
-        """Append a single symbolic IR instruction as a one-slot bundle
-        (linear code: prologue/epilogue). Renamed + lowered immediately -
-        these never see the DAG."""
-        for r in self.re.rename([instr]):
-            self.instrs.append({r.engine: [r.lower()]})
+    def add_pause(self):
+        """Emit a flow barrier as a one-slot bundle (linear prologue/epilogue).
+        Pause has no register operands, so it needs no allocation - just lower
+        it directly."""
+        self.instrs.append({Pause().engine: [Pause().lower()]})
 
     def build_vec_hash(self, val_vec, t1_vec, t2_vec, r, base_i,
                         fma_vec_consts, irr_vec_consts):
@@ -143,7 +111,7 @@ class KernelBuilder:
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
-        prune: bool = True, use_regalloc: bool = False,
+        prune: bool = True,
     ):
         """8-lane-per-group kernel. Cross-lane vectorization over the
         `valu` unit (VLEN=8 lanes per group, 32 groups), packed by the
@@ -151,7 +119,7 @@ class KernelBuilder:
 
         Layout (all pipeline state lives in scratch; only const_vec_0 is
         pinned - everything else is a versioned temporary allocated by the
-        rename engine, see notes/scratch_map_canonical.md for the rationale):
+        two-phase register allocator, see notes/scratch_map_canonical.md):
           - val[256] : per-lane carried state AND the running hash register
             during each round's hash (entry XOR writes `a` into it; the final
             hash stage leaves `v` there for the next round - zero copy-out).
@@ -161,15 +129,15 @@ class KernelBuilder:
           - parity[256] : per-lane (val & 1), persists across the round
             boundary to drive the next round's level-1/2 select.
           - t1/t2/nv : short-lived loop-body temps (hash stage scratch, addr
-            base, node_val landing) shared as tags across groups; the rename
-            engine re-homes them per write so groups never alias.
+            base, node_val landing) as SSA tags; the allocator re-homes them
+            per write so groups never alias.
           - consts : the 6 hash constants + shift amounts, broadcast once at
             prologue as VLEN=8 vectors and reused across all hashes.
 
         Gather (non-contiguous tree.values[idx[i]]) is the one operation that
         cannot be vectorized (the ISA has no scatter/gather): for each group
         one Gather op reads the per-lane addr vector and is decomposed by the
-        rename engine into 8 scalar loads landing in the nv plane.
+        scheduler into 8 scalar loads landing in the nv plane.
 
         Branchless addr update: parity = val & 1; base = 2*addr + neg_fp1
         (valu fma); next_addr = base + parity (valu `+`). Bit-exact with the
@@ -192,12 +160,12 @@ class KernelBuilder:
         WRAP_ROUND = forest_height   # verified: all lanes at leaf on round=h -> wrap to root
 
         # =====================================================================
-        # Scratch layout: the rename engine owns all scratch space. Only
+        # Scratch layout: the register allocator owns all scratch space. Only
         # const_vec_0 is pinned (at address 0; scratch starts all-zero, so it
         # needs no write). Every other symbol is a versioned temporary,
-        # dynamically allocated by the rename engine from its free pools
+        # dynamically allocated by the allocator from its free pools
         # (8-aligned vector granules, then a scalar pool at the top). No
-        # hand-laid-out map - the engine assigns addresses on rename.
+        # hand-laid-out map - the allocator assigns addresses on write.
         # =====================================================================
 
         init_vars = [
@@ -208,7 +176,7 @@ class KernelBuilder:
         # ---- Pinned symbol declarations ----
         # ---- Symbol declarations ----
         # The builder defines symbols; the engine owns all scratch space and
-        # assigns addresses on rename. Only const_vec_0 is pinned; the rest
+        # assigns addresses on write. Only const_vec_0 is pinned; the rest
         # are versioned temporaries.
         #
         # Per-lane SoA state as 32 group-vector symbols each: val[g] /
@@ -216,7 +184,7 @@ class KernelBuilder:
         val  = [Sym(f"val[{g}]",  True) for g in range(n_groups)]  # running hash + carried state
         addr = [Sym(f"addr[{g}]", True) for g in range(n_groups)]  # tree ADDRESS = idx + forest_p (stored, not idx)
         # Local temporaries: ONE shared tag each across all groups (loop-body
-        # locals - each is dead within one group's round). The rename engine
+        # locals - each is dead within one group's round). The allocator
         # re-homes them per write, so different groups' in-flight values
         # still land in different physical homes (no cross-group WAR chains
         # by construction), and homes recycle through the free pool.
@@ -275,12 +243,11 @@ class KernelBuilder:
         addr_a = Sym("addr_a")
         out_addr = [Sym(f"out_addr[{g}]") for g in range(n_groups)]
 
-        # The engine owns scratch space from here on. The ONLY pin is
-        # const_vec_0: scratch starts all-zero, so it needs no write - just a
-        # reserved home (address 0) that stays 0. Every other symbol is a
-        # versioned temporary, dynamically allocated by the rename engine.
-        self.re = RenameEngine([const_vec_0])
-
+        # Scratch space is owned by the two-phase register allocator
+        # (regalloc.py). The ONLY pin is const_vec_0 (at address 0; scratch
+        # starts all-zero, so it needs no write). Every other symbol is a
+        # versioned SSA tag, allocated a physical register when its writer is
+        # placed and freed when its last read commits.
         # (vec, literal) pairs: the prologue `load const` lane 0 + self-broadcast.
         # const_vec_0 is EXCLUDED: scratch starts all-zero, so it needs no
         # const-load + broadcast (and it is the one reserved home - see above).
@@ -307,7 +274,7 @@ class KernelBuilder:
 
         # =====================================================================
         # Prologue: load header; vload val[256]; broadcast consts.
-        # Collected SYMBOLICALLY (not self.add) and renamed together with the
+        # Collected SYMBOLICALLY and tagged together with the
         # body below: with no app pins, prologue-written temps (val, consts,
         # header, out_addr) are read in the body, so liveness must span both.
         # =====================================================================
@@ -399,7 +366,7 @@ class KernelBuilder:
                     # Rounds 3+: gather from mem. addr_vec already holds the
                     # tree address (idx + forest_p), so the loads read it
                     # directly - no per-round address-add valu. One Gather op
-                    # (nv = mem[addr[0..7]]); the rename engine re-homes the
+                    # (nv = mem[addr[0..7]]); the allocator re-homes the
                     # shared nv tag and decomposes this into 8 scalar loads.
                     # nv is then read by the entry XOR below.
                     body.append(Gather(nv, addr_vec))
@@ -444,23 +411,7 @@ class KernelBuilder:
                 if r == rounds - 1:
                     body.append(VStore(out_addr[g], val_vec))
 
-        if use_regalloc:
-            self._emit_regalloc(prologue, body, prune)
-        else:
-            # Rename prologue + body together (single pass) so liveness spans the
-            # boundary, then split: the prologue has no Gather, so its resolved
-            # length == its symbolic length. Emit the prologue linearly (one slot
-            # per bundle); schedule the body on the DAG.
-            resolved = self.re.rename(prologue + body)
-            prologue_res = resolved[:len(prologue)]
-            body = resolved[len(prologue):]
-            for r in prologue_res:
-                self.instrs.append({r.engine: [r.lower()]})
-            # Pause 1 -- match reference_kernel2's first yield (initial mem).
-            self.add(Pause())
-            body_instrs = self.build(body, vliw=True, seed=42, picker="weighted",
-                                       weights=BODY_WEIGHTS, prune=prune)
-            self.instrs.extend(body_instrs)
+        self._emit_regalloc(prologue, body, prune)
 
         # =====================================================================
         # Epilogue: the val[256] vstores now overlap the body tail (each group's
@@ -471,12 +422,11 @@ class KernelBuilder:
         # Pause 2 -- match reference_kernel2's final yield (final mem).
         # Must come AFTER the body so machine.mem holds the final values
         # when the test recommends execution on i=1 (final yield).
-        self.add(Pause())
+        self.add_pause()
 
     def _emit_regalloc(self, prologue, body, prune):
         """Two-phase register-allocation path (regalloc.py): SSA tag chains +
-        RAW-only DAG + schedule-time allocation. Replaces the FIFO rename +
-        pre-resolved schedule of the default path.
+        RAW-only DAG + schedule-time allocation.
 
         Prologue emits linearly, allocating const/carried registers via the
         shared allocator; the body schedules on a RAW-only DAG continuing
@@ -494,6 +444,7 @@ class KernelBuilder:
         # write's register and committing each read (free at 0) via the
         # shared allocator in program order.
         allocator = RegisterAllocator(read_count)
+        self.allocator = allocator
         for instr in tagged_pro:
             wr_bases = [(op.vec if hasattr(op, "vec") else op)
                         for op in instr.write_operands()]
@@ -512,7 +463,7 @@ class KernelBuilder:
                 if b in allocator.assigned:
                     allocator.read(b)
         # Pause 1 -- match reference_kernel2's first yield (initial mem).
-        self.add(Pause())
+        self.add_pause()
 
         # Body: RAW-only DAG + allocating schedule, continuing the allocator.
         dag = build_dag(tagged_body, pinned={"const_vec_0"})
@@ -528,6 +479,10 @@ class KernelBuilder:
         body_instrs = reg_schedule(dag, read_count, seed=42, picker="weighted",
                                    weights=REGALLOC_WEIGHTS, allocator=allocator)
         self.instrs.extend(body_instrs)
+        # Kept for dev tools (_validate.py): the scheduled body's RAW-only
+        # DAG and the tagged body instructions (map rid -> instruction).
+        self.body_dag = dag
+        self.resolved_body = [n.instr for n in dag.nodes]
 
 BASELINE = 147734
 

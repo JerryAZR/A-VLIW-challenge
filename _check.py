@@ -36,23 +36,5 @@ for i in range(len(round_refs)):
         print(f"round {i}: INCORRECT, {len(bad)} mismatches at {bad[:5]}")
         ok = False
         break
-print("CORRECT - all rounds match (FIFO path)" if ok else "FAILED (FIFO)")
+print("CORRECT - all rounds match" if ok else "FAILED")
 print("CYCLES:", machine.cycle)
-
-# ---- regalloc (two-phase) path ----
-kb2 = pt.KernelBuilder()
-kb2.build_kernel(forest.height, len(forest.values), len(inp.indices), 16,
-                 use_regalloc=True)
-machine2 = Machine(list(mem), kb2.instrs, kb2.debug_info(), n_cores=N_CORES,
-                   value_trace=vt, trace=False)
-ok2 = True
-for i in range(len(round_refs)):
-    machine2.run()
-    mine = machine2.mem[inp_values_p : inp_values_p + len(inp.values)]
-    if list(mine) != round_refs[i]:
-        bad = [j for j, (a, b) in enumerate(zip(mine, round_refs[i])) if a != b]
-        print(f"regalloc round {i}: INCORRECT, {len(bad)} mismatches at {bad[:5]}")
-        ok2 = False
-        break
-print("CORRECT - all rounds match (regalloc)" if ok2 else "FAILED (regalloc)")
-print("CYCLES (regalloc):", machine2.cycle)

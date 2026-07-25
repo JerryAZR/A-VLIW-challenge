@@ -1,4 +1,10 @@
-trace.json
-**/*.pyc
-.hypothesis
-.DS_Store
+# Generated debug/build artifacts (not source)
+logs/
+rename_logs/
+rename_logs_probe/
+*.log
+pressure.log
+trace_sim.log
+warn.txt
+slots_regalloc.png
+__pycache__/

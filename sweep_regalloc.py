@@ -31,7 +31,7 @@ def _cap_tag(instrs, pinned=()):
     return out
 regalloc.tag_raw_chains = _cap_tag
 kb = pt.KernelBuilder()
-kb.build_kernel(10, 2047, 256, 16, prune=True, use_regalloc=True)
+kb.build_kernel(10, 2047, 256, 16, prune=True)
 regalloc.tag_raw_chains = _orig_tag
 
 tagged, rc = cap["tagged"], cap["rc"]
@@ -49,7 +49,7 @@ def _cap_bd(t, pinned=()):
     return _orig_bd(t, pinned)
 regalloc.build_dag = _cap_bd
 kb2 = pt.KernelBuilder()
-kb2.build_kernel(10, 2047, 256, 16, prune=True, use_regalloc=True)
+kb2.build_kernel(10, 2047, 256, 16, prune=True)
 regalloc.build_dag = _orig_bd
 
 tagged_body = cap2["body"]
@@ -64,7 +64,7 @@ def body_cycles(prio):
     dag.reset()
     a = RegisterAllocator(read_count)
     bundles = reg_schedule(dag, read_count, seed=42, picker="weighted",
-                           weights=pt.BODY_WEIGHTS, allocator=a, prio=prio)
+                           weights=pt.REGALLOC_WEIGHTS, allocator=a, prio=prio)
     n = sum(1 for b in bundles if any(e != "debug" for e in b))
     return n, a.exhaustion_warnings
 

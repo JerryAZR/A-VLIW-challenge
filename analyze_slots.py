@@ -119,8 +119,6 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--picker", default="fma_first",
                         choices=["fma_first", "idx", "random"])
-    parser.add_argument("--regalloc", action="store_true",
-                        help="use the two-phase regalloc path")
     parser.add_argument("--show", action="store_true")
     parser.add_argument("--out", default="slots.png")
     args = parser.parse_args()
@@ -129,7 +127,7 @@ def main():
         matplotlib.use("TkAgg")
 
     kb = KernelBuilder()
-    kb.build_kernel(10, 2047, 256, 16, use_regalloc=args.regalloc)
+    kb.build_kernel(10, 2047, 256, 16)
 
     body, pro_cyc, epi_cyc = extract_body_bundles(kb)
     print(f"Prologue: {pro_cyc} cyc | Body: {len(body)} cyc | Epilogue: {epi_cyc} cyc")
