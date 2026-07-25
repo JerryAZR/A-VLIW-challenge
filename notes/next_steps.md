@@ -5,7 +5,7 @@ Living planning document (updated as the plan evolves). The optimization log
 holds the current tier matrix, the next levers, and forward-looking design
 notes.
 
-## Current tier status (after step 18: 1413 cyc)
+## Current tier status (after step 19: 1289 cyc)
 
 | tier                     | threshold | status |
 |--------------------------|-----------|--------|
@@ -16,28 +16,26 @@ notes.
 | opus45-2hr               | 1 579     | PASS   |
 | sonnet45                 | 1 548     | PASS   |
 | opus45-11hr              | 1 487     | PASS   |
-| opus45-improved-harness  | 1 363     | FAIL (50 cyc short) |
+| opus45-improved-harness  | 1 363     | **PASS (1289, 74 clear)** |
 
-Shipped config: rollout scheduler (per-cycle trial-and-score, K=6, trial 0
-= weighted greedy + shuffles), `ScoreWeights(reads=2, reg_delta=-1)` =
-**1413 cyc** at 1536 scratch, level-3 preload-select kernel active.
+All nine tiers pass. Shipped config: rollout scheduler (K=6, sort funcs
+[greedy] + [random]*5), `ScoreWeights(reads=2, reg_delta=-1)`,
+`REGALLOC_WEIGHTS = Weights(sink=-1, load=5, raw=1, war=1, rigid=1,
+idx=-4, group=-4)` (group priority: finish earlier DAG sink groups first).
 
 ## Next levers
 
-1. **Close the 50-cyc gap to 1363**: the big-scratch validation of the same
-   dataflow ran 1389 (recompute) / 1363 (retention). Retention
-   (`RECOMPUTE_PATH_BITS=False`, ~26 cyc cheaper) needed +64 granules the
-   greedy scheduler couldn't fit - retry it under the rollout scheduler,
-   which meters pressure by construction.
-2. **Score/feature training**: the reads=2/rd=-1 point is a manual sweep
-   minimum; coordinate descent over ScoreWeights (and K) may find more.
-3. **Horizon depth** (parked, non-trivial): trials = 1 decided cycle + H
-   greedy continuation cycles, scoring the horizon state. Unlocks both
-   deadlock-avoidance foresight and performance tuning. Needs careful
-   planning before attempting.
-4. **Slot-fill performance terms**: with pressure solved, alu_work /
-   load-fill terms become performance levers rather than feasibility
-   noise - retrain with feasibility secured.
+1. **Score/feature training**: coordinate descent over ScoreWeights +
+   REGALLOC_WEIGHTS (now 7 dims incl. group) around the manual minimum.
+2. **Sort-func mix**: with group=-4 the greedy trial dominates (K=3 ties
+   K=6); try K=2-3 for iteration speed, or interp variants once the base
+   weights are retrained.
+3. **Retention retry** (`RECOMPUTE_PATH_BITS=False`, ~26 cyc cheaper at big
+   scratch): pressure is now metered by group priority - retest at 1536.
+4. **Slot-fill performance terms** (alu_work / load-fill) now that
+   feasibility is secured.
+5. **Horizon depth** (parked, non-trivial): trials = 1 decided cycle + H
+   greedy continuation cycles, scoring the horizon state.
 
 ## Tools
 

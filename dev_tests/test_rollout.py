@@ -17,9 +17,10 @@ from ir import (Sym, Alu, VecElem, VecFma, VBroadcast, Const, VStore, VSelect,
                 DebugVCompare, Gather)
 from regalloc import (tag_raw_chains, build_dag, RegisterAllocator,
                       schedule as greedy_schedule)
-from rollout import (schedule_rollout, ScoreWeights, _features, _score,
-                     make_random_order)
-from scheduler import Weights
+from rollout import (schedule_rollout, ScoreWeights, SortCtx, _features,
+                     _score, make_random_order, make_weighted_greedy,
+                     make_interp_greedy)
+from scheduler import Weights, DNode, DAG
 
 W = Weights(sink=-1, load=5, raw=1, war=1, rigid=1, idx=-4)
 
@@ -135,6 +136,63 @@ class TestScoring(unittest.TestCase):
                  "reads": 6, "obligations": 12}
         self.assertAlmostEqual(_score(feats, w),
                                2 * 10 - 3 * 4 + 0.5 * 30 + 1.5 * 6 - 2 * 12)
+
+
+class TestGroupProps(unittest.TestCase):
+    """DAG-derived sink groups: sinks sorted by depth get ids 1..N; every
+    node inherits its DEEPEST descendant sink's id (ties -> lower id);
+    nodes reaching no non-debug sink get 0."""
+
+    def _dag(self):
+        # shared source 0 -> chain A: 0 -> 1 -> 3(store)    depths 0,1,2
+        #                 -> chain B: 0 -> 2 -> 4 -> 5(store) depths 0,1,2,3
+        # debug sink: 6
+        def n(i, eng):
+            return DNode(idx=i, engine=eng, instr=None)
+        nodes = [n(0, "alu"), n(1, "alu"), n(2, "alu"), n(3, "store"),
+                 n(4, "alu"), n(5, "store"), n(6, "debug")]
+        for src, dst in [(0, 1), (1, 3), (0, 2), (2, 4), (4, 5)]:
+            nodes[dst].in_edges.append((src, 1))
+            nodes[src].out_edges.append((dst, 1))
+        return DAG.from_nodes(nodes)
+
+    def test_group_assignment(self):
+        dag = self._dag()
+        g = [node.props.group for node in dag.nodes]
+        # Sinks by depth: node 3 (depth 2) -> id 1, node 5 (depth 3) -> id 2.
+        self.assertEqual(g[3], 1 / 2)
+        self.assertEqual(g[5], 1.0)
+        # Chain members inherit their sink.
+        self.assertEqual(g[1], 1 / 2)
+        self.assertEqual(g[2], 1.0)
+        self.assertEqual(g[4], 1.0)
+        # Shared source gets the DEEPER sink's group (5, not 3).
+        self.assertEqual(g[0], 1.0)
+        # Debug sink is ungrouped.
+        self.assertEqual(g[6], 0.0)
+
+
+class TestInterpGreedy(unittest.TestCase):
+    """progress=0 must reproduce make_weighted_greedy(w2); progress=1 -> w1."""
+
+    def test_endpoints(self):
+        _, rc, dag = _tagged_dag()
+        for n in dag.nodes:
+            from scheduler import _classify
+            _classify(n)
+        alloc = RegisterAllocator(rc)
+        w1 = Weights(sink=10, load=0, raw=0, war=0, rigid=0, idx=0)
+        w2 = Weights(sink=0, load=0, raw=0, war=0, rigid=0, idx=-10)
+        ready = [dag.nodes[i] for i in sorted(dag.ready())]
+        interp = make_interp_greedy(w1, w2)
+        greedy1 = make_weighted_greedy(w1)
+        greedy2 = make_weighted_greedy(w2)
+        ctx0 = SortCtx(allocator=alloc, progress=0.0)
+        ctx1 = SortCtx(allocator=alloc, progress=1.0)
+        self.assertEqual([n.idx for n in interp(ready, ctx0)],
+                         [n.idx for n in greedy2(ready, ctx0)])
+        self.assertEqual([n.idx for n in interp(ready, ctx1)],
+                         [n.idx for n in greedy1(ready, ctx1)])
 
 
 if __name__ == "__main__":

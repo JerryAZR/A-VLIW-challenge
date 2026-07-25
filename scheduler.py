@@ -50,26 +50,34 @@ NO_LOAD = 10**6
 class NodeProps(NamedTuple):
     """Static per-node scheduling properties, normalized to 0..1.
     Higher = more urgent for sink/raw/war/idx; for load LOWER = more urgent
-    (0 = this node is a load; 1 = no downstream load)."""
+    (0 = this node is a load; 1 = no downstream load). group is the
+    DAG-derived sink group id (0 = ungrouped; 1..N normalized by N): each
+    store sink anchors a group (sinks sorted by depth), and every node
+    inherits the id of its deepest descendant sink."""
     sink: float   # dist_to_sink / max  (longest RAW=1/WAR=0 path to a sink)
     load: float   # dist_to_load / max  (cycle-distance to nearest downstream load)
     raw: float    # #RAW dependents / max  (unblocked next cycle)
     war: float    # #WAR dependents / max  (unblocked same cycle)
     idx: float    # program order / total  (locality / determinism)
+    group: float  # sink group id / N  (0 = ungrouped, e.g. debug nodes)
 
 
 class Weights(NamedTuple):
     """Multiplier for each NodeProps term in the weighted picker's score
     (score = sink*props.sink - load*props.load + raw*props.raw
-             + war*props.war + rigid*is_rigid_now + idx*props.idx;
+             + war*props.war + rigid*is_rigid_now + idx*props.idx
+             + group*props.group;
     higher = scheduled first). load is subtracted because low dist_to_load =
-    urgent."""
+    urgent. group defaults to 0 (unused); negative = earlier groups first
+    (finish a group's chain before opening the next - a serialization /
+    register-pressure dial)."""
     sink: float
     load: float
     raw: float
     war: float
     rigid: float
     idx: float
+    group: float = 0.0
 
 # Flow ops that modify the PC - the DAG cannot represent control flow.
 # The only such op in the IR is Pause (prologue/epilogue barrier); hitting
@@ -314,6 +322,12 @@ class DAG:
                  1.0 = no downstream load.
           raw  - #RAW dependents (unblocked next cycle). Higher = more urgent.
           war  - #WAR dependents (unblocked same cycle). Higher = more urgent.
+          group - DAG-derived sink group: each non-debug sink anchors a
+                 group (sinks sorted by cycle-depth, id 1..N); every node
+                 inherits the id of its DEEPEST descendant sink (ties ->
+                 lower id). Nodes reaching no sink anchor (e.g. debug)
+                 get 0. Intuition: prioritising earlier groups finishes
+                 chains before opening new ones (pressure metering).
         """
         n = len(self.nodes)
         n_raw = [sum(1 for _, w in node.out_edges if w == 1) for node in self.nodes]
@@ -334,6 +348,37 @@ class DAG:
                         best_load = d2
             dist_to_sink[node.idx] = best_sink
             dist_to_load[node.idx] = 0 if node.engine == "load" else best_load
+
+        # -- sink groups --------------------------------------------------
+        # Cycle-depth from a source (longest weighted path over in-edges).
+        depth = [0] * n
+        for node in self.nodes:      # program order is a topo order
+            best = 0
+            for src, w in node.in_edges:
+                d = depth[src] + w
+                if d > best:
+                    best = d
+            depth[node.idx] = best
+        # Anchors: non-debug sinks (zero out-edges), sorted by (depth, idx).
+        sinks = sorted((node for node in self.nodes
+                        if not node.out_edges and node.engine != "debug"),
+                       key=lambda node: (depth[node.idx], node.idx))
+        # Reverse-propagate: (depth, group_id) of the deepest descendant
+        # sink; equal depth -> lower group id wins; grouped beats ungrouped.
+        best_sink_of: list[tuple[int, int]] = [(-1, 0)] * n
+        for gid, node in enumerate(sinks, start=1):
+            best_sink_of[node.idx] = (depth[node.idx], gid)
+        for node in reversed(self.nodes):
+            bd, bg = best_sink_of[node.idx]
+            for dst, _ in node.out_edges:
+                cd, cg = best_sink_of[dst]
+                if cg == 0:
+                    continue                      # ungrouped never wins
+                if bg == 0 or cd > bd or (cd == bd and cg < bg):
+                    bd, bg = cd, cg
+            best_sink_of[node.idx] = (bd, bg)
+        n_groups = len(sinks)
+
         max_sink = max(dist_to_sink) or 1
         max_load = max((d for d in dist_to_load if d != NO_LOAD), default=1) or 1
         max_raw = max(n_raw) or 1
@@ -342,7 +387,8 @@ class DAG:
                           1.0 if dist_to_load[i] == NO_LOAD else dist_to_load[i] / max_load,
                           n_raw[i] / max_raw,
                           n_war[i] / max_war,
-                          i / (n - 1) if n > 1 else 0.0)
+                          i / (n - 1) if n > 1 else 0.0,
+                          best_sink_of[i][1] / n_groups if n_groups else 0.0)
                 for i in range(n)]
 
 
@@ -661,7 +707,8 @@ def _make_picker(picker: str, rng: random.Random | None = None,
             score = (w.sink * p.sink - w.load * p.load
                      + w.raw * p.raw + w.war * p.war
                      + w.rigid * (1 if rigid else 0)
-                     + w.idx * p.idx)
+                     + w.idx * p.idx
+                     + w.group * p.group)
             return -score
         return _key
     raise ValueError(f"Unknown picker: {picker}")

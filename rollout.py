@@ -62,6 +62,7 @@ from regalloc import RegisterAllocator, _base, _resolve_operands
 class SortCtx(NamedTuple):
     """Live scheduling state available to sort funcs. Read-only."""
     allocator: RegisterAllocator
+    progress: float          # committed / total nodes, 0..1 at cycle start
 
 
 SortFunc = Callable[[list, SortCtx], list]
@@ -97,6 +98,24 @@ def make_weighted_greedy(weights: Weights) -> SortFunc:
         def pressured_key(node):
             return key_fn(node) - _freeing_read(ctx.allocator, node) * 1000
         return sorted(ready, key=pressured_key)
+    return order
+
+
+def make_interp_greedy(w1: Weights, w2: Weights) -> SortFunc:
+    """Progress-interpolated weighted priority + freeing bias:
+        key = progress * (w1 . props) + (1 - progress) * (w2 . props)
+    (w1 dominates late, w2 early). Intuition: the importance of each
+    property may change as the schedule progresses (e.g. group priority
+    early to meter chain openings, throughput late)."""
+    k1 = _make_picker("weighted", weights=w1)
+    k2 = _make_picker("weighted", weights=w2)
+
+    def order(ready: list, ctx: SortCtx) -> list:
+        t = ctx.progress
+        def key(node):
+            return (t * k1(node) + (1 - t) * k2(node)
+                    - _freeing_read(ctx.allocator, node) * 1000)
+        return sorted(ready, key=key)
     return order
 
 
@@ -304,7 +323,6 @@ def schedule_rollout(dag, read_count, *, seed: int = 42, trials: int = 6,
     if sort_funcs is None:
         sort_funcs = [make_weighted_greedy(weights)] + \
                      [make_random_order(rng) for _ in range(trials - 1)]
-    ctx = SortCtx(allocator=allocator)
 
     pool = FuncUnitPool()
     bundles: list[dict] = []
@@ -319,6 +337,7 @@ def schedule_rollout(dag, read_count, *, seed: int = 42, trials: int = 6,
                 f"rollout schedule: frontier empty with {total - committed} "
                 f"uncommitted nodes at C={C} - cyclic DAG or counter bug")
 
+        ctx = SortCtx(allocator=allocator, progress=committed / total)
         orders = [f(ready, ctx) for f in sort_funcs]
         if C == 0:
             for f, o in zip(sort_funcs, orders):

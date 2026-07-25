@@ -7,7 +7,9 @@ reports body cycle count or the deadlock cycle. Usage:
 """
 
 import perf_takehome as pt
-from rollout import ScoreWeights, make_random_order, make_weighted_greedy
+from rollout import (ScoreWeights, make_random_order, make_weighted_greedy,
+                     make_interp_greedy)
+from scheduler import Weights
 import random
 
 
@@ -42,12 +44,18 @@ def try_config(name, trials, sort_funcs, sw):
 if __name__ == "__main__":
     import time
     R = ScoreWeights(reads=2, reg_delta=-1)
+    W = pt.REGALLOC_WEIGHTS
+    RND = [make_random_order(random.Random(42)) for _ in range(5)]
     configs = [
-        ("default [greedy]+[random]*5 K=6", 6, None, R),
-        ("[random]*6 (no greedy)", 6, [make_random_order(random.Random(42))]*6, R),
-        ("[greedy] alone (K=1)", 1, [make_weighted_greedy(pt.REGALLOC_WEIGHTS)], R),
-        ("default K=4", 4, None, R),
-        ("default K=10", 10, None, R),
+        ("greedy group=-4", 6, [make_weighted_greedy(W._replace(group=-4))] + RND, R),
+        ("greedy group=-6", 6, [make_weighted_greedy(W._replace(group=-6))] + RND, R),
+        ("greedy group=-8", 6, [make_weighted_greedy(W._replace(group=-8))] + RND, R),
+        ("greedy group=-12", 6, [make_weighted_greedy(W._replace(group=-12))] + RND, R),
+        ("greedy group=-20", 6, [make_weighted_greedy(W._replace(group=-20))] + RND, R),
+        ("group=-4 K=10", 10, [make_weighted_greedy(W._replace(group=-4))]
+         + [make_random_order(random.Random(42)) for _ in range(9)], R),
+        ("group=-4 K=3", 3, [make_weighted_greedy(W._replace(group=-4))]
+         + [make_random_order(random.Random(42)) for _ in range(2)], R),
     ]
     for name, trials, sf, sw in configs:
         t0 = time.time()

@@ -43,7 +43,11 @@ from problem import (
 # Picker weights tuned for the regalloc (RAW-only DAG) path by sweep_regalloc -
 # the register-freeing bias is always-on there, and these base weights order
 # the remaining work best. (Found by random search + local refinement.)
-REGALLOC_WEIGHTS = Weights(sink=-1, load=5, raw=1, war=1, rigid=1, idx=-4)
+# group=-4 (sweep_rollout): prioritize earlier DAG sink groups - finish a
+# group's chains before opening the next. This serialization meters in-flight
+# register pressure AND improves throughput: 1413 -> 1290 cyc.
+REGALLOC_WEIGHTS = Weights(sink=-1, load=5, raw=1, war=1, rigid=1, idx=-4,
+                           group=-4)
 
 # Body scheduler selection: "greedy" (regalloc.schedule, weighted picker +
 # freeing bias) or "rollout" (rollout.schedule_rollout: per-cycle

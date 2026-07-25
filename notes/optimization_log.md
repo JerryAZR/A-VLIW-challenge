@@ -729,6 +729,51 @@ the big-scratch validation of the same dataflow (1 389).
 Passes correctness (8 seeds) and **eight** tiers: everything except
 `opus45-improved-harness < 1363` (50 cyc short).
 
+---
+
+## Step 19 - DAG sink groups + group priority   1 289 cyc   114.6×   ALL TIERS
+
+Commits (this step). Two additions, proposed and designed in discussion:
+
+1. **DAG-derived sink groups** (`NodeProps.group`): each non-debug sink (the
+   32 stores) anchors a group; sinks sorted by cycle-depth get ids 1..N;
+   every node inherits the id of its DEEPEST descendant sink (ties -> lower
+   id); debug nodes stay ungrouped (0). On this DAG the partition is exact:
+   32 groups x 296 nodes - the DAG groups align perfectly with the
+   lane-processing groups (by construction: per-group SSA tags, shared
+   consts live in the prologue).
+2. **Progress in ctx** (`SortCtx.progress = committed/total`) +
+   `make_interp_greedy(w1, w2)`: progress-interpolated weighted priority
+   `progress*(w1.props) + (1-progress)*(w2.props)` - prop importance may
+   change over the schedule's lifetime.
+
+The win came from the group dial, not interpolation: prioritising earlier
+groups (negative group weight) serialises chain openings - lower pressure
+AND better throughput. Sweep (K=6, score reads=2/rd=-1):
+
+| config | cycles |
+|--------|-------:|
+| group=-1 | deadlock C=600 |
+| group=-2 | 1 347 |
+| **group=-4** | **1 289** |
+| group=-6/-8 | 1 304 / 1 298 |
+| group=-12/-20 | 1 347 / 1 348 |
+| interp grp-4 early -> 0 late | 1 342 |
+
+Shipped: `REGALLOC_WEIGHTS = Weights(sink=-1, load=5, raw=1, war=1,
+rigid=1, idx=-4, group=-4)` = **1 289 cyc** (K=3 ties at half the
+wall-clock). Interpolation infrastructure kept (make_interp_greedy) but no
+interp config shipped - flat group=-4 beat every interp variant tried.
+
+Also this step (interface alignment): sort funcs are `f(ready_nodes, ctx)
+-> permutation`, K = len(sort_funcs); ctx carries the live allocator +
+progress; weights/rng bind via factories. Node metadata travels on the
+nodes (DNode.props attached by DAG._finish_init, DNode.placement by
+_classify) - the dag.props / placements side lists are gone.
+
+Passes correctness (8 seeds) and **all nine** tiers, including
+`opus45-improved-harness < 1363` (1 289, 74 cyc clear).
+
 Dev tooling: `sweep_rollout.py` (weight/K sweep), `diag_deadlock.py`
 (live-tag autopsy at the wall), `diag_liveness.py` (committed-liveness
 profile; peak 220 at big scratch = scheduler artifact, not a capacity
