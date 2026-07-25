@@ -816,6 +816,22 @@ valu slack.
 Passes correctness (8 seeds) and **all nine** tiers (1 203 < 1 363,
 160 cyc clear).
 
+---
+
+## Step 21 - computed small const vectors   1 190 cyc   124.1×
+
+Commit `0aab7e9`. The 8 small const vectors no longer cost a `const` load
++ `vbroadcast` each - they are computed from each other on valu:
+
+  1 = (0==0)   2 = 1+1   3 = 1+2   9 = 3*3   16 = 2<<3   19 = 16+3
+  33 = 16*2+1 (fma)   4097 = 64*64+1 (fma; 64 = 16<<2)
+
+Trades 8 load slots for ~1 net valu op and cuts 16 prologue nodes to 10;
+the load engine was the busier one in the ramp-up window. Only the 6 big
+hash addends (K0..K5) remain const+vbroadcast. 1 203 -> **1 190** (-13).
+
+Passes correctness (8 seeds) and **all nine** tiers (173 cyc clear).
+
 Dev tooling: `sweep_rollout.py` (weight/K sweep), `diag_deadlock.py`
 (live-tag autopsy at the wall), `diag_liveness.py` (committed-liveness
 profile; peak 220 at big scratch = scheduler artifact, not a capacity
