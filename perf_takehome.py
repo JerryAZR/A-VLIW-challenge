@@ -138,7 +138,7 @@ class KernelBuilder:
 
     def build_kernel(
         self, forest_height: int, n_nodes: int, batch_size: int, rounds: int,
-        prune: bool = True,
+        prune: bool = True, use_regalloc: bool = False,
     ):
         """8-lane-per-group kernel. Cross-lane vectorization over the
         `valu` unit (VLEN=8 lanes per group, 32 groups), packed by the
@@ -439,20 +439,23 @@ class KernelBuilder:
                 if r == rounds - 1:
                     body.append(VStore(out_addr[g], val_vec))
 
-        # Rename prologue + body together (single pass) so liveness spans the
-        # boundary, then split: the prologue has no Gather, so its resolved
-        # length == its symbolic length. Emit the prologue linearly (one slot
-        # per bundle); schedule the body on the DAG.
-        resolved = self.re.rename(prologue + body)
-        prologue_res = resolved[:len(prologue)]
-        body = resolved[len(prologue):]
-        for r in prologue_res:
-            self.instrs.append({r.engine: [r.lower()]})
-        # Pause 1 -- match reference_kernel2's first yield (initial mem).
-        self.add(Pause())
-        body_instrs = self.build(body, vliw=True, seed=42, picker="weighted",
-                                   weights=BODY_WEIGHTS, prune=prune)
-        self.instrs.extend(body_instrs)
+        if use_regalloc:
+            self._emit_regalloc(prologue, body, prune)
+        else:
+            # Rename prologue + body together (single pass) so liveness spans the
+            # boundary, then split: the prologue has no Gather, so its resolved
+            # length == its symbolic length. Emit the prologue linearly (one slot
+            # per bundle); schedule the body on the DAG.
+            resolved = self.re.rename(prologue + body)
+            prologue_res = resolved[:len(prologue)]
+            body = resolved[len(prologue):]
+            for r in prologue_res:
+                self.instrs.append({r.engine: [r.lower()]})
+            # Pause 1 -- match reference_kernel2's first yield (initial mem).
+            self.add(Pause())
+            body_instrs = self.build(body, vliw=True, seed=42, picker="weighted",
+                                       weights=BODY_WEIGHTS, prune=prune)
+            self.instrs.extend(body_instrs)
 
         # =====================================================================
         # Epilogue: the val[256] vstores now overlap the body tail (each group's
@@ -464,6 +467,53 @@ class KernelBuilder:
         # Must come AFTER the body so machine.mem holds the final values
         # when the test recommends execution on i=1 (final yield).
         self.add(Pause())
+
+    def _emit_regalloc(self, prologue, body, prune):
+        """Two-phase register-allocation path (regalloc.py): SSA tag chains +
+        RAW-only DAG + schedule-time allocation. Replaces the FIFO rename +
+        pre-resolved schedule of the default path.
+
+        Prologue emits linearly, allocating const/carried registers via the
+        shared allocator; the body schedules on a RAW-only DAG continuing
+        from that register state. const_vec_0 stays pinned at address 0.
+        """
+        from regalloc import (tag_raw_chains, build_dag,
+                              schedule as reg_schedule, RegisterAllocator)
+        from ir import Reg
+        tagged, read_count = tag_raw_chains(prologue + body,
+                                            pinned={"const_vec_0"})
+        n_pro = len(prologue)
+        tagged_pro, tagged_body = tagged[:n_pro], tagged[n_pro:]
+
+        # Prologue: emit linearly (one slot per bundle), allocating each
+        # write's register and committing each read (free at 0) via the
+        # shared allocator in program order.
+        allocator = RegisterAllocator(read_count)
+        for instr in tagged_pro:
+            wr_bases = [(op.vec if hasattr(op, "vec") else op)
+                        for op in instr.write_operands()]
+            for b in wr_bases:
+                if b.name != "const_vec_0":
+                    allocator.write(b)
+            rd = [Reg(allocator.addr_of(o), getattr(o, "is_vec", False))
+                  for o in instr.read_operands()]
+            wr = [Reg(allocator.addr_of(o), getattr(o, "is_vec", False))
+                  for o in instr.write_operands()]
+            r = instr.rebuild(rd, wr)
+            self.instrs.append({r.engine: [r.tagged_lower()]})
+            # Commit reads: free a register when its last read has landed.
+            for op in instr.read_operands():
+                b = op.vec if hasattr(op, "vec") else op
+                if b in allocator.assigned:
+                    allocator.read(b)
+        # Pause 1 -- match reference_kernel2's first yield (initial mem).
+        self.add(Pause())
+
+        # Body: RAW-only DAG + allocating schedule, continuing the allocator.
+        dag = build_dag(tagged_body, pinned={"const_vec_0"})
+        body_instrs = reg_schedule(dag, read_count, seed=42, picker="weighted",
+                                   weights=BODY_WEIGHTS, allocator=allocator)
+        self.instrs.extend(body_instrs)
 
 BASELINE = 147734
 

@@ -34,7 +34,7 @@ import heapq
 import random
 from typing import NamedTuple
 
-from ir import Instr, Pause, VecElem, VecFma, VBroadcast, RegId, TaggedSlot
+from ir import Instr, Pause, VecElem, VecFma, VBroadcast, RegId, TaggedSlot, Gather
 from problem import VLEN, SLOT_LIMITS
 
 # A register id: (base_addr, is_vector), produced by Instr.reads()/writes().
@@ -531,6 +531,7 @@ def prune_to_stores(dag: DAG) -> DAG:
 # Node classification tags.
 _KIND_ATOMIC_SCALAR = "alu_scalar"
 _KIND_LOAD = "load"
+_KIND_GATHER = "gather"               # VLEN scalar loads, partial completion
 _KIND_STORE = "store"
 _KIND_FLOW = "flow"
 _KIND_DEBUG = "debug"
@@ -570,6 +571,8 @@ def _classify(n: DNode) -> _Placement:
     if eng == "alu":
         return _Placement(_KIND_ATOMIC_SCALAR, 1, "alu")
     if eng == "load":
+        if isinstance(instr, Gather):
+            return _Placement(_KIND_GATHER, VLEN, "load")  # 8 scalar loads
         return _Placement(_KIND_LOAD, 1, "load")
     if eng == "store":
         return _Placement(_KIND_STORE, 1, "store")
