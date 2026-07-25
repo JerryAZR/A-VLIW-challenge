@@ -6,11 +6,9 @@ problem:
 
   1. checkpoint the three mutable structures (DAG / allocator / placements)
      via their uniform ``checkpoint()`` / ``rollback(token)`` interface,
-  2. run K trial orderings of the (fixed, RAW-only) ready set - trial 0 is
-     the incumbent weighted-greedy order, the rest are uniform shuffles -
-     each trial simulating *placement decisions only* (no operand
-     resolution, no slot emission; the pool is per-cycle scratch and needs
-     no rollback),
+  2. run K trial orderings of the (fixed, RAW-only) ready set, each trial
+     simulating *placement decisions only* (no operand resolution, no slot
+     emission; the pool is per-cycle scratch and needs no rollback),
   3. score each trial's post-``advance()`` state (slots filled per engine,
      register pressure, next-cycle frontier size, commits),
   4. roll every trial back, then replay the winner's ordering with emission
@@ -30,11 +28,76 @@ public mutation + rollback interfaces.
 
 import random
 from dataclasses import dataclass
+from typing import Callable, NamedTuple
 
 from ir import Instr
 from scheduler import (DNode, FuncUnitPool, Weights, _classify, _make_picker,
                        _Placement, _KIND_DEBUG, _KIND_GATHER)
 from regalloc import RegisterAllocator, _base, _resolve_operands
+
+
+# ---------------------------------------------------------------------------
+# Trial orderings (sort_funcs)
+# ---------------------------------------------------------------------------
+# Each candidate ordering in a cycle is produced by a "sort func":
+#
+#   f(ready: list[DNode], ctx) -> list[DNode]     (a permutation of ready)
+#
+# ctx carries the ONE legitimate live external: the register allocator
+# (ctx.allocator). Function-specific configuration (weights, rng) is bound
+# via factories/partials. All node metadata travels on the nodes
+# themselves: node.props (static, attached by DAG._finish_init) and
+# node.placement (per-pass, attached by _classify) - no dag/props/
+# placements side lookups.
+#
+# K = len(sort_funcs): the list IS the trial set, e.g.
+#   [make_random_order(rng)] * 6   - 6 full-random trials
+#   [make_weighted_greedy(W)]      - K=1: the trained picker, no search
+#   default: [greedy] + [random]*5 - greedy competes in the same scoring
+#     (empirically load-bearing: pure [random]*6 deadlocks at C=65 - the
+#     shuffle opens too many chains in the opening rounds before the
+#     reads reward can meter them; root cause undiagnosed, masked by the
+#     greedy candidate).
+
+class SortCtx(NamedTuple):
+    """Live scheduling state available to sort funcs. Read-only."""
+    allocator: RegisterAllocator
+
+
+SortFunc = Callable[[list, SortCtx], list]
+
+
+def _freeing_read(allocator, node) -> int:
+    """#registers ``node``'s commit would free (reads with 1 remaining)."""
+    n = 0
+    for op in node.instr.read_operands():
+        b = _base(op)
+        if allocator.remaining.get(b) == 1:
+            n += 1
+    return n
+
+
+def make_random_order(rng: random.Random) -> SortFunc:
+    """Uniform shuffle (draws once from the bound rng - deterministic per
+    seed)."""
+    def order(ready: list, ctx: SortCtx) -> list:
+        o = ready[:]
+        rng.shuffle(o)
+        return o
+    return order
+
+
+def make_weighted_greedy(weights: Weights) -> SortFunc:
+    """The incumbent: trained weighted picker + always-on freeing bias
+    (same priority as regalloc.schedule's pressured_key). Node metadata
+    comes off the nodes; the freeing bias reads ctx.allocator live."""
+    key_fn = _make_picker("weighted", weights=weights)
+
+    def order(ready: list, ctx: SortCtx) -> list:
+        def pressured_key(node):
+            return key_fn(node) - _freeing_read(ctx.allocator, node) * 1000
+        return sorted(ready, key=pressured_key)
+    return order
 
 
 @dataclass(frozen=True)
@@ -98,9 +161,9 @@ def _score(feats, w: ScoreWeights) -> float:
             + w.obligations * feats["obligations"])
 
 
-def _run_cycle(order, dag, allocator, placements, pool, emit):
-    """Run one cycle's placements in ``order``; mirrors the placement
-    semantics of ``regalloc.schedule`` exactly.
+def _run_cycle(order, dag, allocator, pool, emit):
+    """Run one cycle's placements in ``order`` (a list of DNodes); mirrors
+    the placement semantics of ``regalloc.schedule`` exactly.
 
     emit=False (trial): decisions only - pool budgets, allocator and
         placement state, DAG commits. No operand resolution, no slot
@@ -140,19 +203,18 @@ def _run_cycle(order, dag, allocator, placements, pool, emit):
             allocator.write(t)
         return wr_tags, fresh
 
-    for idx in order:
-        node = dag[idx]
-        p = placements[idx]
+    for node in order:
+        p = node.placement
         instr = node.instr
         if p.kind == _KIND_DEBUG:
             # Debug nodes write nothing but DO read a tag (their loc):
             # consume the read (free at 0) like any reader.
             if emit:
-                resolved_node = DNode(idx=idx, engine=node.engine,
+                resolved_node = DNode(idx=node.idx, engine=node.engine,
                                       instr=_resolve_operands(instr, allocator))
                 pool.place(resolved_node, p)
             _commit_reads(instr)
-            dag.commit(idx)
+            dag.commit(node.idx)
             n_committed += 1
             continue
         if p.kind == _KIND_GATHER:
@@ -176,7 +238,7 @@ def _run_cycle(order, dag, allocator, placements, pool, emit):
             p.lanes_done += take
             if p.lanes_done == p.lanes_total:      # all 8 lanes landed
                 _commit_reads(instr)
-                dag.commit(idx)
+                dag.commit(node.idx)
                 n_committed += 1
             continue
         # Regular write node: placeable only with a unit slot AND registers.
@@ -185,7 +247,7 @@ def _run_cycle(order, dag, allocator, placements, pool, emit):
             continue   # leave for next cycle (a read may free a register)
         wr_tags, fresh = aw
         if emit:
-            resolved_node = DNode(idx=idx, engine=node.engine,
+            resolved_node = DNode(idx=node.idx, engine=node.engine,
                                   instr=_resolve_operands(instr, allocator))
             placed = pool.place(resolved_node, p)
         else:
@@ -202,7 +264,7 @@ def _run_cycle(order, dag, allocator, placements, pool, emit):
             continue
         if placed:   # fully placed -> commit reads, free at 0
             _commit_reads(instr)
-            dag.commit(idx)
+            dag.commit(node.idx)
             n_committed += 1
     return {"committed": n_committed, "allocs": allocator.n_alloc - a0,
             "frees": allocator.n_free - f0, "reads": n_reads,
@@ -210,7 +272,7 @@ def _run_cycle(order, dag, allocator, placements, pool, emit):
 
 
 def schedule_rollout(dag, read_count, *, seed: int = 42, trials: int = 6,
-                     greedy_trials: int = 1,
+                     sort_funcs: list[SortFunc] | None = None,
                      score_weights: ScoreWeights | None = None,
                      weights: Weights | None = None,
                      cap: int | None = None,
@@ -222,8 +284,11 @@ def schedule_rollout(dag, read_count, *, seed: int = 42, trials: int = 6,
     but each cycle picks its placement order by scoring K candidate
     orderings on the post-cycle state they produce.
 
-    ``trials``: candidate orderings evaluated per cycle (trial 0..greedy_trials-1
-        are the incumbent weighted-greedy order, the rest uniform shuffles).
+    ``sort_funcs``: the trial set - each entry produces one candidate
+        ordering per cycle (K = len(sort_funcs)). Default: the incumbent
+        weighted-greedy order + ``trials - 1`` uniform shuffles.
+    ``trials``: sizes the default sort_funcs (ignored when sort_funcs is
+        given).
     ``score_weights``: linear weights over the state features.
     ``weights``: base picker weights for the greedy candidate ordering.
     """
@@ -232,26 +297,14 @@ def schedule_rollout(dag, read_count, *, seed: int = 42, trials: int = 6,
         allocator = RegisterAllocator(read_count)
     if score_weights is None:
         score_weights = ScoreWeights()
-    placements = [_classify(n) for n in dag.nodes]
+    for n in dag.nodes:
+        _classify(n)
     if cap is None:
         cap = len(dag) + 1
-
-    # Greedy candidate ordering: the incumbent weighted picker + always-on
-    # freeing bias (same priority as regalloc.schedule's pressured_key).
-    key_fn = _make_picker("weighted", placements, rng, dag.props, weights)
-
-    def freeing_read(idx) -> int:
-        n = 0
-        for op in dag[idx].instr.read_operands():
-            b = _base(op)
-            if allocator.remaining.get(b) == 1:
-                n += 1
-        return n
-
-    def pressured_key(idx):
-        base = key_fn(idx)
-        b0 = base[0] if isinstance(base, tuple) else base
-        return b0 - freeing_read(idx) * 1000
+    if sort_funcs is None:
+        sort_funcs = [make_weighted_greedy(weights)] + \
+                     [make_random_order(rng) for _ in range(trials - 1)]
+    ctx = SortCtx(allocator=allocator)
 
     pool = FuncUnitPool()
     bundles: list[dict] = []
@@ -260,20 +313,17 @@ def schedule_rollout(dag, read_count, *, seed: int = 42, trials: int = 6,
     total = len(dag)
 
     while committed < total:
-        ready = sorted(dag.ready())
+        ready = [dag.nodes[i] for i in sorted(dag.ready())]
         if not ready:
             raise RuntimeError(
                 f"rollout schedule: frontier empty with {total - committed} "
                 f"uncommitted nodes at C={C} - cyclic DAG or counter bug")
 
-        # Candidate orderings: greedy incumbent first, then shuffles.
-        orders = []
-        for _ in range(min(greedy_trials, trials)):
-            orders.append(sorted(ready, key=pressured_key))
-        for _ in range(trials - len(orders)):
-            o = ready[:]
-            rng.shuffle(o)
-            orders.append(o)
+        orders = [f(ready, ctx) for f in sort_funcs]
+        if C == 0:
+            for f, o in zip(sort_funcs, orders):
+                assert sorted(n.idx for n in o) == [n.idx for n in ready], (
+                    f"sort func {f} did not return a permutation of ready")
 
         best_score = float("-inf")
         best_order = None
@@ -282,8 +332,7 @@ def schedule_rollout(dag, read_count, *, seed: int = 42, trials: int = 6,
             ta = allocator.checkpoint()
             tp = _Placement.checkpoint()
             pool.reset()
-            stats = _run_cycle(o, dag, allocator, placements, pool,
-                               emit=False)
+            stats = _run_cycle(o, dag, allocator, pool, emit=False)
             dag.advance()
             slots_used = sum(FuncUnitPool._CAPACITY[e] - pool.free[e]
                              for e in FuncUnitPool._CAPACITY)
@@ -312,8 +361,7 @@ def schedule_rollout(dag, read_count, *, seed: int = 42, trials: int = 6,
         # Winner replay: same order, emission on, no logging (checkpoints
         # all rolled back to token 0, so the logs are closed).
         pool.reset()
-        stats = _run_cycle(best_order, dag, allocator, placements, pool,
-                           emit=True)
+        stats = _run_cycle(best_order, dag, allocator, pool, emit=True)
         dag.advance()
         committed += stats["committed"]
         bundle = {eng: [s.tagged_lower() if isinstance(s, Instr) else s

@@ -34,15 +34,15 @@ regalloc.build_dag = _orig_bd
 dag = prune_to_stores(build_dag(cap["body"], pinned={"const_vec_0"}))
 read_count = recompute_read_count([n.instr for n in dag.nodes],
                                   pinned={"const_vec_0"})
-_placements = [_classify(n) for n in dag.nodes]
+for _n in dag.nodes:
+    _classify(_n)
 
 
 def mk_weighted_base(weights, free_w):
     def prio(allocator, base_key, freeing_read):
-        wf = _make_picker("weighted", _placements, random.Random(42),
-                          dag.props, weights)
+        wf = _make_picker("weighted", random.Random(42), weights)
         def key(idx):
-            b = wf(idx)
+            b = wf(dag.nodes[idx])
             b0 = b[0] if isinstance(b, tuple) else b
             return b0 - freeing_read(idx) * free_w
         return key

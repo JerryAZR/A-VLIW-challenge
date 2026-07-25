@@ -57,7 +57,8 @@ dag = prune_to_stores(build_dag(tagged_body, pinned={"const_vec_0"}))
 read_count = recompute_read_count([n.instr for n in dag.nodes],
                                   pinned={"const_vec_0"})
 from scheduler import _classify
-_placements = [_classify(n) for n in dag.nodes]
+for _n in dag.nodes:
+    _classify(_n)
 
 
 def body_cycles(prio):
@@ -109,10 +110,9 @@ def mk_weighted_base(weights, free_w):
     from scheduler import _make_picker
     import random as _r
     def prio(allocator, base_key, freeing_read):
-        wf = _make_picker("weighted", _placements, _r.Random(42),
-                          dag.props, weights)
+        wf = _make_picker("weighted", _r.Random(42), weights)
         def key(idx):
-            b = wf(idx)
+            b = wf(dag.nodes[idx])
             b0 = b[0] if isinstance(b, tuple) else b
             return b0 - freeing_read(idx) * free_w
         return key

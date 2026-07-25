@@ -79,18 +79,26 @@ FLOW_PANIC = (Pause,)
 
 @dataclass
 class DNode:
-    """A node in the dependency DAG - static graph data only.
+    """A node in the dependency DAG.
 
+    Graph structure (idx/engine/instr/edges) is static after construction.
     Dynamic dependency state (remaining blockers, committed flag, frontier
-    membership) is owned by the ``DAG``; per-cycle scheduling state (lanes
-    landed, sticky engine choice) is owned by the scheduler's
-    ``_Placement`` records. DNode itself never mutates after construction.
+    membership) is owned by the ``DAG`` (idx-keyed arrays).
+
+    Attached scheduling views (trivial node -> data lookup, set after
+    construction by their owners):
+      ``props``      - static NodeProps, attached by ``DAG._finish_init``.
+      ``placement``  - per-pass slot/spill state (``_Placement``), attached
+                       by ``_classify`` at schedule start; owned by the
+                       scheduler, fresh each pass.
     """
     idx: int
     engine: str
     instr: Instr
     in_edges: list[tuple[int, int]] = field(default_factory=list)   # (src_idx, weight)
     out_edges: list[tuple[int, int]] = field(default_factory=list)  # (dst_idx, weight)
+    props: "NodeProps | None" = None
+    placement: "_Placement | None" = None
 
 
 class DAG:
@@ -151,7 +159,10 @@ class DAG:
         # greedy scheduler path never records and pays nothing).
         self._log: list | None = None
 
-        self.props: list[NodeProps] = self._compute_props()
+        # Static scheduling props travel on the nodes (node.props).
+        props = self._compute_props()
+        for node in self.nodes:
+            node.props = props[node.idx]
 
     # -- queries ----------------------------------------------------------
 
@@ -477,26 +488,33 @@ class _Placement:
 
 
 def _classify(n: DNode) -> _Placement:
-    """Classify a node for placement (kind, lanes, native engine)."""
+    """Classify a node for placement (kind, lanes, native engine); attaches
+    the fresh ``_Placement`` to ``n.placement`` (per-pass scheduler state)
+    and returns it."""
     instr = n.instr
     eng = instr.engine
     if eng == "alu":
-        return _Placement(_KIND_ATOMIC_SCALAR, 1, "alu")
-    if eng == "load":
+        p = _Placement(_KIND_ATOMIC_SCALAR, 1, "alu")
+    elif eng == "load":
         if isinstance(instr, Gather):
-            return _Placement(_KIND_GATHER, VLEN, "load")  # 8 scalar loads
-        return _Placement(_KIND_LOAD, 1, "load")
-    if eng == "store":
-        return _Placement(_KIND_STORE, 1, "store")
-    if eng == "flow":
-        return _Placement(_KIND_FLOW, 1, "flow")
-    if eng == "debug":
-        return _Placement(_KIND_DEBUG, 0, "debug")
-    if eng == "valu":
+            p = _Placement(_KIND_GATHER, VLEN, "load")  # 8 scalar loads
+        else:
+            p = _Placement(_KIND_LOAD, 1, "load")
+    elif eng == "store":
+        p = _Placement(_KIND_STORE, 1, "store")
+    elif eng == "flow":
+        p = _Placement(_KIND_FLOW, 1, "flow")
+    elif eng == "debug":
+        p = _Placement(_KIND_DEBUG, 0, "debug")
+    elif eng == "valu":
         if isinstance(instr, VecFma):
-            return _Placement(_KIND_VEC_FMA, 1, "valu")    # rigid: no scalar fma
-        return _Placement(_KIND_VEC_ELEM, VLEN, "valu")    # spillable to alu
-    raise NotImplementedError(f"Unknown engine: {eng}")
+            p = _Placement(_KIND_VEC_FMA, 1, "valu")   # rigid: no scalar fma
+        else:
+            p = _Placement(_KIND_VEC_ELEM, VLEN, "valu")  # spillable to alu
+    else:
+        raise NotImplementedError(f"Unknown engine: {eng}")
+    n.placement = p
+    return p
 
 
 def _vec_instr_to_alu_lanes(instr: Instr, lanes) -> list[tuple]:
@@ -614,30 +632,31 @@ class FuncUnitPool:
         return p.lanes_done == p.lanes_total
 
 
-def _make_picker(picker: str, placements: list[_Placement], rng: random.Random,
-                 props: list[NodeProps] | None = None,
+def _make_picker(picker: str, rng: random.Random | None = None,
                  weights: Weights | None = None):
-    """Return a sort key for a node index (lower = higher priority)."""
+    """Return a sort key over NODES (lower = higher priority). Node metadata
+    travels on the node: ``n.props`` (static properties) and ``n.placement``
+    (kind / lanes_done for the rigidity term)."""
     if picker == "idx":
-        return lambda idx: idx
+        return lambda n: n.idx
     if picker == "random":
-        return lambda idx: rng.random()
+        return lambda n: rng.random()
     if picker == "fma_first":
         # vec_fma < vec_elem < rest < debug, then idx.
-        def _key(idx):
-            return (_KIND_PRIORITY.get(placements[idx].kind, 9), idx)
+        def _key(n):
+            return (_KIND_PRIORITY.get(n.placement.kind, 9), n.idx)
         return _key
     if picker == "weighted":
         # score = sink*sink - load*load + raw*raw + war*war + rigid*is_rigid_now
         #         + idx*idx;
         # higher = scheduled first (max-heap via negation). is_rigid_now is
         # mutable placement state: a node is rigid unless it's a fresh
-        # (un-spilled) vec_elem. Computed at push time, so partial vec_elem
-        # (lanes_done>0 -> sticky alu) read as rigid when re-pushed next cycle.
+        # (un-spilled) vec_elem. Read at key time, so partial vec_elem
+        # (lanes_done>0 -> sticky alu) reads as rigid.
         w = weights
-        def _key(idx):
-            p = props[idx]
-            pl = placements[idx]
+        def _key(n):
+            p = n.props
+            pl = n.placement
             rigid = (pl.kind != _KIND_VEC_ELEM) or (pl.lanes_done > 0)
             score = (w.sink * p.sink - w.load * p.load
                      + w.raw * p.raw + w.war * p.war

@@ -49,8 +49,8 @@ REGALLOC_WEIGHTS = Weights(sink=-1, load=5, raw=1, war=1, rigid=1, idx=-4)
 # freeing bias) or "rollout" (rollout.schedule_rollout: per-cycle
 # trial-and-score search over placement orderings).
 SCHEDULER_MODE = "rollout"
-ROLLOUT_TRIALS = 6           # candidate orderings scored per cycle
-ROLLOUT_GREEDY_TRIALS = 1    # of those, how many are the incumbent greedy order
+ROLLOUT_TRIALS = 6           # sizes the default trial set ([greedy] + [random]*(N-1))
+ROLLOUT_SORT_FUNCS = None    # explicit trial set override; None -> default
 ROLLOUT_SEED = 42
 ROLLOUT_SCORE_WEIGHTS = None  # None -> rollout.ScoreWeights() defaults
 
@@ -570,7 +570,7 @@ class KernelBuilder:
             from rollout import schedule_rollout
             body_instrs = schedule_rollout(
                 dag, read_count, seed=ROLLOUT_SEED, trials=ROLLOUT_TRIALS,
-                greedy_trials=ROLLOUT_GREEDY_TRIALS, weights=REGALLOC_WEIGHTS,
+                sort_funcs=ROLLOUT_SORT_FUNCS, weights=REGALLOC_WEIGHTS,
                 score_weights=ROLLOUT_SCORE_WEIGHTS, allocator=allocator)
         else:
             body_instrs = reg_schedule(dag, read_count, seed=42,

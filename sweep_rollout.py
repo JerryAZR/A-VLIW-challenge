@@ -7,7 +7,8 @@ reports body cycle count or the deadlock cycle. Usage:
 """
 
 import perf_takehome as pt
-from rollout import ScoreWeights
+from rollout import ScoreWeights, make_random_order, make_weighted_greedy
+import random
 
 
 def build_cycles():
@@ -27,10 +28,10 @@ def build_cycles():
     return sum(1 for b in kb.instrs if any(eng != "debug" for eng in b)), None
 
 
-def try_config(name, trials, greedy, sw):
+def try_config(name, trials, sort_funcs, sw):
     pt.SCHEDULER_MODE = "rollout"
     pt.ROLLOUT_TRIALS = trials
-    pt.ROLLOUT_GREEDY_TRIALS = greedy
+    pt.ROLLOUT_SORT_FUNCS = sort_funcs
     pt.ROLLOUT_SCORE_WEIGHTS = sw
     cyc, err = build_cycles()
     status = f"{cyc} cyc" if cyc is not None else f"FAIL: {err}"
@@ -40,18 +41,15 @@ def try_config(name, trials, greedy, sw):
 
 if __name__ == "__main__":
     import time
-    R = ScoreWeights(reads=1, reg_delta=-1)
+    R = ScoreWeights(reads=2, reg_delta=-1)
     configs = [
-        ("reads=2 rd=-1 K=6", 6, 1, ScoreWeights(reads=2, reg_delta=-1)),
-        ("reads=2 rd=-1 K=10", 10, 1, ScoreWeights(reads=2, reg_delta=-1)),
-        ("reads=4 rd=-1 K=6", 6, 1, ScoreWeights(reads=4, reg_delta=-1)),
-        ("reads=2 rd=0 K=6", 6, 1, ScoreWeights(reads=2, reg_delta=0)),
-        ("reads=2 rd=-2 K=6", 6, 1, ScoreWeights(reads=2, reg_delta=-2)),
-        ("reads=3 rd=-1 K=6", 6, 1, ScoreWeights(reads=3, reg_delta=-1)),
-        ("reads=2 rd=-1 oblig=-0.5 K=6", 6, 1, ScoreWeights(reads=2, reg_delta=-1, obligations=-0.5)),
-        ("reads=2 rd=-1 alu=0.1 K=6", 6, 1, ScoreWeights(reads=2, reg_delta=-1, alu_work=0.1)),
+        ("default [greedy]+[random]*5 K=6", 6, None, R),
+        ("[random]*6 (no greedy)", 6, [make_random_order(random.Random(42))]*6, R),
+        ("[greedy] alone (K=1)", 1, [make_weighted_greedy(pt.REGALLOC_WEIGHTS)], R),
+        ("default K=4", 4, None, R),
+        ("default K=10", 10, None, R),
     ]
-    for name, trials, greedy, sw in configs:
+    for name, trials, sf, sw in configs:
         t0 = time.time()
-        try_config(name, trials, greedy, sw)
+        try_config(name, trials, sf, sw)
         print(f"    ({time.time() - t0:.1f}s)", flush=True)

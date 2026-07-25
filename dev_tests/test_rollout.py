@@ -17,7 +17,8 @@ from ir import (Sym, Alu, VecElem, VecFma, VBroadcast, Const, VStore, VSelect,
                 DebugVCompare, Gather)
 from regalloc import (tag_raw_chains, build_dag, RegisterAllocator,
                       schedule as greedy_schedule)
-from rollout import schedule_rollout, ScoreWeights, _features, _score
+from rollout import (schedule_rollout, ScoreWeights, _features, _score,
+                     make_random_order)
 from scheduler import Weights
 
 W = Weights(sink=-1, load=5, raw=1, war=1, rigid=1, idx=-4)
@@ -65,7 +66,7 @@ class TestGreedyEquivalence(unittest.TestCase):
                                    weights=W, allocator=alloc1)
         dag.reset()
         alloc2 = RegisterAllocator(rc)
-        b_roll = schedule_rollout(dag, rc, seed=42, trials=1, greedy_trials=1,
+        b_roll = schedule_rollout(dag, rc, seed=42, trials=1,
                                   weights=W, allocator=alloc2)
         self.assertEqual(b_greedy, b_roll)
 
@@ -75,15 +76,19 @@ class TestDeterminism(unittest.TestCase):
         results = []
         for _ in range(2):
             _, rc, dag = _tagged_dag()
-            b = schedule_rollout(dag, rc, seed=42, trials=4, greedy_trials=1,
+            b = schedule_rollout(dag, rc, seed=42, trials=4,
                                  weights=W, allocator=RegisterAllocator(rc))
             results.append(b)
         self.assertEqual(results[0], results[1])
 
-    def test_different_seed_may_differ_but_completes(self):
+    def test_pure_random_sort_funcs_complete(self):
+        """An explicit sort_funcs trial set is honoured: 4 pure shuffles."""
+        import random as _r
         _, rc, dag = _tagged_dag()
-        b = schedule_rollout(dag, rc, seed=7, trials=4, greedy_trials=0,
-                             weights=W, allocator=RegisterAllocator(rc))
+        b = schedule_rollout(
+            dag, rc, seed=7,
+            sort_funcs=[make_random_order(_r.Random(7)) for _ in range(4)],
+            weights=W, allocator=RegisterAllocator(rc))
         self.assertTrue(any(b for b in b if b))   # some non-empty bundle
 
 
@@ -94,7 +99,7 @@ class TestAllocatorHygiene(unittest.TestCase):
     def test_no_leaks_or_pool_corruption(self):
         _, rc, dag = _tagged_dag()
         alloc = RegisterAllocator(rc)
-        schedule_rollout(dag, rc, seed=42, trials=6, greedy_trials=1,
+        schedule_rollout(dag, rc, seed=42, trials=6,
                          weights=W, allocator=alloc)
         for pool in (alloc.free_vec, alloc.free_scalar):
             self.assertEqual(len(pool), len(set(pool)))
@@ -118,7 +123,7 @@ class TestDeadlock(unittest.TestCase):
             rc[pad] = 1
             alloc.write(pad)
         with self.assertRaises(RuntimeError):
-            schedule_rollout(dag, rc, seed=42, trials=3, greedy_trials=1,
+            schedule_rollout(dag, rc, seed=42, trials=3,
                              weights=W, allocator=alloc)
 
 

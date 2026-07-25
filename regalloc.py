@@ -362,10 +362,11 @@ def schedule(dag: DAG, read_count, *, seed: int | None = None,
     rng = random.Random(seed)
     if allocator is None:
         allocator = RegisterAllocator(read_count)
-    placements = [_classify(n) for n in dag.nodes]
+    for n in dag.nodes:
+        _classify(n)
     if cap is None:
         cap = len(dag) + 1
-    key_fn = _make_picker(picker, placements, rng, dag.props, weights)
+    key_fn = _make_picker(picker, rng, weights)
 
     # Register-freeing priority: a node that is the LAST reader of a tag
     # frees that tag's register when it commits. ALWAYS prefer such nodes
@@ -382,7 +383,7 @@ def schedule(dag: DAG, read_count, *, seed: int | None = None,
         return n
 
     def pressured_key(idx):
-        base = key_fn(idx)
+        base = key_fn(dag[idx])
         b0 = base[0] if isinstance(base, tuple) else base
         return b0 - freeing_read(idx) * 1000
 
@@ -407,7 +408,7 @@ def schedule(dag: DAG, read_count, *, seed: int | None = None,
         while working:
             _, idx = heapq.heappop(working)
             node = dag[idx]
-            p = placements[idx]
+            p = node.placement
             if p.kind == _KIND_DEBUG:
                 # Debug nodes write nothing but DO read a tag (their loc):
                 # resolve it and consume the read (free at 0) like any reader.
