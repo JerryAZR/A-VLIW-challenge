@@ -53,7 +53,8 @@ REGALLOC_WEIGHTS = Weights(sink=-1, load=5, raw=1, war=1, rigid=1, idx=-4,
 # freeing bias) or "rollout" (rollout.schedule_rollout: per-cycle
 # trial-and-score search over placement orderings).
 SCHEDULER_MODE = "rollout"
-ROLLOUT_TRIALS = 6           # sizes the default trial set ([greedy] + [random]*(N-1))
+ROLLOUT_TRIALS = 1           # K=1: priority fn only (1291 cyc, 5x faster);
+                             # raise K after other parts are fully optimized
 ROLLOUT_SORT_FUNCS = None    # explicit trial set override; None -> default
 ROLLOUT_SEED = 42
 ROLLOUT_SCORE_WEIGHTS = None  # None -> rollout.ScoreWeights() defaults
@@ -508,59 +509,26 @@ class KernelBuilder:
         self._emit_regalloc(prologue, body, prune)
 
         # =====================================================================
-        # Epilogue: the val[256] vstores now overlap the body tail (each group's
-        # vstore fires from the body once its round-15 val is ready, using the
-        # per-group out_addr). Nothing left here but the final pause.
+        # Epilogue: the val[256] vstores overlap the body tail (each group's
+        # vstore fires from the body once its round-15 val is ready, using
+        # the per-group out_addr). The two oracle pauses are injected into
+        # existing bundles' flow slots by _insert_pauses (0 cycles at
+        # grading, where enable_pause=False).
         # =====================================================================
-
-        # Pause 2 -- match reference_kernel2's final yield (final mem).
-        # Must come AFTER the body so machine.mem holds the final values
-        # when the test recommends execution on i=1 (final yield).
-        self.add_pause()
 
     def _emit_regalloc(self, prologue, body, prune):
         """Two-phase register-allocation path (regalloc.py): SSA tag chains +
-        RAW-only DAG + schedule-time allocation.
-
-        Prologue emits linearly, allocating const/carried registers via the
-        shared allocator; the body schedules on a RAW-only DAG continuing
-        from that register state. const_vec_0 stays pinned at address 0.
+        RAW-only DAG + schedule-time allocation, over ONE merged DAG of
+        prologue + body (the scheduler interleaves setup work - consts,
+        broadcasts, val/tree vloads - with early body compute instead of a
+        serial one-slot-per-bundle prologue). const_vec_0 stays pinned at
+        address 0.
         """
         from regalloc import (tag_raw_chains, build_dag,
                               schedule as reg_schedule, RegisterAllocator)
-        from ir import Reg
         tagged, read_count = tag_raw_chains(prologue + body,
                                             pinned={"const_vec_0"})
-        n_pro = len(prologue)
-        tagged_pro, tagged_body = tagged[:n_pro], tagged[n_pro:]
-
-        # Prologue: emit linearly (one slot per bundle), allocating each
-        # write's register and committing each read (free at 0) via the
-        # shared allocator in program order.
-        allocator = RegisterAllocator(read_count)
-        self.allocator = allocator
-        for instr in tagged_pro:
-            wr_bases = [(op.vec if hasattr(op, "vec") else op)
-                        for op in instr.write_operands()]
-            for b in wr_bases:
-                if b.name != "const_vec_0":
-                    allocator.write(b)
-            rd = [Reg(allocator.addr_of(o), getattr(o, "is_vec", False))
-                  for o in instr.read_operands()]
-            wr = [Reg(allocator.addr_of(o), getattr(o, "is_vec", False))
-                  for o in instr.write_operands()]
-            r = instr.rebuild(rd, wr)
-            self.instrs.append({r.engine: [r.tagged_lower()]})
-            # Commit reads: free a register when its last read has landed.
-            for op in instr.read_operands():
-                b = op.vec if hasattr(op, "vec") else op
-                if b in allocator.assigned:
-                    allocator.read(b)
-        # Pause 1 -- match reference_kernel2's first yield (initial mem).
-        self.add_pause()
-
-        # Body: RAW-only DAG + allocating schedule, continuing the allocator.
-        dag = build_dag(tagged_body, pinned={"const_vec_0"})
+        dag = build_dag(tagged, pinned={"const_vec_0"})
         if prune:
             # Drop debug/dead nodes, then recompute read counts over the
             # survivors so registers free when their last surviving reader
@@ -570,6 +538,8 @@ class KernelBuilder:
             dag = prune_to_stores(dag)
             read_count = recompute_read_count(
                 [n.instr for n in dag.nodes], pinned={"const_vec_0"})
+        allocator = RegisterAllocator(read_count)
+        self.allocator = allocator
         if SCHEDULER_MODE == "rollout":
             from rollout import schedule_rollout
             body_instrs = schedule_rollout(
@@ -582,10 +552,33 @@ class KernelBuilder:
                                        weights=REGALLOC_WEIGHTS,
                                        allocator=allocator)
         self.instrs.extend(body_instrs)
+        self._insert_pauses()
         # Kept for dev tools (_validate.py): the scheduled body's RAW-only
         # DAG and the tagged body instructions (map rid -> instruction).
         self.body_dag = dag
         self.resolved_body = [n.instr for n in dag.nodes]
+
+    def _insert_pauses(self):
+        """The two oracle barriers (dev-only; 0 extra cycles at grading where
+        enable_pause=False and they ride existing bundles' flow slots):
+
+          pause 1 - initial-mem barrier for _check.py's first run(): injected
+            into the first store-free bundle with a free flow slot (the
+            merged schedule puts all stores in the tail, so this is bundle 0
+            in practice).
+          pause 2 - final-mem barrier: appended to the last bundle's flow
+            slot, or emitted as its own bundle if that slot is taken.
+        """
+        for b in self.instrs:
+            assert "store" not in b, "store scheduled before pause 1"
+            if len(b.get("flow", [])) < 1:    # SLOT_LIMITS["flow"] == 1
+                b.setdefault("flow", []).append(Pause().lower())
+                break
+        last = self.instrs[-1]
+        if len(last.get("flow", [])) < 1:
+            last.setdefault("flow", []).append(Pause().lower())
+        else:
+            self.instrs.append({Pause().engine: [Pause().lower()]})
 
 BASELINE = 147734
 
