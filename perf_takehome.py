@@ -77,7 +77,7 @@ COMPUTED_CONSTS = {1, 2, 3, 9, 16, 19, 33, 4097}
 # With more scratch space, or once a pressure-aware scheduler can fit the
 # retained version, set this False to drop the recompute and use pure retention
 # (validated correct via _check_big.py: 1363 cyc retention vs 1389 recompute).
-RECOMPUTE_PATH_BITS = True
+RECOMPUTE_PATH_BITS = False
 
 
 class KernelBuilder:
