@@ -892,6 +892,30 @@ Commit `4ae89db`. Three changes:
 1 174 -> **1 119** (-55). Passes correctness (8 seeds) and **all nine**
 tiers (244 cyc clear).
 
+---
+
+## Step 25 - dynamic scalar/vector allocation   1 117 cyc   132.2×
+
+Commit `3d6876c`. The static 48-word scalar reserve is gone: ONE vector
+free list covers all of scratch as 8-aligned granules; the scalar engine
+claims a granule and splits it into 8 free words on demand, and fully-free
+granules are reclaimed at CYCLE END (`collect_scalar_garbage`, called by
+both schedulers after commit - outside the trial/checkpoint window, so
+reclaim needs NO undo support; the entire "Rc" undo family was avoided by
+deferral, per the user's simplification). Undo stays self-contained:
+claim reversal only when all sibling words are still free
+(`_granule_free == VLEN-1`), else plain word return.
+
+Profile findings: scalar usage is flat ~30-32 words everywhere (peaks
+don't coincide with the vec peak, but ~5 granules are always pinned);
+allocation already consolidates to the 5-granule minimum for 33 words (no
+pinning pathology); effective pressure peak 190/191 granules. Net gain
+over the static reserve: +1 vec granule (peak 186 vs 185 saturated).
+
+Shipped with re-tuned weights (freeing 5.3 -> 4.3, retuned under the new
+allocator): 1 119 -> **1 117** (-2). Passes correctness (8 seeds) and
+**all nine** tiers (246 cyc clear).
+
 Dev tooling: `sweep_rollout.py` (weight/K sweep), `diag_deadlock.py`
 (live-tag autopsy at the wall), `diag_liveness.py` (committed-liveness
 profile; peak 220 at big scratch = scheduler artifact, not a capacity
