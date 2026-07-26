@@ -385,7 +385,8 @@ def schedule(dag: DAG, read_count, *, seed: int | None = None,
     def pressured_key(idx):
         base = key_fn(dag[idx])
         b0 = base[0] if isinstance(base, tuple) else base
-        return b0 - freeing_read(idx) * 1000
+        fw = weights.freeing if weights is not None else 1000.0
+        return b0 - freeing_read(idx) * fw
 
     active_key = prio(allocator, key_fn, freeing_read) if prio else pressured_key
 

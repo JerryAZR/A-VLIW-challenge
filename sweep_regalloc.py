@@ -180,7 +180,7 @@ t0 = time.time()
 n = 0
 print(f"\n=== random Weights search (always-free w1000), budget {budget:.0f}s ===")
 while time.time() - t0 < budget:
-    w = Weights(*(rng.choice(VALUES) for _ in range(6)))
+    w = Weights(*(rng.choice(VALUES) for _ in range(5)))
     try:
         cycles, stalls = body_cycles(mk_weighted_base(w, 1000))
     except RuntimeError:
@@ -189,8 +189,8 @@ while time.time() - t0 < budget:
     if best is None or cycles < best[0]:
         best = (cycles, w, stalls)
         print(f"  [{time.time()-t0:5.1f}s] #{n}: NEW BEST {cycles} cyc  "
-              f"sink={w.sink} load={w.load} raw={w.raw} war={w.war} "
-              f"rigid={w.rigid} idx={w.idx}  (stalls {stalls})")
+              f"sink={w.sink} load={w.load} raw={w.raw} "
+              f"rigid={w.rigid} group={w.group}  (stalls {stalls})")
 print(f"\n{n} samples; best body={best[0]} total={best[0]+PROLOGUE_EPI}")
 print(f"  weights: {best[1]}")
 

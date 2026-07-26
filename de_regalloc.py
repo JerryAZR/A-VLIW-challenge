@@ -63,7 +63,7 @@ def body_cycles(weights, free_w=1000):
 
 
 def vec(w):
-    return [w.sink, w.load, w.raw, w.war, w.rigid, w.idx]
+    return [w.sink, w.load, w.raw, w.rigid, w.group]
 
 
 def to_weights(v):
@@ -80,8 +80,8 @@ CR = 0.8    # crossover prob
 BOUNDS = (-6, 6)
 
 # Init population around the known best + random.
-seed_best = vec(Weights(sink=-1, load=5, raw=1, war=1, rigid=1, idx=-4))
-pop = [seed_best] + [[rng.uniform(*BOUNDS) for _ in range(6)] for _ in range(POP - 1)]
+seed_best = vec(Weights(sink=-1, load=5, raw=1, rigid=1, group=-4))
+pop = [seed_best] + [[rng.uniform(*BOUNDS) for _ in range(5)] for _ in range(POP - 1)]
 scores = []
 for v in pop:
     c, _ = body_cycles(to_weights(v))

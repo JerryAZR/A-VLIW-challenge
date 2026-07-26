@@ -24,7 +24,7 @@ from scheduler import (Weights, DNode, DAG, FuncUnitPool, _classify,
                        _KIND_VEC_ELEM, _KIND_VEC_FMA)
 from problem import VLEN
 
-W = Weights(sink=-1, load=5, raw=1, war=1, rigid=1, idx=-4)
+W = Weights(sink=-1, load=5, raw=1, rigid=1, group=-4)
 
 
 def _synthetic():
@@ -246,8 +246,8 @@ class TestInterpGreedy(unittest.TestCase):
             from scheduler import _classify
             _classify(n)
         alloc = RegisterAllocator(rc)
-        w1 = Weights(sink=10, load=0, raw=0, war=0, rigid=0, idx=0)
-        w2 = Weights(sink=0, load=0, raw=0, war=0, rigid=0, idx=-10)
+        w1 = Weights(sink=10, load=0, raw=0, rigid=0, group=0)
+        w2 = Weights(sink=0, load=0, raw=0, rigid=0, group=-10)
         ready = [dag.nodes[i] for i in sorted(dag.ready())]
         interp = make_interp_greedy(w1, w2)
         greedy1 = make_weighted_greedy(w1)

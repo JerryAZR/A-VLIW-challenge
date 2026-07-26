@@ -96,7 +96,7 @@ def make_weighted_greedy(weights: Weights) -> SortFunc:
 
     def order(ready: list, ctx: SortCtx) -> list:
         def pressured_key(node):
-            return key_fn(node) - _freeing_read(ctx.allocator, node) * 1000
+            return key_fn(node) - _freeing_read(ctx.allocator, node) * weights.freeing
         return sorted(ready, key=pressured_key)
     return order
 
@@ -112,9 +112,10 @@ def make_interp_greedy(w1: Weights, w2: Weights) -> SortFunc:
 
     def order(ready: list, ctx: SortCtx) -> list:
         t = ctx.progress
+        fw = t * w1.freeing + (1 - t) * w2.freeing
         def key(node):
             return (t * k1(node) + (1 - t) * k2(node)
-                    - _freeing_read(ctx.allocator, node) * 1000)
+                    - _freeing_read(ctx.allocator, node) * fw)
         return sorted(ready, key=key)
     return order
 

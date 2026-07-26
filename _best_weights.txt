@@ -1,1 +1,2 @@
-Weights(sink=4, load=-0.25, raw=-1, war=6, rigid=0.75, idx=1.5)
+Weights(sink=6.8, load=7.1, raw=8.0, rigid=7.7, group=-3.6, freeing=5.3)
+# 1119 cyc, K=1, train_weights.py random+finetune (trimmed space: no war/idx)

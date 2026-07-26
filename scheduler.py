@@ -49,7 +49,7 @@ NO_LOAD = 10**6
 
 class NodeProps(NamedTuple):
     """Static per-node scheduling properties, normalized to 0..1.
-    Higher = more urgent for sink/raw/war/idx; for load LOWER = more urgent
+    Higher = more urgent for sink/raw; for load LOWER = more urgent
     (0 = this node is a load; 1 = no downstream load). group is the
     DAG-derived sink group id (0 = ungrouped; 1..N normalized by N): each
     store sink anchors a group (sinks sorted by depth), and every node
@@ -57,27 +57,30 @@ class NodeProps(NamedTuple):
     sink: float   # dist_to_sink / max  (longest RAW=1/WAR=0 path to a sink)
     load: float   # dist_to_load / max  (cycle-distance to nearest downstream load)
     raw: float    # #RAW dependents / max  (unblocked next cycle)
-    war: float    # #WAR dependents / max  (unblocked same cycle)
-    idx: float    # program order / total  (locality / determinism)
     group: float  # sink group id / N  (0 = ungrouped, e.g. debug nodes)
 
 
 class Weights(NamedTuple):
-    """Multiplier for each NodeProps term in the weighted picker's score
-    (score = sink*props.sink - load*props.load + raw*props.raw
-             + war*props.war + rigid*is_rigid_now + idx*props.idx
-             + group*props.group;
-    higher = scheduled first). load is subtracted because low dist_to_load =
-    urgent. group defaults to 0 (unused); negative = earlier groups first
-    (finish a group's chain before opening the next - a serialization /
-    register-pressure dial)."""
+    """Multiplier for each score term in the weighted picker:
+    score = sink*props.sink - load*props.load + raw*props.raw
+            + rigid*is_rigid_now + group*props.group
+            + freeing*freeing_read_now;
+    higher = scheduled first. load is subtracted because low dist_to_load =
+    urgent. group: negative = earlier groups first (finish a group's chain
+    before opening the next - a serialization / register-pressure dial).
+    rigid/freeing are DYNAMIC (read at key time): rigid = not a fresh
+    un-spilled vec_elem; freeing = #registers the commit frees now (reads
+    with 1 remaining). freeing defaults to 1000 (hard lexicographic tier -
+    any freeing node outranks everything); bring it to ~unit scale to make
+    it a soft term.
+    (war and idx were removed: war edges don't exist on the RAW-only DAG,
+    and program-order idx was pure noise once group carried the ordering.)"""
     sink: float
     load: float
     raw: float
-    war: float
     rigid: float
-    idx: float
-    group: float = 0.0
+    group: float
+    freeing: float = 1000.0
 
 # Flow ops that modify the PC - the DAG cannot represent control flow.
 # The only such op in the IR is Pause (prologue/epilogue barrier); hitting
@@ -331,7 +334,6 @@ class DAG:
         """
         n = len(self.nodes)
         n_raw = [sum(1 for _, w in node.out_edges if w == 1) for node in self.nodes]
-        n_war = [sum(1 for _, w in node.out_edges if w == 0) for node in self.nodes]
         dist_to_sink = [0] * n
         dist_to_load = [NO_LOAD] * n
         for node in reversed(self.nodes):
@@ -382,12 +384,9 @@ class DAG:
         max_sink = max(dist_to_sink) or 1
         max_load = max((d for d in dist_to_load if d != NO_LOAD), default=1) or 1
         max_raw = max(n_raw) or 1
-        max_war = max(n_war) or 1
         return [NodeProps(dist_to_sink[i] / max_sink,
                           1.0 if dist_to_load[i] == NO_LOAD else dist_to_load[i] / max_load,
                           n_raw[i] / max_raw,
-                          n_war[i] / max_war,
-                          i / (n - 1) if n > 1 else 0.0,
                           best_sink_of[i][1] / n_groups if n_groups else 0.0)
                 for i in range(n)]
 
@@ -731,21 +730,19 @@ def _make_picker(picker: str, rng: random.Random | None = None,
             return (_KIND_PRIORITY.get(n.placement.kind, 9), n.idx)
         return _key
     if picker == "weighted":
-        # score = sink*sink - load*load + raw*raw + war*war + rigid*is_rigid_now
-        #         + idx*idx;
-        # higher = scheduled first (max-heap via negation). is_rigid_now is
-        # mutable placement state: a node is rigid unless it's a fresh
-        # (un-spilled) vec_elem. Read at key time, so partial vec_elem
-        # (lanes_done>0 -> sticky alu) reads as rigid.
+        # score = sink*sink - load*load + raw*raw + rigid*is_rigid_now
+        #         + group*group; higher = scheduled first (max-heap via
+        # negation). is_rigid_now is mutable placement state: a node is
+        # rigid unless it's a fresh (un-spilled) vec_elem. Read at key time,
+        # so partial vec_elem (lanes_done>0 -> sticky alu) reads as rigid.
         w = weights
         def _key(n):
             p = n.props
             pl = n.placement
             rigid = (pl.kind != _KIND_VEC_ELEM) or (pl.lanes_done > 0)
             score = (w.sink * p.sink - w.load * p.load
-                     + w.raw * p.raw + w.war * p.war
+                     + w.raw * p.raw
                      + w.rigid * (1 if rigid else 0)
-                     + w.idx * p.idx
                      + w.group * p.group)
             return -score
         return _key
