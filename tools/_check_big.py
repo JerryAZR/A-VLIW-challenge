@@ -10,7 +10,7 @@ pressure.
 
 NOT a grading harness - SCRATCH_SIZE is frozen by problem.py. Validation only.
 
-    python _check_big.py [scratch_size]   # default 4096
+    python -m tools._check_big [scratch_size]   # default 4096
 """
 import random
 import sys

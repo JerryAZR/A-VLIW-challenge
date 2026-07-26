@@ -447,11 +447,11 @@ getting to 1,110.
 
 ```
 python tests/submission_tests.py   # 1,110 cycles, all tiers, 8 seeds
-python _check.py                   # per-round correctness oracle
-python analyze_slots.py --show     # per-cycle engine utilization
+python -m tools._check             # per-round correctness oracle
+python -m tools.analyze_slots --show   # per-cycle engine utilization
 ```
 
 The trained constants ship in `perf_takehome.py`
 (`INTERP_W_EARLY`/`INTERP_W_LATE`); the training harness is
-`train_weights.py`; per-step history with mechanisms and PMU tables is
+`tools/train_weights.py`; per-step history with mechanisms and PMU tables is
 `notes/optimization_log.md`.

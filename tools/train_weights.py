@@ -3,10 +3,10 @@ war/idx). Two independent phases, each with its own TIME BUDGET and
 external result file; phases chain through files so any phase can be
 restarted without rerunning the others:
 
-    python train_weights.py random   600  --mode single
-    python train_weights.py finetune 1200 --mode single
-    python train_weights.py random   600  --mode interp
-    python train_weights.py finetune 1200 --mode interp
+    python -m tools.train_weights random   600  --mode single
+    python -m tools.train_weights finetune 1200 --mode single
+    python -m tools.train_weights random   600  --mode interp
+    python -m tools.train_weights finetune 1200 --mode interp
 
   random    - sign-free joint random search until the budget is exhausted;
               every completing config is checkpointed to --out (rewritten
@@ -299,12 +299,12 @@ def main():
     args = ap.parse_args()
 
     if args.phase == "random":
-        out = args.out or f"_weights_found_{args.mode}.json"
+        out = args.out or f"weights/_weights_found_{args.mode}.json"
         phase_random(args.budget, out, args.seed, args.mode,
                      args.workers)
     else:
-        infile = args.infile or f"_weights_found_{args.mode}.json"
-        out = args.out or f"_weights_refined_{args.mode}.json"
+        infile = args.infile or f"weights/_weights_found_{args.mode}.json"
+        out = args.out or f"weights/_weights_refined_{args.mode}.json"
         phase_finetune(args.budget, infile, out, args.top, args.mode,
                        args.workers)
 

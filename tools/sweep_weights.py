@@ -1,7 +1,7 @@
 """Sign-free joint random search over the trimmed Weights space (no war, no
 idx). No sign assumptions: every dim sampled uniformly from [-LO, LO].
 
-    python sweep_weights.py [n_samples] [bound]
+    python -m tools.sweep_weights [n_samples] [bound]
 """
 
 import random

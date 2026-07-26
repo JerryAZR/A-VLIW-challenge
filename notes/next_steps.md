@@ -48,12 +48,12 @@ small); one-step scheduling search cannot recover it.
 3. **Round-15 feed wall**: only structural fixes apply - spread arrivals
    (needs a delay/hold DOF the scheduler lacks; valu is too full for
    idling to be cheap) or reduce gather cost (no ISA scatter/gather).
-4. **Fine polish continues**: `_weights_refined_l0i3.json` winner is one
+4. **Fine polish continues**: `weights/_weights_refined_l0i3.json` winner is one
    +0.25 fine step deep; more finetune budget may find 1-3 cyc.
 
 ## Tools
 
-- `train_weights.py` v2: parallel trainer (multiprocessing pool, default
+- `tools/train_weights.py` v2: parallel trainer (multiprocessing pool, default
   min(28, cpu-4) workers, ~15 evals/s). Search space: raw dropped (inert),
   sign-biased per-prop bounds, interp as base+tilt, two-stage finetune
   deltas. Phases: `random <budget> --mode single|interp`,
@@ -65,10 +65,10 @@ small); one-step scheduling search cannot recover it.
   (valu/load/alu/flow) as separate subplots, each scaled to its own capacity.
   Two views: per-cycle bars (shows the alternating gather/compute pattern)
   and 10-cycle rolling average (shows macro phase trends). Usage:
-  `python analyze_slots.py [--show] [--picker fma_first|idx|random]`.
+  `python -m tools.analyze_slots [--show] [--picker fma_first|idx|random]`.
 - `pmu.py`: `InstrumentedMachine` subclasses the frozen simulator to count
   slot fires / op breakdowns / per-cycle histograms without touching it.
-  Run: `python pmu.py`.
+  Run: `python -m tools.pmu`.
 
 ## Roofline reminders
 

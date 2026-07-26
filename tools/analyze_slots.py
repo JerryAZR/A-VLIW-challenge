@@ -6,9 +6,9 @@ matplotlib chart showing per-cycle slot usage by engine type as separate
 subplots (one per engine) so nothing overlaps.
 
 Usage:
-    python analyze_slots.py                 # default: saves slots.png
-    python analyze_slots.py --show          # interactive window
-    python analyze_slots.py --picker idx    # try different picker
+    python -m tools.analyze_slots                 # default: saves slots.png
+    python -m tools.analyze_slots --show          # interactive window
+    python -m tools.analyze_slots --picker idx    # try different picker
 """
 
 import argparse
