@@ -845,6 +845,25 @@ group priority meters it without effort. 1 190 -> **1 179** (-11).
 
 Passes correctness (8 seeds) and **all nine** tiers (184 cyc clear).
 
+---
+
+## Step 23 - valu->alu swap for rigid fma   1 174 cyc   125.8×
+
+Commit `292e6bb`. Placement-engine swap (proposed in discussion): when a
+vec_fma finds the valu unit full, the pool evicts one valu-placed vec_elem
+(LIFO) down to the alu (1 valu slot <-> 8 alu lane slots), if the alu can
+take ALL VLEN lanes. Key insight (user's): this is a pure slot-MAPPING
+change - the evicted node stays complete in the same cycle (same pre-cycle
+reads, same end-of-cycle writes whichever engine realises it), so no
+commit/register state is touched and the trials/rollback machinery is
+unaffected. Implemented inside `FuncUnitPool.place` (records valu-placed
+elems per cycle for LIFO eviction); both scheduler paths benefit, zero
+caller changes. 478 fma stalls were measured at step 22's schedule.
+
+1 179 -> **1 174** (-5). 19 unit tests (3 new pool-swap tests).
+
+Passes correctness (8 seeds) and **all nine** tiers (189 cyc clear).
+
 Dev tooling: `sweep_rollout.py` (weight/K sweep), `diag_deadlock.py`
 (live-tag autopsy at the wall), `diag_liveness.py` (committed-liveness
 profile; peak 220 at big scratch = scheduler artifact, not a capacity
