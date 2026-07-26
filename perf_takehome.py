@@ -184,8 +184,8 @@ class KernelBuilder:
             Stored as 32 VLEN=8 vectors.
           - addr[256] : per-lane tree ADDRESS (idx + forest_p); the gather
             reads it directly. Carried across rounds.
-          - parity[256] : per-lane (val & 1), persists across the round
-            boundary to drive the next round's level-1/2 select.
+          - path[256]  : per-lane descent bit (val & 1), persists across
+            the round boundary to drive the next round's level-1/2 select.
           - t1/t2/nv : short-lived loop-body temps (hash stage scratch, addr
             base, node_val landing) as SSA tags; the allocator re-homes them
             per write so groups never alias.
@@ -197,8 +197,9 @@ class KernelBuilder:
         one Gather op reads the per-lane addr vector and is decomposed by the
         scheduler into 8 scalar loads landing in the nv plane.
 
-        Branchless addr update: parity = val & 1; base = 2*addr + neg_fp1
-        (valu fma); next_addr = base + parity (valu `+`). Bit-exact with the
+        Branchless addr update: path = val & 1 (the descent bit); base =
+        2*addr + neg_fp1 (valu fma); next_addr = base + path (valu `+`).
+        Bit-exact with the
         reference's `2*idx + (1 if even else 2)` in idx terms.
 
         Wrap is a build-time-known per-round decision (verified uniform wrap
@@ -238,7 +239,8 @@ class KernelBuilder:
         # are versioned temporaries.
         #
         # Per-lane SoA state as 32 group-vector symbols each: val[g] /
-        # addr[g] / parity[g] are lanes 8g..8g+7 of a logical plane.
+        # addr[g] (and the path[g][l] level bits) are lanes 8g..8g+7 of a
+        # logical plane.
         val  = [Sym(f"val[{g}]",  True) for g in range(n_groups)]  # running hash + carried state
         addr = [Sym(f"addr[{g}]", True) for g in range(n_groups)]  # tree ADDRESS = idx + forest_p (stored, not idx)
         # Local temporaries: ONE shared tag each across all groups (loop-body
@@ -250,7 +252,7 @@ class KernelBuilder:
         t2 = Sym("t2", True)   # hash stage scratch + addr-update base
         t3 = Sym("t3", True)   # select tree intermediate (level 3)
         nv = Sym("nv", True)   # node_val landing / gather pad
-        # Parity (hash & 1) doubles as the descent path bit: path[g][l] holds
+        # The path bit (hash & 1 = descent direction): path[g][l] holds
         # the bit computed at level l of a descent (rounds 0-9 / 11-15 map to
         # levels 0-9 / 0-4). Levels 0-2 stay live until the level-3 select
         # (rounds 3/14); levels 3+ are read only by their own round's addr
@@ -283,7 +285,7 @@ class KernelBuilder:
         # VAR vectors: runtime values (forest_p = header broadcast; tree_preload
         # = non-uniform vload of tree[0..7]; tree0..6 = its lane broadcasts).
         forest_p_vec = Sym("forest_p_vec", True)
-        neg_fp1_vec  = Sym("neg_fp1_vec", True)  # 1 - forest_p (next-addr: 2*addr + neg_fp1 + parity)
+        neg_fp1_vec  = Sym("neg_fp1_vec", True)  # 1 - forest_p (next-addr: 2*addr + neg_fp1 + path)
         pos_fp5_vec  = Sym("pos_fp5_vec", True)  # 5 + forest_p (level-2 select)
         pos_fp7_vec  = Sym("pos_fp7_vec", True)  # 7 + forest_p (level-3 path recompute)
         tree_preload = Sym("tree_preload", True)  # 8 words: tree[0..7]
@@ -462,7 +464,7 @@ class KernelBuilder:
                 val_vec  = val[g]
                 addr_vec = addr[g]
                 path_g   = path[g]      # per-level path bits; path_g[level] is
-                                        # this round's parity destination
+                                        # this round's path-bit destination
                 # t1 / t2 / nv : the shared loop-body local tags
                 base_i   = g * VLEN
                 keyval  = [(r, base_i + j, "val") for j in range(VLEN)]
@@ -544,9 +546,9 @@ class KernelBuilder:
                 # --- post-hash: addr update or wrap (branchless, on valu) ---
                 # --- post-hash: addr update (store addr = idx + forest_p, not
                 # idx; gather reads addr directly). next_addr = 2*addr +
-                # (1-forest_p) + parity = 2*addr + neg_fp1 + parity. Wrap sets
+                # (1-forest_p) + path = 2*addr + neg_fp1 + path. Wrap sets
                 # addr = forest_p. Round 0 (idx=0 initial) computes next_addr
-                # = forest_p+1+parity = (2-neg_fp1)+parity without reading addr
+                # = forest_p+1+path = (2-neg_fp1)+path without reading addr
                 # (addr plane is not yet valid). ---
                 if is_wrap:
                     # idx -> 0, so addr = forest_p = 1 - neg_fp1.
@@ -558,7 +560,7 @@ class KernelBuilder:
                     pdest = path_g[level]
                     body.append(VecElem("&", pdest, val_vec, const_vec_1))
                     if r == 0:
-                        # idx=0: next_addr = forest_p + 1 + parity = (2 - neg_fp1) + parity
+                        # idx=0: next_addr = forest_p + 1 + path = (2 - neg_fp1) + path
                         body.append(VecElem("-", t2, const_vec_2, neg_fp1_vec))  # 2 - neg_fp1
                     else:
                         # next_addr base = 2*addr + neg_fp1
