@@ -197,12 +197,14 @@ class RegisterAllocator:
         # const_vec_0 occupies address 0 (granule 0); all other granules
         # (VLEN..SCRATCH_SIZE step VLEN) are the vector pool.
         self.free_vec = deque(range(VLEN, SCRATCH_SIZE, VLEN))
-        # Scalar engine: free words + per-granule bookkeeping for claimed
-        # (vector->scalar converted) granules.
-        self._scalar_words: deque[int] = deque()     # free scalar words
-        self._word_granule: dict[int, int] = {}      # word -> its granule base
-        self._granule_free: dict[int, int] = {}      # claimed granule -> #free words
-        self._claim_of: dict[int, int] = {}          # word allocated by a fresh claim -> granule
+        # Scalar engine: per-granule free-word lists for claimed
+        # (vector->scalar converted) granules. Allocation is BEST-FIT
+        # (fullest partial granule first) so near-empty granules drain and
+        # can be reclaimed - 2 scalars must not pin 2 vectors.
+        self._granule_words: dict[int, list[int]] = {}  # granule -> free words
+        self._granule_free: dict[int, int] = {}         # granule -> #free words
+        self._word_granule: dict[int, int] = {}         # word -> granule base
+        self._claim_of: dict[int, int] = {}             # word from a fresh claim -> granule
         # Pool sizes (for pressure features / normalization). The scalar
         # pool is elastic: its ceiling is the whole granule space in words.
         self.vec_pool_size = len(self.free_vec)
@@ -218,10 +220,19 @@ class RegisterAllocator:
         # Undo log for checkpoint()/rollback() (None = not recording).
         self._log: list | None = None
 
-    @property
-    def free_scalar(self):
-        """The scalar free list (words), as a read-only view."""
-        return self._scalar_words
+    def free_scalar_count(self) -> int:
+        """Total free scalar words across all claimed granules."""
+        return sum(self._granule_free.values())
+
+    def _best_fit_granule(self):
+        """The most-full claimed granule with a free word (ties: lowest
+        base, deterministic), or None if all are fully used."""
+        best = None
+        for g, c in self._granule_free.items():
+            if c > 0 and (best is None or c < self._granule_free[best]
+                          or (c == self._granule_free[best] and g < best)):
+                best = g
+        return best
 
     def can_write(self, tag: Sym) -> bool:
         """A register for ``tag`` is already assigned or one is available."""
@@ -229,7 +240,7 @@ class RegisterAllocator:
             return True
         if tag.is_vec:
             return len(self.free_vec) > 0
-        return len(self._scalar_words) > 0 or len(self.free_vec) > 0
+        return self._best_fit_granule() is not None or len(self.free_vec) > 0
 
     def write(self, tag: Sym) -> int:
         """Allocate (or return the sticky) register for ``tag``; returns addr."""
@@ -243,20 +254,20 @@ class RegisterAllocator:
                     f"{tag.name} ({len(self.assigned)} live)")
             addr = self.free_vec.popleft()
         else:
-            if not self._scalar_words:
-                # Scalar pool empty: claim a vector granule, split into words.
+            g = self._best_fit_granule()
+            if g is None:
+                # No partial granule: claim a vector granule, split it.
                 if not self.free_vec:
                     raise RuntimeError(
                         f"register exhaustion: no free scalar word for "
                         f"{tag.name} ({len(self.assigned)} live)")
                 g = self.free_vec.popleft()
+                self._granule_words[g] = list(range(g, g + VLEN))
                 for w in range(g, g + VLEN):
-                    self._scalar_words.append(w)
                     self._word_granule[w] = g
                 self._granule_free[g] = VLEN
                 claimed = True
-            addr = self._scalar_words.popleft()
-            g = self._word_granule[addr]
+            addr = self._granule_words[g].pop()
             self._granule_free[g] -= 1
             if claimed:
                 self._claim_of[addr] = g
@@ -303,16 +314,15 @@ class RegisterAllocator:
         g = self._word_granule[addr]
         if self._claim_of.get(addr) == g and self._granule_free[g] == VLEN - 1:
             del self._claim_of[addr]
-            for w in range(g + 1, g + VLEN):
-                self._scalar_words.remove(w)
+            for w in range(g, g + VLEN):
                 del self._word_granule[w]
-            del self._word_granule[g]
+            del self._granule_words[g]
             del self._granule_free[g]
             self.free_vec.appendleft(g)
             return "rev"
         self._claim_of.pop(addr, None)
+        self._granule_words[g].append(addr)
         self._granule_free[g] += 1
-        self._scalar_words.appendleft(addr)
         return "ret"
 
     def read(self, tag: Sym) -> None:
@@ -330,8 +340,8 @@ class RegisterAllocator:
                     self._log.append(("F", tag, addr))
             else:
                 g = self._word_granule[addr]
+                self._granule_words[g].append(addr)
                 self._granule_free[g] += 1
-                self._scalar_words.append(addr)
                 was_claim = self._claim_of.pop(addr, None) is not None
                 if self._log is not None:
                     self._log.append(("Fs", tag, addr, was_claim))
@@ -344,14 +354,10 @@ class RegisterAllocator:
         undo support."""
         reclaimable = [g for g, cnt in self._granule_free.items()
                        if cnt == VLEN]
-        if not reclaimable:
-            return
-        reclaim = set(reclaimable)
-        self._scalar_words = deque(
-            w for w in self._scalar_words if self._word_granule[w] not in reclaim)
         for g in reclaimable:
-            for w in range(g, g + VLEN):
+            for w in self._granule_words[g]:
                 del self._word_granule[w]
+            del self._granule_words[g]
             del self._granule_free[g]
             self.free_vec.append(g)
 
@@ -387,17 +393,18 @@ class RegisterAllocator:
                 del self.assigned[tag]
                 del self.remaining[tag]
                 if claimed:
+                    # Full claim reversal (reverse-order undo guarantees
+                    # the sibling words are all back in the free list).
                     g = self._claim_of.pop(addr)
-                    for w in range(g + 1, g + VLEN):
-                        self._scalar_words.remove(w)
+                    for w in range(g, g + VLEN):
                         del self._word_granule[w]
-                    del self._word_granule[g]
+                    del self._granule_words[g]
                     del self._granule_free[g]
                     self.free_vec.appendleft(g)
                 else:
                     g = self._word_granule[addr]
+                    self._granule_words[g].append(addr)
                     self._granule_free[g] += 1
-                    self._scalar_words.appendleft(addr)
                 self._restore_name(addr, old_name)
             elif kind == "R":                   # undo a consumed read
                 self.remaining[entry[1]] += 1
@@ -409,8 +416,8 @@ class RegisterAllocator:
             elif kind == "Fs":                  # undo a scalar free
                 _, tag, addr, was_claim = entry
                 g = self._word_granule[addr]
+                self._granule_words[g].remove(addr)
                 self._granule_free[g] -= 1
-                self._scalar_words.remove(addr)
                 if was_claim:
                     self._claim_of[addr] = g
                 self.assigned[tag] = addr
@@ -423,18 +430,18 @@ class RegisterAllocator:
                 if tag.is_vec:
                     self.free_vec.remove(addr)
                 elif path == "rev":
-                    g = addr            # a claim hands out the granule base
+                    g = addr - (addr % VLEN)    # granule base (8-aligned)
                     self._claim_of[addr] = g
                     self.free_vec.remove(g)
                     for w in range(g, g + VLEN):
-                        self._scalar_words.append(w)
                         self._word_granule[w] = g
+                    self._granule_words[g] = [w for w in range(g, g + VLEN)
+                                              if w != addr]
                     self._granule_free[g] = VLEN - 1
-                    self._scalar_words.remove(addr)
                 else:                   # "ret": plain word return was made
                     g = self._word_granule[addr]
+                    self._granule_words[g].remove(addr)
                     self._granule_free[g] -= 1
-                    self._scalar_words.remove(addr)
                     if was_claim:
                         self._claim_of[addr] = g
                 self.assigned[tag] = addr

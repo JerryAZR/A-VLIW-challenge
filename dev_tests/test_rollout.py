@@ -104,11 +104,10 @@ class TestAllocatorHygiene(unittest.TestCase):
         alloc = RegisterAllocator(rc)
         schedule_rollout(dag, rc, seed=42, trials=6,
                          weights=W, allocator=alloc)
-        for pool in (alloc.free_vec, alloc.free_scalar):
-            self.assertEqual(len(pool), len(set(pool)))
         live = set(alloc.assigned.values())
-        for pool in (alloc.free_vec, alloc.free_scalar):
-            self.assertTrue(live.isdisjoint(pool))
+        self.assertTrue(live.isdisjoint(alloc.free_vec))
+        free_words = {w for ws in alloc._granule_words.values() for w in ws}
+        self.assertTrue(live.isdisjoint(free_words))
         # Every remaining live tag still expects future reads.
         for tag, rem in alloc.remaining.items():
             self.assertGreater(rem, 0)

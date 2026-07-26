@@ -376,7 +376,7 @@ def schedule_rollout(dag, read_count, *, seed: int = 42, trials: int = 6,
                 f"rollout schedule: deadlock at C={C} - all {len(orders)} "
                 f"trials stuck ({len(ready)} ready nodes, none placeable; "
                 f"free_vec={len(allocator.free_vec)} "
-                f"free_scalar={len(allocator.free_scalar)})")
+                f"free_scalar={allocator.free_scalar_count()})")
 
         # Winner replay: same order, emission on, no logging (checkpoints
         # all rolled back to token 0, so the logs are closed).
