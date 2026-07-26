@@ -605,6 +605,16 @@ class FuncUnitPool:
             finished = pool.place(node, placement)  # yes / partial / no
             ...
             bundles.append(pool.bundle)           # cycle end - all placements
+
+    Swapping: when a rigid valu node (vec_fma) finds no free valu slot, the
+    pool may EVICT a vec_elem it previously placed on valu this cycle down
+    to the alu (1 valu slot <-> 8 alu lane slots), if the alu can take all
+    VLEN lanes. This is a pure slot-mapping change: the evicted node stays
+    complete in the same cycle (same pre-cycle reads, same end-of-cycle
+    writes, whichever engine realises it), so no commit state is touched.
+    Eviction is LIFO over this cycle's valu-placed vec_elems (recorded at
+    placement; deleting the last appended bundle entry keeps the recorded
+    indices of earlier entries valid).
     """
 
     # Per-engine slot budgets (refreshed by reset() each cycle).
@@ -613,12 +623,14 @@ class FuncUnitPool:
     def __init__(self):
         self.free: dict[str, int] = {}
         self.bundle: dict[str, list] = {}
+        self._valu_elems: list = []   # (node, p, bundle_idx) evictable elems
         self.reset()
 
     def reset(self) -> None:
         """Clear slot budgets and the bundle for a new cycle."""
         self.free = dict(self._CAPACITY)
         self.bundle = {}
+        self._valu_elems = []
 
     def place(self, node: DNode, p: _Placement, dry: bool = False) -> bool | None:
         """Try to place a single node this cycle.
@@ -646,6 +658,10 @@ class FuncUnitPool:
             if self.free["valu"] > 0:         # fresh: prefer one valu slot
                 if not dry:
                     self.bundle.setdefault("valu", []).append(node.instr)
+                    self._valu_elems.append(
+                        (node, p, len(self.bundle["valu"]) - 1))
+                else:
+                    self._valu_elems.append((node, p, -1))
                 self.free["valu"] -= 1
                 p.lanes_done = p.lanes_total
                 p.engine_choice = "valu"
@@ -655,12 +671,34 @@ class FuncUnitPool:
         # Atomic: alu / load / store / flow / vec_fma
         eng = p.native_engine
         if self.free[eng] == 0:
-            return None
+            # Rigid valu (vec_fma) with a full valu unit: swap a spillable
+            # vec_elem down to the alu to make room, if possible.
+            if eng == "valu" and self._swap_elem_to_alu(dry):
+                pass                          # a valu slot was freed
+            else:
+                return None
         if not dry:
             self.bundle.setdefault(eng, []).append(node.instr)
         self.free[eng] -= 1
         p.lanes_done = p.lanes_total
         p.engine_choice = eng
+        return True
+
+    def _swap_elem_to_alu(self, dry: bool) -> bool:
+        """Evict one valu-placed vec_elem (LIFO) down to the alu, freeing a
+        valu slot. Requires the alu to take ALL VLEN lanes (the node is
+        already complete; partial eviction would corrupt the caller's
+        commit). Slot-mapping only - no commit state is touched."""
+        if not self._valu_elems or self.free["alu"] < VLEN:
+            return False
+        node, p, slot_idx = self._valu_elems.pop()
+        p.engine_choice = "alu"                # still complete (lanes_done == VLEN)
+        self.free["valu"] += 1
+        self.free["alu"] -= VLEN
+        if not dry:
+            del self.bundle["valu"][slot_idx]
+            for s in _vec_instr_to_alu_lanes(node.instr, range(VLEN)):
+                self.bundle.setdefault("alu", []).append(s)
         return True
 
     def _spill_alu(self, node: DNode, p: _Placement, dry: bool = False) -> bool | None:

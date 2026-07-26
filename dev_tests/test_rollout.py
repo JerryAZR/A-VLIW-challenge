@@ -14,13 +14,15 @@ Run: python -m unittest dev_tests.test_rollout -v
 import unittest
 
 from ir import (Sym, Alu, VecElem, VecFma, VBroadcast, Const, VStore, VSelect,
-                DebugVCompare, Gather)
+                DebugVCompare, Gather, Reg)
 from regalloc import (tag_raw_chains, build_dag, RegisterAllocator,
                       schedule as greedy_schedule)
 from rollout import (schedule_rollout, ScoreWeights, SortCtx, _features,
                      _score, make_random_order, make_weighted_greedy,
                      make_interp_greedy)
-from scheduler import Weights, DNode, DAG
+from scheduler import (Weights, DNode, DAG, FuncUnitPool, _classify,
+                       _KIND_VEC_ELEM, _KIND_VEC_FMA)
+from problem import VLEN
 
 W = Weights(sink=-1, load=5, raw=1, war=1, rigid=1, idx=-4)
 
@@ -126,6 +128,69 @@ class TestDeadlock(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             schedule_rollout(dag, rc, seed=42, trials=3,
                              weights=W, allocator=alloc)
+
+
+class TestPoolSwap(unittest.TestCase):
+    """Rigid valu (vec_fma) with a full valu unit may evict a valu-placed
+    vec_elem down to the alu (1 valu slot <-> VLEN alu lanes), if the alu
+    can take all lanes. Slot-mapping only: the evicted node stays complete."""
+
+    def _elem(self, i):
+        n = DNode(idx=i, engine="valu",
+                  instr=VecElem("+", Reg(100 + 8 * i, True),
+                                Reg(200, True), Reg(208, True)))
+        _classify(n)
+        return n
+
+    def _fma(self, i):
+        n = DNode(idx=100 + i, engine="valu",
+                  instr=VecFma(Reg(300, True), Reg(308, True),
+                               Reg(316, True), Reg(324, True)))
+        _classify(n)
+        return n
+
+    def _fill(self, pool, n_elems, n_alu_used, dry=False):
+        for _ in range(n_alu_used):
+            pool.free["alu"] -= 1
+        elems = [self._elem(i) for i in range(n_elems)]
+        for e in elems:
+            assert pool.place(e, e.placement, dry) is True
+        return elems
+
+    def test_swap_fits_fma(self):
+        pool = FuncUnitPool()
+        pool.reset()
+        elems = self._fill(pool, 6, n_alu_used=4)   # valu full, alu 8 free
+        self.assertEqual(pool.free["valu"], 0)
+        fma = self._fma(0)
+        self.assertIs(pool.place(fma, fma.placement), True)
+        # fma on valu; evicted elem moved wholly to alu.
+        self.assertEqual(pool.free["valu"], 0)
+        self.assertEqual(pool.free["alu"], 0)
+        self.assertIn(fma.instr, pool.bundle["valu"])
+        self.assertEqual(len(pool.bundle["valu"]), 6)      # 5 elems + fma
+        self.assertEqual(len(pool.bundle["alu"]), VLEN)    # evicted lanes
+        evicted = elems[-1].placement                     # LIFO eviction
+        self.assertEqual(evicted.engine_choice, "alu")
+        self.assertEqual(evicted.lanes_done, VLEN)         # still complete
+
+    def test_no_swap_when_alu_short(self):
+        pool = FuncUnitPool()
+        pool.reset()
+        self._fill(pool, 6, n_alu_used=5)      # alu has only 7 < VLEN free
+        fma = self._fma(0)
+        self.assertIsNone(pool.place(fma, fma.placement))
+        self.assertEqual(len(pool.bundle["valu"]), 6)      # nothing evicted
+
+    def test_swap_in_dry_mode(self):
+        pool = FuncUnitPool()
+        pool.reset()
+        self._fill(pool, 6, n_alu_used=4, dry=True)
+        fma = self._fma(0)
+        self.assertIs(pool.place(fma, fma.placement, dry=True), True)
+        self.assertEqual(pool.free["valu"], 0)
+        self.assertEqual(pool.free["alu"], 0)
+        self.assertEqual(pool.bundle, {})                  # dry: no emission
 
 
 class TestScoring(unittest.TestCase):
