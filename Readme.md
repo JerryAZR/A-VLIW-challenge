@@ -1,5 +1,8 @@
 # VLIW/SIMD Performance Take-Home — 1,110 cycles (133.1×)
 
+[![CI](https://github.com/JerryAZR/A-VLIW-challenge/actions/workflows/ci.yml/badge.svg)](https://github.com/JerryAZR/A-VLIW-challenge/actions/workflows/ci.yml)
+[![cycles](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/JerryAZR/A-VLIW-challenge/badge/cycles.json)](https://github.com/JerryAZR/A-VLIW-challenge/actions/workflows/ci.yml)
+
 A completed solution to Anthropic's original performance-engineering
 take-home (preserved verbatim at `notes/original_challenge.md`):
 optimize a 256-lane × 16-round hash/tree-descent kernel for a simulated

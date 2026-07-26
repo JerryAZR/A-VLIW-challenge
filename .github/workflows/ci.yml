@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    outputs:
+      cycles: ${{ steps.submission.outputs.cycles }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Unit tests (dev_tests)
+        run: python -m unittest discover dev_tests
+      - name: Correctness oracle (_check)
+        run: python -m tools._check
+      - name: Submission tests (graded cycle count)
+        id: submission
+        run: |
+          python tests/submission_tests.py | tee submission.out
+          cyc=$(grep -oP 'CYCLES:\s+\K\d+' submission.out | head -1)
+          echo "cycles=$cyc" >> "$GITHUB_OUTPUT"
+          echo "graded cycles: $cyc"
+
+  badge:
+    # Update the shields.io endpoint payload on the dedicated "badge"
+    # branch (kept off main so badge commits never retrigger CI).
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Write payload
+        run: |
+          python - <<'EOF'
+          import json
+          cyc = int("${{ needs.test.outputs.cycles }}")
+          color = ("brightgreen" if cyc < 1363 else
+                   "green" if cyc < 1487 else "yellow")
+          with open("/tmp/cycles.json", "w") as f:
+              json.dump({"schemaVersion": 1, "label": "cycles",
+                         "message": f"{cyc:,}", "color": color}, f)
+          EOF
+      - name: Push payload to badge branch
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin badge > /dev/null; then
+            git fetch origin badge
+            git checkout badge
+          else
+            git checkout --orphan badge
+            git rm -rf .
+          fi
+          cp /tmp/cycles.json cycles.json
+          git add cycles.json
+          git commit -m "badge: ${{ needs.test.outputs.cycles }} cycles" \
+            || echo "badge unchanged"
+          git push origin badge
