@@ -864,6 +864,34 @@ caller changes. 478 fma stalls were measured at step 22's schedule.
 
 Passes correctness (8 seeds) and **all nine** tiers (189 cyc clear).
 
+---
+
+## Step 24 - weight training: trimmed space + sign-free search   1 119 cyc   132.1×
+
+Commit `4ae89db`. Three changes:
+
+1. **Trim** (`war`, `idx` removed): war was provably inert (RAW-only DAG);
+   idx (program order) is not DAG structure - "the DAG is the program".
+   Evidence backed the user's call: my sign-biased single-coordinate
+   sweep could not compensate for idx (everything deadlocked C=75-169),
+   but a sign-free JOINT random search found idx-free configs beating the
+   old best within 200 samples - idx was proxying for weight regions the
+   biased sweep could not reach, not for real information. `freeing`
+   became a regular weight (was hardcoded 1000; winners use 0.7-9.3).
+2. **`train_weights.py`**: budget-driven, file-checkpointed phases -
+   `random` (sign-free joint search) and `finetune` (breadth-first
+   coordinate descent), each restartable from the other's dump. Modes:
+   `single` (6-dim) and `interp` (12-dim, w_early ++ w_late for
+   make_interp_greedy, random-seeded per the user's reasoning that
+   pre-optimized singles are biased toward no-interp optima).
+3. **Results**: single-mode **1 119** (shipped; signs demolish the old
+   hand-tuning: sink +6.8, load +7.1, raw +8.0, rigid +7.7, group -3.6,
+   freeing +5.3). interp-mode 1 126 after one random+finetune round
+   (close, not yet better - candidates were still improving at budget).
+
+1 174 -> **1 119** (-55). Passes correctness (8 seeds) and **all nine**
+tiers (244 cyc clear).
+
 Dev tooling: `sweep_rollout.py` (weight/K sweep), `diag_deadlock.py`
 (live-tag autopsy at the wall), `diag_liveness.py` (committed-liveness
 profile; peak 220 at big scratch = scheduler artifact, not a capacity
