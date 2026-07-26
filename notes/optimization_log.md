@@ -916,6 +916,29 @@ Shipped with re-tuned weights (freeing 5.3 -> 4.3, retuned under the new
 allocator): 1 119 -> **1 117** (-2). Passes correctness (8 seeds) and
 **all nine** tiers (246 cyc clear).
 
+---
+
+## Exploration - valu op-count reduction: tested and parked   (1 117)
+
+Census of the 6 521 valu slots: hash (1 954 fma + irreducible xor/shift),
+entry XOR, 3-op addr update - all at proven minimums (12-slot hash, xor
+non-affine so no fma-fold, `&1` doubles as path bit). Dead ends: wrap
+write via flow add_imm (immediate needs runtime forest_p).
+
+The one real candidate: level-0 `nv = tree0 ^ 0` is 64 pure-copy valu
+ops; the entry XOR can read tree0_vec directly. Floor -~ ~1 077, BUT
+after full re-training (random + finetune) the schedule landed at
+**1 127 - worse than 1 117**. The copies act as a *frontier pacemaker*:
+their commits stagger entry-XOR readiness, and without them the ramp-up
+floods (193 ready nodes, deadlock at C=152 with the old weights). Verdict:
+scheduler deficiency, not a flaw in the op cut - per discussion, interp /
+K=N with a properly trained score function may realize the ~10-cyc cut.
+
+Preserved as the `LEVEL0_DIRECT_TREE0` toggle (default OFF); the
+re-trained candidates live in `_weights_found_l0.json` /
+`_weights_refined_l0.json` (best 1 127: sink 7.9, load 5.2, raw -9.4,
+rigid 7.7, group 3.6, freeing 1.1).
+
 Dev tooling: `sweep_rollout.py` (weight/K sweep), `diag_deadlock.py`
 (live-tag autopsy at the wall), `diag_liveness.py` (committed-liveness
 profile; peak 220 at big scratch = scheduler artifact, not a capacity

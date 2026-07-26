@@ -77,6 +77,17 @@ COMPUTED_CONSTS = {1, 2, 3, 9, 16, 19, 33, 4097}
 # (validated correct via _check_big.py: 1363 cyc retention vs 1389 recompute).
 RECOMPUTE_PATH_BITS = False
 
+# Level-0 direct-tree0 toggle. Level 0 (rounds 0/11) has node_val = tree[0]
+# for every lane. OFF (default): write a per-group copy `nv = tree0 ^ 0`
+# (64 valu ops) and let the entry XOR read nv. ON: the entry XOR reads
+# tree0_vec directly, deleting the 64 copies (~10 cyc off the valu floor).
+# Measured result with the K=1 tuned scheduler: WORSE (1127 vs 1117 after
+# re-training) - the copies act as a frontier pacemaker, staggering
+# entry-XOR readiness. That is a scheduler deficiency, not a flaw in the
+# op cut itself: revisit when interp / K=N with a trained score function
+# can hold the flooded ramp-up frontier.
+LEVEL0_DIRECT_TREE0 = False
+
 
 class KernelBuilder:
     def __init__(self):
@@ -444,9 +455,13 @@ class KernelBuilder:
                 keyhv   = [(r, base_i + j, "hashed_val") for j in range(VLEN)]
 
                 # --- node_val gather or preload-select (rounds 0-3 use preloaded) ---
+                nv_op = nv
                 if r in (0, 11):
                     # Level 0: all lanes at idx=0. node_val = tree[0].
-                    body.append(VecElem("^", nv, tree0_vec, const_vec_0))
+                    if LEVEL0_DIRECT_TREE0:
+                        nv_op = tree0_vec   # entry XOR reads the shared const
+                    else:
+                        body.append(VecElem("^", nv, tree0_vec, const_vec_0))
                 elif r in (1, 12):
                     # Level 1: idx in {1,2}. idx = 1 + d0, so the level-0 path
                     # bit IS the select bit (idx=1 -> tree1, idx=2 -> tree2).
@@ -498,11 +513,11 @@ class KernelBuilder:
                     # nv is then read by the entry XOR below.
                     body.append(Gather(nv, addr_vec))
 
-                body.append(DebugVCompare(nv, keynv))
+                body.append(DebugVCompare(nv_op, keynv))
                 body.append(DebugVCompare(val_vec, keyval))  # val before xor
 
-                # --- entry XOR: val_vec = val_vec ^ nv  (a) ---
-                body.append(VecElem("^", val_vec, val_vec, nv))
+                # --- entry XOR: val_vec = val_vec ^ nv_op  (a) ---
+                body.append(VecElem("^", val_vec, val_vec, nv_op))
 
                 # --- 12-slot hash, fully on valu (8 lanes / slot) ---
                 body.extend(self.build_vec_hash(val_vec, t1, t2, r, base_i,

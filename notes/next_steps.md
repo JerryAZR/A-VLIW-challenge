@@ -33,16 +33,19 @@ cyc slack). load 88.7%, alu 88.0%, flow 58.7%. Former-prologue ramp-up
 
 ## Next levers
 
-1. **valu op-count reduction** (the floor): prologue tricks (compute
-   small consts instead of const+vbroadcast - but keep them OFF valu;
-   const loads ride the 88.7% load engine, alu-computed trades load->alu),
-   select-tree op reductions, anything cutting valu slots in early rounds.
-2. **Score/feature training**: coordinate descent over ScoreWeights +
-   REGALLOC_WEIGHTS (7 dims) at K=1 (1.6 s/eval - cheap).
-3. **Retention retry** (`RECOMPUTE_PATH_BITS=False`, ~26 cyc cheaper at
-   big scratch): pressure is metered by group priority - retest at 1536.
-4. **Raise K** (search trials) after structural work settles: worth ~2
-   cyc at current shape.
+1. **K=N diverse-func trial sets** (deferred investigation): compose
+   [func_w1, func_w2, func_w3, rand*2] from `_weights_refined.json`
+   (singles) + `_weights_refined_interp.json`. NOTE: the K=N state-scoring
+   function (ScoreWeights: reads/reg_delta) has never been properly
+   trained - train it before judging K=N.
+2. **Interp re-training** under the dynamic allocator (the 1126 interp
+   result predates it).
+3. **`LEVEL0_DIRECT_TREE0` retry under interp/K=N**: the op cut is real
+   (~10 cyc floor) but the K=1 scheduler needs the copies as a frontier
+   pacemaker; a better search may hold the flooded ramp-up. Candidates in
+   `_weights_*_l0.json` (best 1127).
+4. **valu op-count reduction** is otherwise exhausted (hash/xor/addr all
+   at proven minimums); floor ~1085 combined is the algorithm's floor.
 5. **Horizon depth** (parked, non-trivial): trials = 1 decided cycle + H
    greedy continuation cycles, scoring the horizon state.
 
