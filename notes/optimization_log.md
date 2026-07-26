@@ -920,6 +920,10 @@ allocator): 1 119 -> **1 117** (-2). Passes correctness (8 seeds) and
 
 ## Exploration - valu op-count reduction: tested and parked   (1 117)
 
+*(Superseded by step 26: the op cut is now SHIPPED at 1 110 under interp
+weights found by the v2 search. This entry records why it was parked
+under the v1 search.)*
+
 Census of the 6 521 valu slots: hash (1 954 fma + irreducible xor/shift),
 entry XOR, 3-op addr update - all at proven minimums (12-slot hash, xor
 non-affine so no fma-fold, `&1` doubles as path bit). Dead ends: wrap
@@ -946,3 +950,58 @@ proof). dev_tests/ (14 unit tests): randomized rollback equivalence for
 all three structures, golden greedy-equivalence (trials=1 reproduces
 regalloc.schedule byte-for-byte), determinism, allocator hygiene,
 deadlock detection.
+
+---
+
+## Step 26 - L0-direct shipped: interp weights via trimmed/base+tilt search   1 110 cyc   133.1×
+
+Commits (this step). The parked LEVEL0_DIRECT_TREE0 op cut (64 pure-copy
+valu ops deleted; entry XOR reads tree0_vec directly; compute floor
+65090 -> 64578 lane-slots = 1085 -> 1077) is now SHIPPED, beating the
+L0-off 1117 by 7. Three parts:
+
+1. **Parallel trainer** (`train_weights.py` v2 infra): candidate evals
+   farmed to a multiprocessing pool (default min(28, cpu-4) workers;
+   ~25x throughput, ~15 evals/s). random = embarrassingly parallel;
+   finetune = steepest-neighbor descent (whole dims x DELTAS neighborhood
+   in one parallel batch, best applied) replacing sequential Gauss-Seidel.
+
+2. **Failure mechanism of L0-on, measured** (`diag_underfill.py`, new dev
+   tool - classifies valu-underfilled cycles as register-pressure vs
+   work-starvation): the 1123 interp schedule's 46-cycle slack is
+   starvation-dominated (61 cycles, 102 slots), NOT pressure (17, 21).
+   The starvation clusters at C~750-900 = the round-15 gather wall: a
+   gather feeds at 4 cyc/group (8 loads / 2 ports) but its hash drains at
+   2.3 cyc/group (14 valu / 6), so synchronized group arrivals force valu
+   starvation arithmetically. L0-on's efficient early schedule removes
+   the copy-op metronome that kept groups phase-spread. (User's doubt
+   confirmed: no scheduler permutation recovers a feed-rate wall felt
+   100+ cycles after the decisions that caused it.)
+
+3. **Search-space v2** (from trend analysis of 4050+ trained completes):
+   - Signature of winners: sink+, load+, freeing+ (98-100%), group mildly
+     +, raw DEAD (corr +/-0.04). Note (sink+,group+) IS a diagonal
+     wavefront (late groups lead by slope w_group/w_sink) - phase
+     spreading was already in the searched space; serializing (sink-)
+     regions capped at 1149.
+   - Changes: raw dropped (fixed 0); sign-biased per-prop bounds
+     (sink/freeing [0,10], load [-3,10], group [-4,10], rigid [-3,6]);
+     interp reparameterized as base+tilt (w_late = base+tilt/2, w_early =
+     base-tilt/2) - the signal lives in base (corr -0.33/-0.44), tilt is
+     weak; two-stage finetune deltas (coarse then +/-0.25 polish).
+   - Completion rate 15% -> 50%; 1127-equivalent found in 29s (was 536s).
+
+The new basin (found at #3998): EARLY serializes early groups
+(group -4.8) + pushes far-from-sink work; LATE drops group entirely;
+freeing strong (~7-8) throughout. Random 1114, finetune 1111, fine polish
+1110 (freeing_base 7.4 -> 7.65).
+
+Shipped: `LEVEL0_DIRECT_TREE0=True`, `ROLLOUT_SORT_FUNCS =
+[make_interp_greedy(INTERP_W_LATE, INTERP_W_EARLY)]` (decoded in
+perf_takehome.py). 1110 = floor 1077 + 33 slack. `REGALLOC_WEIGHTS` kept
+for the greedy fallback path only.
+
+Passes correctness (8 seeds) and **all nine** tiers (253 cyc clear).
+Remaining slack vs floor: 33 cyc (ramp-up latency ~4, round-15 feed wall,
+tail drain). Next levers unchanged in kind: K=N with a trained scorer
+(still untrained), op-count (the dedup lever - fewer than 4096 hashes).

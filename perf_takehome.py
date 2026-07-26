@@ -44,8 +44,23 @@ from problem import (
 # (sign-free joint random search + coordinate descent; trimmed space: no
 # war, no idx). Signs were NOT what hand-tuning assumed (group/sink
 # positive, freeing small). 1119 cyc at K=1.
+# NOTE: superseded by the interp pair below (used when SCHEDULER_MODE is
+# "rollout"); kept for the "greedy" fallback path.
 REGALLOC_WEIGHTS = Weights(sink=6.8, load=7.1, raw=8.0, rigid=7.7,
                            group=-3.6, freeing=4.3)
+
+# Progress-interpolated priority pair (make_interp_greedy: w_late dominates
+# as progress->1, w_early dominates at 0). Found by train_weights.py v2
+# (trimmed space: raw dropped as inert; sign-biased bounds; base+tilt
+# reparameterization) with LEVEL0_DIRECT_TREE0=True - 1110 cyc at K=1,
+# beating the L0-off 1117. Structure: EARLY serializes early groups
+# (group -4.8) to stagger the descent wavefront, LATE drops the group dial
+# entirely; strong register discipline (freeing ~7-8) throughout.
+from rollout import make_interp_greedy
+INTERP_W_LATE = Weights(sink=1.15, load=1.5, raw=0.0, rigid=1.4,
+                        group=0.0, freeing=8.4)
+INTERP_W_EARLY = Weights(sink=5.45, load=1.1, raw=0.0, rigid=-1.0,
+                         group=-4.8, freeing=6.9)
 
 # Body scheduler selection: "greedy" (regalloc.schedule, weighted picker +
 # freeing bias) or "rollout" (rollout.schedule_rollout: per-cycle
@@ -53,7 +68,7 @@ REGALLOC_WEIGHTS = Weights(sink=6.8, load=7.1, raw=8.0, rigid=7.7,
 SCHEDULER_MODE = "rollout"
 ROLLOUT_TRIALS = 1           # K=1: priority fn only (1291 cyc, 5x faster);
                              # raise K after other parts are fully optimized
-ROLLOUT_SORT_FUNCS = None    # explicit trial set override; None -> default
+ROLLOUT_SORT_FUNCS = [make_interp_greedy(INTERP_W_LATE, INTERP_W_EARLY)]
 ROLLOUT_SEED = 42
 ROLLOUT_SCORE_WEIGHTS = None  # None -> rollout.ScoreWeights() defaults
 
@@ -86,7 +101,7 @@ RECOMPUTE_PATH_BITS = False
 # entry-XOR readiness. That is a scheduler deficiency, not a flaw in the
 # op cut itself: revisit when interp / K=N with a trained score function
 # can hold the flooded ramp-up frontier.
-LEVEL0_DIRECT_TREE0 = False
+LEVEL0_DIRECT_TREE0 = True
 
 
 class KernelBuilder:
