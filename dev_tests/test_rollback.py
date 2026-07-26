@@ -88,16 +88,21 @@ class TestDAGRollback(unittest.TestCase):
 
 def _alloc_snapshot(a: RegisterAllocator):
     return (dict(a.assigned), dict(a.remaining), deque(a.free_vec),
-            deque(a.free_scalar), dict(a._names))
+            deque(a.free_scalar), dict(a._names), dict(a._word_granule),
+            dict(a._granule_free), dict(a._claim_of))
 
 
 def _assert_alloc_matches(tc, a, snap):
-    assigned, remaining, free_vec, free_scalar, names = snap
+    (assigned, remaining, free_vec, free_scalar, names,
+     word_granule, granule_free, claim_of) = snap
     tc.assertEqual(a.assigned, assigned)
     tc.assertEqual(a.remaining, remaining)
     tc.assertEqual(a.free_vec, free_vec)
     tc.assertEqual(a.free_scalar, free_scalar)
     tc.assertEqual(a._names, names)
+    tc.assertEqual(a._word_granule, word_granule)
+    tc.assertEqual(a._granule_free, granule_free)
+    tc.assertEqual(a._claim_of, claim_of)
 
 
 class TestAllocatorRollback(unittest.TestCase):

@@ -45,7 +45,7 @@ from problem import (
 # war, no idx). Signs were NOT what hand-tuning assumed (group/sink
 # positive, freeing small). 1119 cyc at K=1.
 REGALLOC_WEIGHTS = Weights(sink=6.8, load=7.1, raw=8.0, rigid=7.7,
-                           group=-3.6, freeing=5.3)
+                           group=-3.6, freeing=4.3)
 
 # Body scheduler selection: "greedy" (regalloc.schedule, weighted picker +
 # freeing bias) or "rollout" (rollout.schedule_rollout: per-cycle

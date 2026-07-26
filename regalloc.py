@@ -167,11 +167,6 @@ def build_dag(tagged, pinned=()):
 # Step 3: register allocator + allocating scheduler
 # ===========================================================================
 
-# Scalar temps live in the topmost words of scratch; everything between the
-# pinned region and the scalar pool is 8-aligned vector granules. (const_vec_0
-# is pinned at address 0; the vector pool starts at granule 1.)
-SCALAR_POOL_WORDS = 48
-
 # Debug: dump per-cycle live-register pressure to find leaks.
 _DEBUG_PRESSURE = False
 _pressure_log = open("pressure.log", "w") if _DEBUG_PRESSURE else None
@@ -188,18 +183,30 @@ class RegisterAllocator:
     partially-completed node like a gather or a spilled vec_elem) and freed
     when all its reads have committed. Register availability is checked
     alongside functional-unit availability when placing a write.
+
+    Dynamic scalar/vector allocation: there is ONE vector free list (all of
+    scratch as 8-aligned granules, const_vec_0 pinned at granule 0). The
+    scalar engine holds a free-WORD list; when it runs out it claims a
+    vector granule and splits it into 8 scalar words, and when all 8 words
+    of a claimed granule are free again the granule returns to the vector
+    list. No static scalar reserve: the split is elastic in both directions.
     """
 
     def __init__(self, read_count, pinned_addr0=True):
         self._read_count = read_count
-        # const_vec_0 occupies address 0 (granule 0); vector pool from 1.
-        vec_start = VLEN
-        scalar_start = SCRATCH_SIZE - SCALAR_POOL_WORDS
-        self.free_vec = deque(range(vec_start, scalar_start, VLEN))
-        self.free_scalar = deque(range(scalar_start, SCRATCH_SIZE))
-        # Initial pool sizes (for pressure features / normalization).
+        # const_vec_0 occupies address 0 (granule 0); all other granules
+        # (VLEN..SCRATCH_SIZE step VLEN) are the vector pool.
+        self.free_vec = deque(range(VLEN, SCRATCH_SIZE, VLEN))
+        # Scalar engine: free words + per-granule bookkeeping for claimed
+        # (vector->scalar converted) granules.
+        self._scalar_words: deque[int] = deque()     # free scalar words
+        self._word_granule: dict[int, int] = {}      # word -> its granule base
+        self._granule_free: dict[int, int] = {}      # claimed granule -> #free words
+        self._claim_of: dict[int, int] = {}          # word allocated by a fresh claim -> granule
+        # Pool sizes (for pressure features / normalization). The scalar
+        # pool is elastic: its ceiling is the whole granule space in words.
         self.vec_pool_size = len(self.free_vec)
-        self.scalar_pool_size = len(self.free_scalar)
+        self.scalar_pool_size = self.vec_pool_size * VLEN
         self.assigned: dict[Sym, int] = {}     # tag -> base addr
         self.remaining: dict[Sym, int] = {}    # tag -> reads left before free
         self.exhaustion_warnings = 0
@@ -211,25 +218,48 @@ class RegisterAllocator:
         # Undo log for checkpoint()/rollback() (None = not recording).
         self._log: list | None = None
 
-    def _pool(self, is_vec):
-        return self.free_vec if is_vec else self.free_scalar
+    @property
+    def free_scalar(self):
+        """The scalar free list (words), as a read-only view."""
+        return self._scalar_words
 
     def can_write(self, tag: Sym) -> bool:
         """A register for ``tag`` is already assigned or one is available."""
         if tag in self.assigned:
             return True
-        return len(self._pool(tag.is_vec)) > 0
+        if tag.is_vec:
+            return len(self.free_vec) > 0
+        return len(self._scalar_words) > 0 or len(self.free_vec) > 0
 
     def write(self, tag: Sym) -> int:
         """Allocate (or return the sticky) register for ``tag``; returns addr."""
         if tag in self.assigned:
             return self.assigned[tag]
-        pool = self._pool(tag.is_vec)
-        if not pool:
-            raise RuntimeError(
-                f"register exhaustion: no free {'vector' if tag.is_vec else 'scalar'} "
-                f"register for {tag.name} ({len(self.assigned)} live)")
-        addr = pool.popleft()
+        claimed = False
+        if tag.is_vec:
+            if not self.free_vec:
+                raise RuntimeError(
+                    f"register exhaustion: no free vector register for "
+                    f"{tag.name} ({len(self.assigned)} live)")
+            addr = self.free_vec.popleft()
+        else:
+            if not self._scalar_words:
+                # Scalar pool empty: claim a vector granule, split into words.
+                if not self.free_vec:
+                    raise RuntimeError(
+                        f"register exhaustion: no free scalar word for "
+                        f"{tag.name} ({len(self.assigned)} live)")
+                g = self.free_vec.popleft()
+                for w in range(g, g + VLEN):
+                    self._scalar_words.append(w)
+                    self._word_granule[w] = g
+                self._granule_free[g] = VLEN
+                claimed = True
+            addr = self._scalar_words.popleft()
+            g = self._word_granule[addr]
+            self._granule_free[g] -= 1
+            if claimed:
+                self._claim_of[addr] = g
         self.assigned[tag] = addr
         self.remaining[tag] = self._read_count[tag]
         self.n_alloc += 1
@@ -237,7 +267,8 @@ class RegisterAllocator:
         old_name = self._names.get(addr)
         self._names[addr] = (tag.name.split("#")[0], VLEN if tag.is_vec else 1)
         if self._log is not None:
-            self._log.append(("W", tag, addr, old_name))
+            self._log.append(("W" if tag.is_vec else "Ws",
+                              tag, addr, old_name, claimed))
         return addr
 
     def unwrite(self, tag: Sym) -> None:
@@ -246,10 +277,43 @@ class RegisterAllocator:
         yet); a sticky tag allocated by an earlier placement is left alone."""
         if self.remaining.get(tag) == self._read_count[tag] and tag in self.assigned:
             addr = self.assigned.pop(tag)
-            self._pool(tag.is_vec).appendleft(addr)
             del self.remaining[tag]
+            was_claim = addr in self._claim_of
+            path = None
+            if tag.is_vec:
+                self.free_vec.appendleft(addr)
+            else:
+                path = self._scalar_dealloc(addr)
             if self._log is not None:
-                self._log.append(("U", tag, addr))
+                self._log.append(("U", tag, addr, was_claim, path))
+
+    def _scalar_dealloc(self, addr: int) -> str:
+        """Return a scalar word to the free engine (used by unwrite and by
+        rollback of a scalar allocation). Two self-contained paths:
+
+          "rev" - full claim reversal: the word came from a fresh claim and
+                  all 7 sibling words are still free (the only checked-out
+                  word is this one) -> the granule never happened.
+          "ret" - plain word return: bump the granule's free count and put
+                  the word back. Granule RECLAMATION IS NOT DONE HERE - it
+                  is deferred to cycle end (collect_scalar_garbage),
+                  outside the trial/checkpoint window, so it never needs
+                  to be rolled back.
+        """
+        g = self._word_granule[addr]
+        if self._claim_of.get(addr) == g and self._granule_free[g] == VLEN - 1:
+            del self._claim_of[addr]
+            for w in range(g + 1, g + VLEN):
+                self._scalar_words.remove(w)
+                del self._word_granule[w]
+            del self._word_granule[g]
+            del self._granule_free[g]
+            self.free_vec.appendleft(g)
+            return "rev"
+        self._claim_of.pop(addr, None)
+        self._granule_free[g] += 1
+        self._scalar_words.appendleft(addr)
+        return "ret"
 
     def read(self, tag: Sym) -> None:
         """One read of ``tag`` committed; free its register when all are done."""
@@ -258,11 +322,38 @@ class RegisterAllocator:
             self._log.append(("R", tag))
         if self.remaining[tag] == 0:
             addr = self.assigned.pop(tag)
-            self._pool(tag.is_vec).append(addr)
             del self.remaining[tag]
             self.n_free += 1
-            if self._log is not None:
-                self._log.append(("F", tag, addr))
+            if tag.is_vec:
+                self.free_vec.append(addr)
+                if self._log is not None:
+                    self._log.append(("F", tag, addr))
+            else:
+                g = self._word_granule[addr]
+                self._granule_free[g] += 1
+                self._scalar_words.append(addr)
+                was_claim = self._claim_of.pop(addr, None) is not None
+                if self._log is not None:
+                    self._log.append(("Fs", tag, addr, was_claim))
+                # NB: no granule reclaim here - deferred to cycle end.
+
+    def collect_scalar_garbage(self) -> None:
+        """Cycle-end scalar GC: return fully-free claimed granules to the
+        vector pool. Called by the scheduler AFTER the cycle's decisions are
+        committed (outside any checkpoint/rollback window), so it needs no
+        undo support."""
+        reclaimable = [g for g, cnt in self._granule_free.items()
+                       if cnt == VLEN]
+        if not reclaimable:
+            return
+        reclaim = set(reclaimable)
+        self._scalar_words = deque(
+            w for w in self._scalar_words if self._word_granule[w] not in reclaim)
+        for g in reclaimable:
+            for w in range(g, g + VLEN):
+                del self._word_granule[w]
+            del self._granule_free[g]
+            self.free_vec.append(g)
 
     # -- checkpoint / rollback --------------------------------------------
     # Same interface as DAG.checkpoint()/rollback(): mutations above append
@@ -285,31 +376,79 @@ class RegisterAllocator:
         while len(log) > token:
             entry = log.pop()
             kind = entry[0]
-            if kind == "W":                     # undo an allocation
-                _, tag, addr, old_name = entry
+            if kind == "W":                     # undo a vector allocation
+                _, tag, addr, old_name, _ = entry
                 del self.assigned[tag]
                 del self.remaining[tag]
-                self._pool(tag.is_vec).appendleft(addr)
-                if old_name is None:
-                    self._names.pop(addr, None)
+                self.free_vec.appendleft(addr)
+                self._restore_name(addr, old_name)
+            elif kind == "Ws":                  # undo a scalar allocation
+                _, tag, addr, old_name, claimed = entry
+                del self.assigned[tag]
+                del self.remaining[tag]
+                if claimed:
+                    g = self._claim_of.pop(addr)
+                    for w in range(g + 1, g + VLEN):
+                        self._scalar_words.remove(w)
+                        del self._word_granule[w]
+                    del self._word_granule[g]
+                    del self._granule_free[g]
+                    self.free_vec.appendleft(g)
                 else:
-                    self._names[addr] = old_name
+                    g = self._word_granule[addr]
+                    self._granule_free[g] += 1
+                    self._scalar_words.appendleft(addr)
+                self._restore_name(addr, old_name)
             elif kind == "R":                   # undo a consumed read
                 self.remaining[entry[1]] += 1
-            elif kind == "F":                   # undo a free
+            elif kind == "F":                   # undo a vector free
                 _, tag, addr = entry
-                self._pool(tag.is_vec).remove(addr)
+                self.free_vec.remove(addr)
                 self.assigned[tag] = addr
                 self.remaining[tag] = 0
+            elif kind == "Fs":                  # undo a scalar free
+                _, tag, addr, was_claim = entry
+                g = self._word_granule[addr]
+                self._granule_free[g] -= 1
+                self._scalar_words.remove(addr)
+                if was_claim:
+                    self._claim_of[addr] = g
+                self.assigned[tag] = addr
+                self.remaining[tag] = 0
+            elif kind == "Rc":                  # unreachable (deferred GC)
+                raise AssertionError("Rc entries must not exist: granule "
+                                     "reclaim is deferred to cycle end")
             elif kind == "U":                   # undo an unwrite (redo write)
-                _, tag, addr = entry
-                self._pool(tag.is_vec).remove(addr)
+                _, tag, addr, was_claim, path = entry
+                if tag.is_vec:
+                    self.free_vec.remove(addr)
+                elif path == "rev":
+                    g = addr            # a claim hands out the granule base
+                    self._claim_of[addr] = g
+                    self.free_vec.remove(g)
+                    for w in range(g, g + VLEN):
+                        self._scalar_words.append(w)
+                        self._word_granule[w] = g
+                    self._granule_free[g] = VLEN - 1
+                    self._scalar_words.remove(addr)
+                else:                   # "ret": plain word return was made
+                    g = self._word_granule[addr]
+                    self._granule_free[g] -= 1
+                    self._scalar_words.remove(addr)
+                    if was_claim:
+                        self._claim_of[addr] = g
                 self.assigned[tag] = addr
                 self.remaining[tag] = self._read_count[tag]
             else:
                 raise AssertionError(f"unknown allocator log entry: {entry}")
         if token == 0:
             self._log = None
+
+    def _restore_name(self, addr, old_name):
+        if old_name is None:
+            self._names.pop(addr, None)
+        else:
+            self._names[addr] = old_name
 
     # -- queries for the scheduler ----------------------------------------
 
@@ -499,6 +638,9 @@ def schedule(dag: DAG, read_count, *, seed: int | None = None,
                 f"{allocator.exhaustion_warnings})")
         bundles.append(bundle)
         dag.advance()
+        # Cycle-end scalar GC: return fully-free claimed granules to the
+        # vector pool (committed state, outside any checkpoint).
+        allocator.collect_scalar_garbage()
         C += 1
         if C > cap:
             raise RuntimeError(

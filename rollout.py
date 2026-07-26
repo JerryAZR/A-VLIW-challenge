@@ -384,6 +384,9 @@ def schedule_rollout(dag, read_count, *, seed: int = 42, trials: int = 6,
         stats = _run_cycle(best_order, dag, allocator, pool, emit=True)
         dag.advance()
         committed += stats["committed"]
+        # Cycle-end scalar GC: return fully-free claimed granules to the
+        # vector pool (committed state, outside any checkpoint).
+        allocator.collect_scalar_garbage()
         bundle = {eng: [s.tagged_lower() if isinstance(s, Instr) else s
                         for s in slots]
                   for eng, slots in pool.bundle.items()}
