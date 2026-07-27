@@ -80,27 +80,37 @@ load 1991/2 = 996 -> floor ~1000, they land 63 above it.
 Ideas to borrow (in planned order):
 
 1. **Hash stage 2+3 algebraic fusion (12 -> 11 slots)** [from rubinownz111].
-   `b = 33a + C2`, and `<<` distributes over `+` mod 2^32, so
+   IMPLEMENTED (FUSE_HASH_STAGES_23=True, attribution in the toggle
+   comment): fused form derived from frozen HASH_STAGES with shape
+   asserts; const_vec_16896 computed as 33<<9 in the prologue (no const
+   load); K2/K3 die, K23/K2S9 const-loaded; stage-2 DebugVCompare
+   dropped. Verified -512 vec ops in the scheduled program (valu 6566 ->
+   6327, alu 12050 -> 9874); floor 1077 -> 1009 combined, load 1063 now
+   the binding per-engine bound. CORRECT via tools._check at 1536;
+   1154 cyc on the OLD weights (+44, expected - priority fn needs
+   retraining on the fused DAG).
+   Mechanism: `b = 33a + C2`, and `<<` distributes over `+` mod 2^32, so
    `b << 9 = 16896a + (C2<<9)`; stages 2+3 become
-   `(33a + (C2+C3)) ^ (16896a + (C2<<9))` = fma + fma + xor = 3 ops instead
-   of 4. Verified numerically against the frozen constants (200k random
-   inputs, exact match). Gain: -512 vec ops (~68 floor cyc); floor 1077 ->
-   ~1009. Side effects: rigid fma per hash 3 -> 4 (still far from binding);
-   new consts (mult 16896, addends C2+C3 and C2<<9), K2/K3 vecs die,
-   const_vec_9 loses its stage-3-shift sharing. Touchpoints:
-   `build_vec_hash`, fma/irr const dicts. **This falsifies the "verified
-   12-slot hash minimum" in notes/hash_dag.md - update it when shipped.**
+   `(33a + (C2+C3)) ^ (16896a + (C2<<9))` = fma + fma + xor = 3 ops
+   instead of 4 (numerically verified, 200k random inputs exact).
+   **This falsifies the "verified 12-slot hash minimum" in
+   notes/hash_dag.md - update it when shipped.**
 
-2. **Wrap-root stage-5 ^C5 deferral (round 10)** [from rubinownz111]. On the
-   wrap round emit stage 5 as `val' = a ^ (a>>16)` (drop the ^C5); repair
-   free via a precomputed `tree0_xor5_vec = tree0_vec ^ C5` broadcast that
-   round 11's entry XOR reads instead of tree0_vec (LEVEL0_DIRECT_TREE0
-   already reads it directly). Safe because round 10 skips the branch-bit &
-   and addr update; the only other consumer is the dev `hashed_val`
-   DebugVCompare (drop that one check on round 10). NOT dead code - the
-   carried val is eventually stored, so prune_to_stores cannot find this;
-   it's a reassociation across the round boundary. Gain: -32 vec ops (~4
-   floor cyc). Cost: ~2 prologue ops + 1 live broadcast register.
+2. **Wrap-root stage-5 ^C5 deferral (round 10)** [from rubinownz111].
+   IMPLEMENTED (WRAP_ROOT_C5_DEFER=True, attribution in the toggle
+   comment): round-10 stage 5 emits a ^ (a>>16); round-11 entry XOR reads
+   tree0_xor5_vec (precomputed just-in-time at round-11 start, short
+   liveness). Oracle checks skipped where the trace includes C5:
+   round-10 stage-5 + hashed_val, round-11 pre-entry val. CORRECT via
+   tools._check_big (4096 scratch, 1152 cyc); DEADLOCKS at 1536 (fusion
+   alone had 8854 exhaustion stalls - zero-slack pressure; the extra live
+   vector tips it over). Fit is expected from the priority retrain (the
+   trainer scores deadlocks as non-completes and searches around them).
+   Mechanism: on the wrap round the & branch-bit and addr update are
+   skipped, so nothing reads the deferred val's parity; the only other
+   consumer is round 11's entry XOR, repaired free via tree0^C5. NOT dead
+   code - prune_to_stores cannot find this; it's a reassociation across
+   the round boundary.
 
 3. **Level-4 preloading / partial preloading** [from rubinownz111; the
    follow-on once 1+2 land]. Loads are already nearly co-binding (2125

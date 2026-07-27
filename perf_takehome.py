@@ -103,6 +103,45 @@ RECOMPUTE_PATH_BITS = False
 # can hold the flooded ramp-up frontier.
 LEVEL0_DIRECT_TREE0 = True
 
+# Hash stage 2+3 cross-fusion toggle (idea borrowed from rubinownz111's
+# 1063-cycle solution - see notes/next_steps.md "Prior art").
+# Stage 2 is linear:  b = 33a + C2.  Stage 3: out = (b + C3) ^ (b << 9).
+# Since << distributes over + (mod 2^32), b << 9 = 16896a + (C2<<9), so
+# stages 2+3 = (33a + (C2+C3)) ^ (16896a + (C2<<9)) - two fma + one xor
+# (3 ops) instead of fma + add + shift + xor (4 ops). The hash drops from
+# 12 to 11 slots (-512 vec ops over the kernel). Verified numerically
+# against the frozen HASH_STAGES (200k random inputs, exact match).
+# Cost: rigid-fma count per hash rises 3 -> 4 (far from binding) and one
+# extra const vector stays live kernel-wide (16896 = 33<<9, computed from
+# existing consts in the prologue; K2/K3 die).
+FUSE_HASH_STAGES_23 = True
+
+# Wrap-root stage-5 ^C5 deferral (idea borrowed from rubinownz111's
+# 1063-cycle solution - see notes/next_steps.md "Prior art"). On the wrap
+# round (r == forest_height), stage 5's `^ C5` is omitted from the hash
+# (1 vec op per group = -32 total); the carried val is then val^C5 until
+# round 11's entry XOR, where reading a precomputed tree0^C5 broadcast
+# repairs it for free (with LEVEL0_DIRECT_TREE0 the entry XOR reads that
+# shared vector directly, so the repair costs zero body ops). Safe because
+# the wrap round skips the branch-bit & and addr update, so nothing reads
+# the deferred val's parity. Oracle: round-10 stage-5 + hashed_val and
+# round-11 pre-entry val DebugVCompares are skipped (their trace values
+# include C5).
+WRAP_ROOT_C5_DEFER = True
+
+# Fused stage-2+3 constants, DERIVED from the frozen HASH_STAGES (with
+# shape asserts so a spec change fails loudly instead of silently
+# miscomputing). Stage 2: ("+", C2, "+", "<<", 5); stage 3: ("+", C3,
+# "^", "<<", 9).
+assert HASH_STAGES[2][0] == "+" and HASH_STAGES[2][2] == "+" \
+    and HASH_STAGES[2][3] == "<<", "stage-2 shape changed: revisit fusion"
+assert HASH_STAGES[3][0] == "+" and HASH_STAGES[3][2] == "^" \
+    and HASH_STAGES[3][3] == "<<", "stage-3 shape changed: revisit fusion"
+_M2 = (1 << HASH_STAGES[2][4]) + 1                 # 33  (stage-2 mult)
+FUSED23_MULT = _M2 << HASH_STAGES[3][4]            # 16896 = 33 << 9
+FUSED23_ADD1 = (HASH_STAGES[2][1] + HASH_STAGES[3][1]) % 2**32   # C2+C3
+FUSED23_ADD2 = (HASH_STAGES[2][1] << HASH_STAGES[3][4]) % 2**32  # C2<<9
+
 
 class KernelBuilder:
     def __init__(self):
@@ -131,9 +170,20 @@ class KernelBuilder:
         self.instrs.append({Pause().engine: [Pause().lower()]})
 
     def build_vec_hash(self, val_vec, t1_vec, t2_vec, r, base_i,
-                        fma_vec_consts, irr_vec_consts):
-        """Emit the 12-slot reduced myhash fully on the `valu` unit, operating
+                        fma_vec_consts, irr_vec_consts, defer_c5=False):
+        """Emit the reduced myhash fully on the `valu` unit, operating
         elementwise on all VLEN=8 lanes of `val_vec` in parallel.
+
+        12 slots, or 11 with FUSE_HASH_STAGES_23: stages 2+3 fuse into
+        (33a + (C2+C3)) ^ (16896a + (C2<<9)) = fma + fma + xor (see the
+        toggle's comment). The stage-2 intermediate then never exists, so
+        its DebugVCompare is skipped (only the stage-3 check is emitted).
+
+        With defer_c5 (wrap round only, WRAP_ROOT_C5_DEFER) the final
+        stage drops its `^ C5`: out = a ^ (a>>16), one op shorter. The
+        carried val is then val^C5 until the next round's entry XOR
+        repairs it via a precomputed tree0^C5 vector. The stage-5 oracle
+        check is skipped (the trace value includes C5).
 
         `val_vec` is both the input `a = val ^ node_val` and the persistent
         lane-state vector: each stage writes back into it, and the final
@@ -150,7 +200,33 @@ class KernelBuilder:
             not collide (mult 9 in stage 4 vs shift 9 in stage 3).
         """
         slots = []
-        for hi, (op1, val1, op2, op3, val3) in enumerate(HASH_STAGES):
+        hi = 0
+        while hi < len(HASH_STAGES):
+            op1, val1, op2, op3, val3 = HASH_STAGES[hi]
+            if FUSE_HASH_STAGES_23 and hi == 2:
+                # Fused stages 2+3: x = 33a + (C2+C3); y = 16896a + (C2<<9);
+                # out = x ^ y. Two fma + one xor instead of fma+add+shift+xor.
+                # The stage-2 intermediate b is never materialized.
+                slots.append(VecFma(t1_vec, val_vec,
+                                    fma_vec_consts[_M2],
+                                    fma_vec_consts[FUSED23_ADD1]))
+                slots.append(VecFma(t2_vec, val_vec,
+                                    fma_vec_consts[FUSED23_MULT],
+                                    fma_vec_consts[FUSED23_ADD2]))
+                slots.append(VecElem("^", val_vec, t1_vec, t2_vec))
+                keys = [(r, base_i + j, "hash_stage", 3) for j in range(VLEN)]
+                slots.append(DebugVCompare(val_vec, keys))
+                hi += 2
+                continue
+            if defer_c5 and hi == len(HASH_STAGES) - 1:
+                # Wrap-root C5 deferral: final stage WITHOUT the `^ C5` -
+                # out = a ^ (a>>16). The constant is repaired at round 11's
+                # entry XOR (tree0^C5). No stage-5 DebugVCompare: the
+                # trace's stage-5 value includes C5.
+                slots.append(VecElem(op3, t2_vec, val_vec, irr_vec_consts[val3]))
+                slots.append(VecElem("^", val_vec, val_vec, t2_vec))
+                hi += 1
+                continue
             if op1 == "+" and op2 == "+":
                 # Linear stage: (a + K) + (a << s) == a*(1+2^s) + K, one fma.
                 mult = (1 << val3) + 1
@@ -165,6 +241,7 @@ class KernelBuilder:
                 slots.append(VecElem(op2, val_vec, t1_vec, t2_vec))
             keys = [(r, base_i + j, "hash_stage", hi) for j in range(VLEN)]
             slots.append(DebugVCompare(val_vec, keys))
+            hi += 1
         return slots
 
     def build_kernel(
@@ -271,17 +348,20 @@ class KernelBuilder:
         const_vec_1    = Sym("const_vec_1", True)
         const_vec_2    = Sym("const_vec_2", True)
         const_vec_3    = Sym("const_vec_3", True)
-        const_vec_9    = Sym("const_vec_9", True)     # stage4 mult + stage3 shift
+        const_vec_9    = Sym("const_vec_9", True)     # stage4 mult (+ stage3 shift when unfused)
         const_vec_16   = Sym("const_vec_16", True)   # stage5 shift
         const_vec_19   = Sym("const_vec_19", True)   # stage1 shift
         const_vec_33   = Sym("const_vec_33", True)   # stage2 mult
         const_vec_4097 = Sym("const_vec_4097", True) # stage0 mult
+        const_vec_16896 = Sym("const_vec_16896", True)  # fused stage2+3 mult
         K0_vec = Sym("K0_vec", True)   # stage 0 addend
         K1_vec = Sym("K1_vec", True)   # stage 1 xor const
-        K2_vec = Sym("K2_vec", True)   # stage 2 addend
-        K3_vec = Sym("K3_vec", True)   # stage 3 add const
+        K2_vec = Sym("K2_vec", True)   # stage 2 addend (unused when fused)
+        K3_vec = Sym("K3_vec", True)   # stage 3 add const (unused when fused)
         K4_vec = Sym("K4_vec", True)   # stage 4 addend
         K5_vec = Sym("K5_vec", True)   # stage 5 xor const
+        K23_vec  = Sym("K23_vec", True)   # fused stage2+3: C2+C3
+        K2S9_vec = Sym("K2S9_vec", True)  # fused stage2+3: C2<<9
         # VAR vectors: runtime values (forest_p = header broadcast; tree_preload
         # = non-uniform vload of tree[0..7]; tree0..6 = its lane broadcasts).
         forest_p_vec = Sym("forest_p_vec", True)
@@ -290,6 +370,7 @@ class KernelBuilder:
         pos_fp7_vec  = Sym("pos_fp7_vec", True)  # 7 + forest_p (level-3 path recompute)
         tree_preload = Sym("tree_preload", True)  # 8 words: tree[0..7]
         tree0_vec = Sym("tree0_vec", True)
+        tree0_xor5_vec = Sym("tree0_xor5_vec", True)  # tree0 ^ C5 (wrap repair)
         tree1_vec = Sym("tree1_vec", True)
         tree2_vec = Sym("tree2_vec", True)
         tree3_vec = Sym("tree3_vec", True)
@@ -333,9 +414,16 @@ class KernelBuilder:
         # COMPUTED from each other on valu (see below), trading 8 const loads
         # + 8 broadcasts for 9 valu ops on the less-loaded engines.
         vec_bcasts = [
-            (K0_vec, 0x7ED55D16), (K1_vec, 0xC761C23C), (K2_vec, 0x165667B1),
-            (K3_vec, 0xD3A2646C), (K4_vec, 0xFD7046C5), (K5_vec, 0xB55A4F09),
+            (K0_vec, 0x7ED55D16), (K1_vec, 0xC761C23C),
+            (K4_vec, 0xFD7046C5), (K5_vec, 0xB55A4F09),
         ]
+        if FUSE_HASH_STAGES_23:
+            # Fused stage2+3 addends. const_vec_16896 is NOT here: it is
+            # COMPUTED as const_vec_33 << const_vec_9 in the prologue below
+            # (one valu op, no const load on the near-binding load engine).
+            vec_bcasts += [(K23_vec, FUSED23_ADD1), (K2S9_vec, FUSED23_ADD2)]
+        else:
+            vec_bcasts += [(K2_vec, 0x165667B1), (K3_vec, 0xD3A2646C)]
         # Small consts NOT in COMPUTED_CONSTS fall back to const+vbroadcast.
         _small_syms = {1: const_vec_1, 2: const_vec_2, 3: const_vec_3,
                        9: const_vec_9, 16: const_vec_16, 19: const_vec_19,
@@ -343,14 +431,24 @@ class KernelBuilder:
         vec_bcasts += [(sym, v) for v, sym in _small_syms.items()
                        if v not in COMPUTED_CONSTS]
 
-        # Hash-stage consts by value. The literal `9` is shared (stage-4 mult +
-        # stage-3 shift both read const_vec_9); kept in two dicts only because
-        # fma stages read (mult, addend) and irr stages read (K, shift).
+        # Hash-stage consts by value. The literal `9` is shared (stage-4 mult
+        # +
+        # stage-3 shift both read const_vec_9 when fusion is off); kept in two
+        # dicts only because fma stages read (mult, addend) and irr stages
+        # read (K, shift).
         fma_vec_consts = {
             4097: const_vec_4097, 0x7ED55D16: K0_vec,
-            33:   const_vec_33,   0x165667B1: K2_vec,
+            33:   const_vec_33,
             9:    const_vec_9,    0xFD7046C5: K4_vec,
         }
+        if FUSE_HASH_STAGES_23:
+            fma_vec_consts.update({
+                FUSED23_MULT: const_vec_16896,
+                FUSED23_ADD1: K23_vec,
+                FUSED23_ADD2: K2S9_vec,
+            })
+        else:
+            fma_vec_consts[0x165667B1] = K2_vec
         irr_vec_consts = {
             0xC761C23C: K1_vec, 0xD3A2646C: K3_vec, 0xB55A4F09: K5_vec,
             19: const_vec_19, 9: const_vec_9, 16: const_vec_16,
@@ -415,6 +513,11 @@ class KernelBuilder:
             prologue.append(VecElem("<<", const_vec_64, const_vec_16, const_vec_2))  # 64 = 16<<2
             prologue.append(VecFma(const_vec_4097, const_vec_64, const_vec_64,
                                    const_vec_1))                               # 4097 = 64*64+1
+        if FUSE_HASH_STAGES_23:
+            # 16896 = 33 << 9: computed from existing consts (one valu op),
+            # works whether 33/9 were computed or broadcast-loaded.
+            prologue.append(VecElem("<<", const_vec_16896, const_vec_33,
+                                    const_vec_9))
 
         # neg_fp1 = 1 - forest_values_p (used by the next-addr update). Computed
         prologue.append(VecElem("-", neg_fp1_vec, const_vec_1, forest_p_vec))
@@ -458,6 +561,10 @@ class KernelBuilder:
             # level of this round within its descent (rounds 0-9 -> 0-9,
             # round 10 wraps, rounds 11-15 -> 0-4).
             level = r if r < WRAP_ROUND else r - WRAP_ROUND - 1
+            if WRAP_ROOT_C5_DEFER and r == WRAP_ROUND + 1:
+                # Wrap-repair vector, precomputed just-in-time (short
+                # liveness): tree0 ^ C5 cancels the ^C5 round 10 deferred.
+                body.append(VecElem("^", tree0_xor5_vec, tree0_vec, K5_vec))
             for g in range(n_groups):
                 is_wrap = (r == WRAP_ROUND)
                 # per-group vector symbols of the SoA per-lane planes
@@ -475,10 +582,17 @@ class KernelBuilder:
                 nv_op = nv
                 if r in (0, 11):
                     # Level 0: all lanes at idx=0. node_val = tree[0].
+                    # Round 11 with WRAP_ROOT_C5_DEFER: the carried val is
+                    # val^C5 (round 10 deferred the constant), so the entry
+                    # XOR reads tree0^C5 instead of tree0 - the repair is
+                    # free (same shared-vector read as LEVEL0_DIRECT_TREE0).
+                    t0 = tree0_vec
+                    if WRAP_ROOT_C5_DEFER and r == WRAP_ROUND + 1:
+                        t0 = tree0_xor5_vec
                     if LEVEL0_DIRECT_TREE0:
-                        nv_op = tree0_vec   # entry XOR reads the shared const
+                        nv_op = t0   # entry XOR reads the shared const
                     else:
-                        body.append(VecElem("^", nv, tree0_vec, const_vec_0))
+                        body.append(VecElem("^", nv, t0, const_vec_0))
                 elif r in (1, 12):
                     # Level 1: idx in {1,2}. idx = 1 + d0, so the level-0 path
                     # bit IS the select bit (idx=1 -> tree1, idx=2 -> tree2).
@@ -531,17 +645,25 @@ class KernelBuilder:
                     body.append(Gather(nv, addr_vec))
 
                 body.append(DebugVCompare(nv_op, keynv))
-                body.append(DebugVCompare(val_vec, keyval))  # val before xor
+                # val before xor. Skipped on round 11 under
+                # WRAP_ROOT_C5_DEFER: the carried val is val^C5 there; the
+                # true val only re-forms at the entry XOR below.
+                if not (WRAP_ROOT_C5_DEFER and r == WRAP_ROUND + 1):
+                    body.append(DebugVCompare(val_vec, keyval))
 
                 # --- entry XOR: val_vec = val_vec ^ nv_op  (a) ---
                 body.append(VecElem("^", val_vec, val_vec, nv_op))
 
-                # --- 12-slot hash, fully on valu (8 lanes / slot) ---
-                body.extend(self.build_vec_hash(val_vec, t1, t2, r, base_i,
-                                                fma_vec_consts, irr_vec_consts))
+                # --- hash, fully on valu (8 lanes / slot) ---
+                body.extend(self.build_vec_hash(
+                    val_vec, t1, t2, r, base_i, fma_vec_consts, irr_vec_consts,
+                    defer_c5=(WRAP_ROOT_C5_DEFER and is_wrap)))
 
-                # debug: hashed_val == v == val_vec after hash
-                body.append(DebugVCompare(val_vec, keyhv))
+                # debug: hashed_val == v == val_vec after hash. Skipped on
+                # the wrap round under WRAP_ROOT_C5_DEFER (the trace value
+                # includes the ^C5 we deferred).
+                if not (WRAP_ROOT_C5_DEFER and is_wrap):
+                    body.append(DebugVCompare(val_vec, keyhv))
 
                 # --- post-hash: addr update or wrap (branchless, on valu) ---
                 # --- post-hash: addr update (store addr = idx + forest_p, not
