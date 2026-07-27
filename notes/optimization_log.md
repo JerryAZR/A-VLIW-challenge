@@ -1005,3 +1005,44 @@ Passes correctness (8 seeds) and **all nine** tiers (253 cyc clear).
 Remaining slack vs floor: 33 cyc (ramp-up latency ~4, round-15 feed wall,
 tail drain). Next levers unchanged in kind: K=N with a trained scorer
 (still untrained), op-count (the dedup lever - fewer than 4096 hashes).
+
+---
+
+## Step 27 - borrowed op-cuts + weight retrain on the new DAG   1 100 cyc   134.3×
+
+Commits `8201f33` (the cuts), `e918243` (prior-art doc), (this step's
+retrain). Two op-count cuts borrowed from rubinownz111's 1063-cycle
+solution (toggles + attribution in perf_takehome.py):
+
+- **FUSE_HASH_STAGES_23**: stages 2+3 = (33a + (C2+C3)) ^ (16896a +
+  (C2<<9)) = fma+fma+xor (3 ops, was 4). -512 vec ops.
+- **WRAP_ROOT_C5_DEFER**: round-10 stage 5 drops ^C5 (-32 vec ops),
+  repaired free at round 11's entry XOR via precomputed tree0^C5.
+
+The combined DAG DEADLOCKED at 1536 under the step-26 weights (C=399,
+free_vec=0). Weight retrain with the v2 trainer (freeing bound widened
+to [0,16] - the step-26 winner sat at 8.4, near the old cap):
+
+- random 1200s (9 713 samples, 4 944 completes): 1 110
+- finetune 696s (coarse converged 580s, fine polish): **1 100**
+- Winner (base/tilt): sink 7.0/2.5, load 4.9/2.3, rigid -1.0/2.9,
+  group -3.6/0.6, freeing 2.3/4.5. Decoded: EARLY sink 5.75, load 3.75,
+  rigid -2.45, group -3.9, freeing 0.05; LATE sink 8.25, load 6.05,
+  rigid 0.45, group -3.3, freeing 4.55. Structure shift vs step 26:
+  group serialization now THROUGHOUT (-3.9/-3.3, not early-only);
+  freeing much lighter (0.05/4.55 vs 6.9/8.4).
+- K-invariant: K=1/3/6 all 1 100 (the trained candidate wins every
+  trial); shipped at K=1.
+
+Oracle fix (same class as the existing skips): the round-11 node_val
+DebugVCompare compared nv_op (= tree0^C5, the repair) against reference
+tree0 - an intentional mismatch, like the already-skipped round-11 val
+and wrap-round hashed_val compares. Added the same guard. Oracle
+artifact, not a dataflow bug (final mem matched throughout).
+
+Per-engine bounds now: load 1 063 (BINDING), valu 1 055, alu 823.
+1 100 = load floor + 37. Follow-on: level-4 partial preloading (lever
+0(3)) deletes the round-15 gather wall AND relieves the load floor.
+
+Correctness: _check (1536) CORRECT, _check_big (4096) CORRECT,
+submission tests (8 seeds) 1 100. All nine tiers (263 clear).

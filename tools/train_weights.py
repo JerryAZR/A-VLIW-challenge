@@ -70,7 +70,7 @@ PROP_BOUNDS = {
     "load":    (-3.0, 10.0),
     "rigid":   (-3.0,  6.0),
     "group":   (-4.0, 10.0),
-    "freeing": ( 0.0, 10.0),
+    "freeing": ( 0.0, 16.0),
 }
 SEARCH_PROPS = tuple(PROP_BOUNDS)
 TILT_BOUND = 5.0

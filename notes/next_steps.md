@@ -5,7 +5,7 @@ Living planning document (updated as the plan evolves). The optimization log
 holds the current tier matrix, the next levers, and forward-looking design
 notes.
 
-## Current tier status (after step 26: 1110 cyc)
+## Current tier status (after step 27: 1100 cyc)
 
 | tier                     | threshold | status |
 |--------------------------|-----------|--------|
@@ -16,33 +16,32 @@ notes.
 | opus45-2hr               | 1 579     | PASS   |
 | sonnet45                 | 1 548     | PASS   |
 | opus45-11hr              | 1 487     | PASS   |
-| opus45-improved-harness  | 1 363     | **PASS (1110, 253 clear)** |
+| opus45-improved-harness  | 1 363     | **PASS (1100, 263 clear)** |
 
 All nine tiers pass. Shipped config: rollout scheduler **K=1**,
-`LEVEL0_DIRECT_TREE0=True`, progress-interpolated priority
+`LEVEL0_DIRECT_TREE0=True`, `FUSE_HASH_STAGES_23=True` (11-slot hash),
+`WRAP_ROOT_C5_DEFER=True`, progress-interpolated priority
 `ROLLOUT_SORT_FUNCS = [make_interp_greedy(INTERP_W_LATE, INTERP_W_EARLY)]`
-(early: serialize early groups group=-4.8 + sink push; late: no group
-dial; freeing ~7-8 throughout). Prologue merged into the body DAG; pauses
-ride existing bundles' flow slots.
+(group serialization throughout -3.9/-3.3; sink/load push; freeing
+0.05/4.55). Prologue merged into the body DAG; pauses ride existing
+bundles' flow slots.
 
-## Current bottleneck (step-26 analysis)
+## Current bottleneck (step-27 analysis)
 
-Compute-work floor (alu + 8xvalu lane-slots, cap 60/cyc): **1077**
-(64 578 lane-slots; L0-direct deleted the 64 copy ops). Schedule 1110 =
-floor + 33 slack. `diag_underfill.py` classifies the slack: ramp-up
-dependency latency (~4 cyc, irreducible), the round-15 gather-feed wall
-(gather feeds 4 cyc/group at 2 load ports, hash drains 2.3 cyc/group -
-synchronized arrivals force valu starvation), tail drain. The round-15
-wall is a feed-rate problem, not register pressure (pressure slack is
-small); one-step scheduling search cannot recover it.
+Per-engine bounds: **load 1063 (BINDING)**, valu 1055, alu 823. The
+11-slot hash fusion (-512 vec ops) demoted valu; the gather rounds'
+2,048 scalar loads are now the wall. Schedule 1100 = load floor + 37.
+Follow-on: level-4 partial preloading (lever 0(3) below) deletes the
+round-15 gather wall AND relieves the load floor - the two residual
+bottlenecks of step 26 in one move.
 
 ## Next levers
 
 0. **Borrowed from the 1063-cycle solution** (see "Prior art" section
    below for details + attribution): (1) hash stage 2+3 fusion -> 11-slot
-   hash, floor 1077 -> ~1009; (2) wrap-root stage-5 ^C5 deferral (-4 cyc);
-   (3) level-4 partial preloading - deletes the round-15 gather wall AND
-   relieves the load floor (1063), which becomes binding after (1).
+   hash - DONE (step 27); (2) wrap-root stage-5 ^C5 deferral - DONE
+   (step 27); (3) level-4 partial preloading - REMAINING: deletes the
+   round-15 gather wall AND relieves the now-binding load floor (1063).
 1. **Op-count / structural** (the big pot now): the roofline note stands -
    sub-floor requires fewer than 4096 hashes (a structural dedup lever:
    identical (idx, val) lanes hash identically). The "<=11-slot hash"
@@ -55,8 +54,9 @@ small); one-step scheduling search cannot recover it.
    the level-4 gather; convert it to preloaded select trees (flow/valu)
    instead of re-spreading arrivals. (Prior dismissal - "no structural
    fix, no ISA gather" - missed that 16 nodes are preloadable.)
-4. **Fine polish continues**: `weights/_weights_refined_l0i3.json` winner is one
-   +0.25 fine step deep; more finetune budget may find 1-3 cyc.
+4. **Fine polish continues**: `weights/_weights_refined_s27.json`
+   winner converged both coarse and fine; more random seeds may find a
+   better basin (1110 -> 1100 was partly basin luck).
 
 ## Prior art: the 1063-cycle solution (external)
 

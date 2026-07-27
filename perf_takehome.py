@@ -50,17 +50,17 @@ REGALLOC_WEIGHTS = Weights(sink=6.8, load=7.1, raw=8.0, rigid=7.7,
                            group=-3.6, freeing=4.3)
 
 # Progress-interpolated priority pair (make_interp_greedy: w_late dominates
-# as progress->1, w_early dominates at 0). Found by train_weights.py v2
-# (trimmed space: raw dropped as inert; sign-biased bounds; base+tilt
-# reparameterization) with LEVEL0_DIRECT_TREE0=True - 1110 cyc at K=1,
-# beating the L0-off 1117. Structure: EARLY serializes early groups
-# (group -4.8) to stagger the descent wavefront, LATE drops the group dial
-# entirely; strong register discipline (freeing ~7-8) throughout.
+# as progress->1, w_early dominates at 0). Trained by tools/train_weights.py
+# v2 (base+tilt reparameterization) on the step-27 DAG (11-slot hash +
+# WRAP_ROOT_C5_DEFER): the step-26 weights DEADLOCKED at 1536 on it
+# (C=399); these fit and land 1100 cyc at K=1 (K=3/6 add nothing).
+# Structure: group serialization THROUGHOUT (-3.9/-3.3), sink/load pushing
+# far-from-sink + gather-feeding work, much lighter freeing (0.05/4.55).
 from rollout import make_interp_greedy
-INTERP_W_LATE = Weights(sink=1.15, load=1.5, raw=0.0, rigid=1.4,
-                        group=0.0, freeing=8.4)
-INTERP_W_EARLY = Weights(sink=5.45, load=1.1, raw=0.0, rigid=-1.0,
-                         group=-4.8, freeing=6.9)
+INTERP_W_LATE = Weights(sink=8.25, load=6.05, raw=0.0, rigid=0.45,
+                        group=-3.3, freeing=4.55)
+INTERP_W_EARLY = Weights(sink=5.75, load=3.75, raw=0.0, rigid=-2.45,
+                         group=-3.9, freeing=0.05)
 
 # Body scheduler selection: "greedy" (regalloc.schedule, weighted picker +
 # freeing bias) or "rollout" (rollout.schedule_rollout: per-cycle
@@ -644,7 +644,10 @@ class KernelBuilder:
                     # nv is then read by the entry XOR below.
                     body.append(Gather(nv, addr_vec))
 
-                body.append(DebugVCompare(nv_op, keynv))
+                # node_val. Skipped on round 11 under WRAP_ROOT_C5_DEFER:
+                # nv_op is tree0^C5 there (the repair), not tree0.
+                if not (WRAP_ROOT_C5_DEFER and r == WRAP_ROUND + 1):
+                    body.append(DebugVCompare(nv_op, keynv))
                 # val before xor. Skipped on round 11 under
                 # WRAP_ROOT_C5_DEFER: the carried val is val^C5 there; the
                 # true val only re-forms at the entry XOR below.
