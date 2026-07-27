@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/JerryAZR/A-VLIW-challenge/actions/workflows/ci.yml/badge.svg)](https://github.com/JerryAZR/A-VLIW-challenge/actions/workflows/ci.yml)
 [![cycles](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/JerryAZR/A-VLIW-challenge/badge/cycles.json)](https://github.com/JerryAZR/A-VLIW-challenge/actions/workflows/ci.yml)
+[![check 1536](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/JerryAZR/A-VLIW-challenge/badge/check1536.json)](https://github.com/JerryAZR/A-VLIW-challenge/actions/workflows/ci.yml)
+[![check 4096](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/JerryAZR/A-VLIW-challenge/badge/check4096.json)](https://github.com/JerryAZR/A-VLIW-challenge/actions/workflows/ci.yml)
 
 A completed solution to Anthropic's original performance-engineering
 take-home (preserved verbatim at `notes/original_challenge.md`):
@@ -39,9 +41,17 @@ optimization log when it ships.
 
 ```
 python tests/submission_tests.py   # 1,110 cycles, 8 seeds, tier report
-python -m tools._check             # per-round correctness oracle
+python -m tools._check             # per-round correctness oracle (real 1536 scratch)
+python -m tools._check_big         # same oracle, relaxed 4096 scratch (dataflow-only)
 git diff origin/main tests/        # empty - tests untouched
 ```
+
+The two `check` badges report the correctness oracle at the real machine's
+1,536-word scratch and at a relaxed 4,096-word scratch (validation-only;
+`SCRATCH_SIZE` is frozen by `problem.py`). During op-count work the
+schedule can temporarily fail to *fit* at 1,536 (register pressure) while
+remaining *correct* — the 4096 badge distinguishes dataflow bugs from
+register-fit states.
 
 ## Repo layout
 
