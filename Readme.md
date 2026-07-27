@@ -21,6 +21,20 @@ read-before-write bundles with unit latency.
 All nine performance tiers in `tests/submission_tests.py` pass, including
 `opus45-improved-harness < 1363` (253 cycles clear).
 
+## Provenance & attribution
+
+Everything up to and including **1,110 cycles** (step 26, commit
+`e728293`) was developed independently, without knowledge of other
+solutions — the complete record is `JOURNEY.md` +
+`notes/optimization_log.md` (steps 1–26).
+
+Any optimization *below* 1,110 builds on ideas borrowed afterward from
+external solutions — principally **rubinownz111's 1,063-cycle repo**
+(github.com/rubinownz111/1063-cycles-original-performance-takehome).
+Each borrowed idea is credited where it is recorded
+(`notes/next_steps.md`, "Prior art" section) and again in the
+optimization log when it ships.
+
 ## Reproduce
 
 ```
@@ -48,7 +62,8 @@ git diff origin/main tests/        # empty - tests untouched
 
 - **`JOURNEY.md`** — the curated writeup: eight eras, the final-design
   inventory, the regressions we kept, the graveyard of superseded ideas,
-  and what's left on the table.
+  and what's left on the table. (Covers only the independent era,
+  147,734 → 1,110 — see "Provenance & attribution" above.)
 - **`notes/optimization_log.md`** — append-only per-step history with
   mechanisms and PMU tables.
 - **`notes/original_challenge.md`** — the original challenge README,

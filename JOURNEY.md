@@ -443,6 +443,20 @@ getting to 1,110.
    re-spread arrivals — expensive when both compute engines run at
    96–97%.
 
+## Provenance
+
+This document covers only the **independent era**: everything from
+147,734 down to and including 1,110 cycles (steps 1–26, through commit
+`e728293`) was developed without knowledge of other solutions.
+
+Work *below* 1,110 — not narrated here — began after studying external
+solutions, principally **rubinownz111's 1,063-cycle repo**
+(github.com/rubinownz111/1063-cycles-original-performance-takehome).
+Borrowed ideas (the 11-slot hash via stage 2+3 fusion, the wrap-root
+`^C5` deferral, level-4 preloading) are attributed item-by-item in
+`notes/next_steps.md` ("Prior art" section) and in
+`notes/optimization_log.md` as they ship.
+
 ## Reproducing
 
 ```
