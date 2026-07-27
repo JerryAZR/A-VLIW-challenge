@@ -1046,3 +1046,43 @@ Per-engine bounds now: load 1 063 (BINDING), valu 1 055, alu 823.
 
 Correctness: _check (1536) CORRECT, _check_big (4096) CORRECT,
 submission tests (8 seeds) 1 100. All nine tiers (263 clear).
+
+---
+
+## Step 28 - level-4 partial preload (round-15 scope) + knob co-training   1 076 cyc   137.3×
+
+Commits (this step). Three parts:
+
+1. **Round->level refactor** (behavior-preserving, verified 1 100
+   unchanged): hardcoded round branches ((0,11)/(1,12)/(2,13)/(3,14),
+   WRAP_ROUND) replaced by DESCENT = height+1, level = r % DESCENT,
+   first = (r == 0), is_wrap = (level == height). The C5-defer condition
+   becomes level == 0 and not first.
+
+2. **PRELOAD_L4_GROUPS knob (0..32) + PRELOAD_L4_BOTH_ROUNDS scope +
+   PRELOAD_L4_JIT**: level-4 rounds can reach node_val via a 15-vselect
+   MSB-first mux (two 8-way subtrees even/odd + d3 final) over 16
+   preloaded broadcasts instead of an 8-load gather, consuming retained
+   path bits d0..d3. JIT variant emits vload+broadcast as body nodes
+   right before each level-4 round (tags free right after; -16 pinned
+   granules vs prologue). Findings:
+   - both-rounds scope LOSES at every G (best 1 117): 30 flow ops/group
+     on the 1-wide flow port costs more than -16 loads buys.
+   - round-15-only scope (15 flow/group, -8 loads, targets the gather
+     wall) WINS: sweep G=8..32 bottoms at G=16 (1 085 at 250s-random).
+   - Dataflow CORRECT at all G/scope (big-scratch oracle).
+
+3. **Co-trained at G=16**: random 1200s (8 842 samples, 4 388 completes)
+   -> 1 080; finetune 645s -> **1 076**. Neighbors probed (G=14: 1 093,
+   G=18: 1 082 random bests) - 16 confirmed. Winner: freeing-heavy
+   (13.15/16.05 - the JIT granules + extended d0..d2 retention make
+   register discipline the constraint), group -4.8 early / -1.6 late.
+
+Bounds now: load 1 063 (floor), valu 1 055, flow ~950. **1 076 = load
+floor + 13** - schedule quality nearly matches the floor; remaining
+slack is ramp-up + tail. The load floor itself is now the frontier
+(level 5-9 gathers remain: 5 rounds x 32 x 8 = 1 280 loads of the
+2 069 remaining).
+
+Correctness: _check (1536) CORRECT, _check_big (4096) CORRECT, 19 dev
+tests, submission tests (8 seeds) 1 076. All nine tiers (287 clear).

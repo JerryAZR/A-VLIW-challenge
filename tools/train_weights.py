@@ -114,7 +114,8 @@ def weights_from(v, mode):
     return _mk(w1.items()), _mk(w2.items())
 
 
-def build_cycles(v, mode):
+def build_cycles(v, mode, knob=0):
+    pt.PRELOAD_L4_GROUPS = knob
     if mode == "single":
         w, _ = weights_from(v, mode)
         pt.ROLLOUT_SORT_FUNCS = None
@@ -143,12 +144,12 @@ def _worker_init():
 
 
 def _eval_star(arg):
-    """Pool worker: (v, mode) -> (cycles|None, v). Never raises - a stray
+    """Pool worker: (v, mode, knob) -> (cycles|None, v). Never raises - a stray
     failure must not kill a long training run; it is reported on stderr and
     scored as a non-complete."""
-    v, mode = arg
+    v, mode, knob = arg
     try:
-        return (build_cycles(v, mode), v)
+        return (build_cycles(v, mode, knob), v)
     except Exception:
         import traceback
         traceback.print_exc()
@@ -166,7 +167,7 @@ def dump(path, rows):
     os.replace(tmp, path)
 
 
-def phase_random(budget, out, seed, mode, workers):
+def phase_random(budget, out, seed, mode, workers, knob):
     dims = dims_for(mode)
     bounds = dim_bounds(dims)
     rng = random.Random(seed)
@@ -179,7 +180,7 @@ def phase_random(budget, out, seed, mode, workers):
     def candidates():
         while True:
             yield ([round(rng.uniform(lo, hi), 1) for lo, hi in bounds],
-                   mode)
+                   mode, knob)
 
     with Pool(workers, initializer=_worker_init) as pool:
         it = pool.imap_unordered(_eval_star, candidates(), chunksize=1)
@@ -230,7 +231,7 @@ def _neighbors(v, dims, deltas):
                 yield cand
 
 
-def phase_finetune(budget, infile, out, top, mode, workers):
+def phase_finetune(budget, infile, out, top, mode, workers, knob):
     dims = dims_for(mode)
     found = json.load(open(infile))
     starts = pick_diverse([tuple(r) for r in found], top)
@@ -252,7 +253,7 @@ def phase_finetune(budget, infile, out, top, mode, workers):
             for ci in range(len(cur)):
                 if time.time() - t0 >= budget:
                     break
-                batch = [(cand, mode)
+                batch = [(cand, mode, knob)
                          for cand in _neighbors(cur[ci][1], dims, deltas)]
                 results = pool.map(_eval_star, batch, chunksize=1)
                 best = None
@@ -288,6 +289,8 @@ def main():
     pr.add_argument("--out", default=None)
     pr.add_argument("--seed", type=int, default=2024)
     pr.add_argument("--mode", choices=["single", "interp"], default="single")
+    pr.add_argument("--knob", type=int, default=0,
+                    help="PRELOAD_L4_GROUPS value during evaluation")
     pr.add_argument("--workers", type=int, default=default_workers())
     pf = sub.add_parser("finetune", help="coordinate descent around candidates")
     pf.add_argument("budget", type=float, help="seconds")
@@ -295,18 +298,20 @@ def main():
     pf.add_argument("--out", default=None)
     pf.add_argument("--top", type=int, default=6)
     pf.add_argument("--mode", choices=["single", "interp"], default="single")
+    pf.add_argument("--knob", type=int, default=0,
+                    help="PRELOAD_L4_GROUPS value during evaluation")
     pf.add_argument("--workers", type=int, default=default_workers())
     args = ap.parse_args()
 
     if args.phase == "random":
         out = args.out or f"weights/_weights_found_{args.mode}.json"
         phase_random(args.budget, out, args.seed, args.mode,
-                     args.workers)
+                     args.workers, args.knob)
     else:
         infile = args.infile or f"weights/_weights_found_{args.mode}.json"
         out = args.out or f"weights/_weights_refined_{args.mode}.json"
         phase_finetune(args.budget, infile, out, args.top, args.mode,
-                       args.workers)
+                       args.workers, args.knob)
 
 
 if __name__ == "__main__":

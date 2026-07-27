@@ -1,4 +1,4 @@
-# VLIW/SIMD Performance Take-Home — 1,100 cycles (134.3×)
+# VLIW/SIMD Performance Take-Home — 1,076 cycles (137.3×)
 
 [![CI](https://github.com/JerryAZR/A-VLIW-challenge/actions/workflows/ci.yml/badge.svg)](https://github.com/JerryAZR/A-VLIW-challenge/actions/workflows/ci.yml)
 [![cycles](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/JerryAZR/A-VLIW-challenge/badge/cycles.json)](https://github.com/JerryAZR/A-VLIW-challenge/actions/workflows/ci.yml)
@@ -15,13 +15,13 @@ read-before-write bundles with unit latency.
 | | cycles |
 |---|---:|
 | Baseline (as shipped) | 147,734 |
-| **This repo** | **1,100** (134.3×) |
+| **This repo** | **1,076** (137.3×) |
 | Binding floor of the final algorithm (load port) | 1,063 |
 | Claude Opus 4.5 (11.5 h harness) | 1,487 |
 | Claude Opus 4.5 (improved harness, best listed) | 1,363 |
 
 All nine performance tiers in `tests/submission_tests.py` pass, including
-`opus45-improved-harness < 1363` (263 cycles clear).
+`opus45-improved-harness < 1363` (287 cycles clear).
 
 ## Provenance & attribution
 
@@ -40,7 +40,7 @@ optimization log when it ships.
 ## Reproduce
 
 ```
-python tests/submission_tests.py   # 1,100 cycles, 8 seeds, tier report
+python tests/submission_tests.py   # 1,076 cycles, 8 seeds, tier report
 python -m tools._check             # per-round correctness oracle (real 1536 scratch)
 python -m tools._check_big         # same oracle, relaxed 4096 scratch (dataflow-only)
 git diff origin/main tests/        # empty - tests untouched

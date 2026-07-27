@@ -5,7 +5,7 @@ Living planning document (updated as the plan evolves). The optimization log
 holds the current tier matrix, the next levers, and forward-looking design
 notes.
 
-## Current tier status (after step 27: 1100 cyc)
+## Current tier status (after step 28: 1076 cyc)
 
 | tier                     | threshold | status |
 |--------------------------|-----------|--------|
@@ -16,32 +16,34 @@ notes.
 | opus45-2hr               | 1 579     | PASS   |
 | sonnet45                 | 1 548     | PASS   |
 | opus45-11hr              | 1 487     | PASS   |
-| opus45-improved-harness  | 1 363     | **PASS (1100, 263 clear)** |
+| opus45-improved-harness  | 1 363     | **PASS (1076, 287 clear)** |
 
 All nine tiers pass. Shipped config: rollout scheduler **K=1**,
 `LEVEL0_DIRECT_TREE0=True`, `FUSE_HASH_STAGES_23=True` (11-slot hash),
-`WRAP_ROOT_C5_DEFER=True`, progress-interpolated priority
+`WRAP_ROOT_C5_DEFER=True`, `PRELOAD_L4_GROUPS=16` (round-15-only scope,
+JIT consts), progress-interpolated priority
 `ROLLOUT_SORT_FUNCS = [make_interp_greedy(INTERP_W_LATE, INTERP_W_EARLY)]`
-(group serialization throughout -3.9/-3.3; sink/load push; freeing
-0.05/4.55). Prologue merged into the body DAG; pauses ride existing
-bundles' flow slots.
+(freeing-heavy 13-16; group -4.8 early / -1.6 late). Prologue merged
+into the body DAG; pauses ride existing bundles' flow slots.
 
-## Current bottleneck (step-27 analysis)
+## Current bottleneck (step-28 analysis)
 
-Per-engine bounds: **load 1063 (BINDING)**, valu 1055, alu 823. The
-11-slot hash fusion (-512 vec ops) demoted valu; the gather rounds'
-2,048 scalar loads are now the wall. Schedule 1100 = load floor + 37.
-Follow-on: level-4 partial preloading (lever 0(3) below) deletes the
-round-15 gather wall AND relieves the load floor - the two residual
-bottlenecks of step 26 in one move.
+**Load floor 1063 binding; schedule 1076 = floor + 13.** valu 1055,
+flow ~950 (16 preloaded groups x 15 selects), alu ~823. The load floor
+is the frontier: level 5-9 gathers remain (5 rounds x 32 groups x 8
+loads = 1 280 of the 2 069 remaining loads). Options against it:
+level-5+ preloading is 31+ selects/node on the 1-wide flow port
+(prohibitive); fewer loads means fewer gathers means either more
+preload levels (flow-bound) or the dedup lever.
 
 ## Next levers
 
 0. **Borrowed from the 1063-cycle solution** (see "Prior art" section
    below for details + attribution): (1) hash stage 2+3 fusion -> 11-slot
    hash - DONE (step 27); (2) wrap-root stage-5 ^C5 deferral - DONE
-   (step 27); (3) level-4 partial preloading - REMAINING: deletes the
-   round-15 gather wall AND relieves the now-binding load floor (1063).
+   (step 27); (3) level-4 partial preloading - DONE (step 28):
+   round-15-only scope at G=16 won (both-rounds loses on flow-port
+   cost); 1100 -> 1076.
 1. **Op-count / structural** (the big pot now): the roofline note stands -
    sub-floor requires fewer than 4096 hashes (a structural dedup lever:
    identical (idx, val) lanes hash identically). The "<=11-slot hash"
@@ -54,9 +56,9 @@ bottlenecks of step 26 in one move.
    the level-4 gather; convert it to preloaded select trees (flow/valu)
    instead of re-spreading arrivals. (Prior dismissal - "no structural
    fix, no ISA gather" - missed that 16 nodes are preloadable.)
-4. **Fine polish continues**: `weights/_weights_refined_s27.json`
-   winner converged both coarse and fine; more random seeds may find a
-   better basin (1110 -> 1100 was partly basin luck).
+4. **Fine polish continues**: `weights/_l4_g16_refined.json`
+   converged; G=14/18 probed worse. Knob space is one-dimensional and
+   mapped; remaining variance is weight-basin luck.
 
 ## Prior art: the 1063-cycle solution (external)
 

@@ -51,16 +51,15 @@ REGALLOC_WEIGHTS = Weights(sink=6.8, load=7.1, raw=8.0, rigid=7.7,
 
 # Progress-interpolated priority pair (make_interp_greedy: w_late dominates
 # as progress->1, w_early dominates at 0). Trained by tools/train_weights.py
-# v2 (base+tilt reparameterization) on the step-27 DAG (11-slot hash +
-# WRAP_ROOT_C5_DEFER): the step-26 weights DEADLOCKED at 1536 on it
-# (C=399); these fit and land 1100 cyc at K=1 (K=3/6 add nothing).
-# Structure: group serialization THROUGHOUT (-3.9/-3.3), sink/load pushing
-# far-from-sink + gather-feeding work, much lighter freeing (0.05/4.55).
+# on the step-28 DAG (PRELOAD_L4_GROUPS=16, round-15-only scope): 1076 cyc
+# at K=1. Structure: heavy register discipline throughout (freeing 13-16,
+# the 16 JIT broadcast granules + retention make pressure the constraint),
+# group serialization -4.8 early relaxing to -1.6 late.
 from rollout import make_interp_greedy
-INTERP_W_LATE = Weights(sink=8.25, load=6.05, raw=0.0, rigid=0.45,
-                        group=-3.3, freeing=4.55)
-INTERP_W_EARLY = Weights(sink=5.75, load=3.75, raw=0.0, rigid=-2.45,
-                         group=-3.9, freeing=0.05)
+INTERP_W_LATE = Weights(sink=2.3, load=2.2, raw=0.0, rigid=-1.1,
+                        group=-1.6, freeing=13.15)
+INTERP_W_EARLY = Weights(sink=1.5, load=-2.6, raw=0.0, rigid=-1.1,
+                         group=-4.8, freeing=16.05)
 
 # Body scheduler selection: "greedy" (regalloc.schedule, weighted picker +
 # freeing bias) or "rollout" (rollout.schedule_rollout: per-cycle
@@ -102,6 +101,36 @@ RECOMPUTE_PATH_BITS = False
 # op cut itself: revisit when interp / K=N with a trained score function
 # can hold the flooded ramp-up frontier.
 LEVEL0_DIRECT_TREE0 = True
+
+# Level-4 partial preload knob (0..n_groups). Level 4 (16 nodes, idx
+# 15..30) is reached by a 15-vselect mux over 16 preloaded broadcasts
+# instead of an 8-load gather - for the first PRELOAD_L4_GROUPS groups
+# (the rest still gather, both level-4 rounds: 4 and 15). Trades load-port
+# pressure (-16 loads/group; the load floor is binding since step 27) for
+# flow pressure (+30 selects/group on the 1-wide flow port) plus 16
+# permanently-live broadcast granules + extended path-bit retention
+# (d0..d2 stay live one round longer for preloaded groups). 0 = all gather.
+# The right value balances the engines; co-tuned with the priority
+# weights (tools/train_weights.py --knob).
+PRELOAD_L4_GROUPS = 16
+
+# Level-4 preload const-liveness variant. False: the 16 broadcast vectors
+# are emitted in the prologue and live (nearly) the whole schedule - 16
+# pinned granules. True (default): vload+broadcast are emitted as body
+# nodes right before each level-4 round; the tags free right after that
+# round's selects, so the 16 granules are only live around rounds 4 and
+# 15. Costs +16 broadcasts +2 vloads +4 alu (the round-15 re-broadcast)
+# against 16 granules of pressure in the rounds 5-14 peak region.
+PRELOAD_L4_JIT = True
+
+# Level-4 preload round scope. True: both level-4 rounds (4 and 15) use
+# the select path for preloaded groups (30 flow ops/group, -16 loads).
+# False: only the SECOND descent's level-4 round (round 15 - the gather
+# wall) selects; round 4 always gathers (15 flow ops/group, -8 loads).
+# Flow is 3.75x scarcer than load (1 vs 2 slots), so the both-rounds
+# trade is poor unless flow is very idle; round-15-only is the
+# cheaper version that targets the wall specifically.
+PRELOAD_L4_BOTH_ROUNDS = False
 
 # Hash stage 2+3 cross-fusion toggle (idea borrowed from rubinownz111's
 # 1063-cycle solution - see notes/next_steps.md "Prior art").
@@ -293,7 +322,11 @@ class KernelBuilder:
 
         V = batch_size
         n_groups = V // VLEN
-        WRAP_ROUND = forest_height   # verified: all lanes at leaf on round=h -> wrap to root
+        # Rounds per descent: levels 0..height. level = r % DESCENT (rounds
+        # 0-10 -> levels 0-10, rounds 11-15 -> 0-4); the wrap (idx -> root)
+        # follows the level == forest_height leaf round. Verified: all lanes
+        # are at the same level every round for the canonical shape.
+        DESCENT = forest_height + 1
 
         # =====================================================================
         # Scratch layout: the register allocator owns all scratch space. Only
@@ -328,6 +361,7 @@ class KernelBuilder:
         t1 = Sym("t1", True)   # hash stage scratch + select tree intermediate
         t2 = Sym("t2", True)   # hash stage scratch + addr-update base
         t3 = Sym("t3", True)   # select tree intermediate (level 3)
+        t4 = Sym("t4", True)   # select tree intermediate (level 4)
         nv = Sym("nv", True)   # node_val landing / gather pad
         # The path bit (hash & 1 = descent direction): path[g][l] holds
         # the bit computed at level l of a descent (rounds 0-9 / 11-15 map to
@@ -392,6 +426,17 @@ class KernelBuilder:
         tree14_vec = Sym("tree14_vec", True)
         tree8_14 = [tree8_vec, tree9_vec, tree10_vec, tree11_vec,
                     tree12_vec, tree13_vec, tree14_vec]
+        # Level-4 preload: nodes 15-30. tree15 =
+        # tree_preload2.lane(7); tree16-30 from two more vloads (only
+        # emitted in the prologue when PRELOAD_L4_JIT is off). 16
+        # broadcast granules. With JIT on, the broadcasts are emitted
+        # per level-4 round from fresh vloads (l4_pl_a/b) instead.
+        tree_preload3 = Sym("tree_preload3", True)  # 8 words: tree[16..23]
+        tree_preload4 = Sym("tree_preload4", True)  # 8 words: tree[24..31]
+        tree15_30 = [Sym(f"tree{i}_vec", True) for i in range(15, 31)]
+        l4_pl_a = Sym("l4_pl_a", True)      # JIT: tree[15..22]
+        l4_pl_b = Sym("l4_pl_b", True)      # JIT: tree[23..30]
+        l4_addr = Sym("l4_addr", False)     # JIT: vload address scalar
 
         # Scalars: `eight` (vload/vstore stride of 8 - the only CONST scalar);
         # header vars (loaded from mem); addr_a (vload/vstore ptr); per-group
@@ -544,6 +589,21 @@ class KernelBuilder:
         prologue.append(VBroadcast(tree7_vec, tree_preload.lane(7)))
         for i in range(7):
             prologue.append(VBroadcast(tree8_14[i], tree_preload2.lane(i)))
+        if PRELOAD_L4_GROUPS > 0 and not PRELOAD_L4_JIT:
+            # Level-4 preload: tree[16..23] and tree[24..31] (tree31 is
+            # padding; n_nodes = 2047 so the vload is in-range). tree15 is
+            # preload2.lane(7).
+            prologue.append(Alu("+", addr_a, addr_a, eight_const))  # +16
+            prologue.append(VLoad(tree_preload3, addr_a))
+            prologue.append(Alu("+", addr_a, addr_a, eight_const))  # +24
+            prologue.append(VLoad(tree_preload4, addr_a))
+            prologue.append(VBroadcast(tree15_30[0], tree_preload2.lane(7)))
+            for i in range(8):
+                prologue.append(VBroadcast(tree15_30[1 + i],
+                                           tree_preload3.lane(i)))
+            for i in range(7):
+                prologue.append(VBroadcast(tree15_30[9 + i],
+                                           tree_preload4.lane(i)))
 
         # =====================================================================
         # Body -- unrolled rounds x 32 groups, one slot per bundle.
@@ -558,15 +618,33 @@ class KernelBuilder:
             body.append(Const(out_addr[g], g * VLEN))   # offset 8g
             body.append(Alu("+", out_addr[g], out_addr[g], inp_values_p))
         for r in range(rounds):
-            # level of this round within its descent (rounds 0-9 -> 0-9,
-            # round 10 wraps, rounds 11-15 -> 0-4).
-            level = r if r < WRAP_ROUND else r - WRAP_ROUND - 1
-            if WRAP_ROOT_C5_DEFER and r == WRAP_ROUND + 1:
+            # level within the descent (modulo form; first = descent-1
+            # round 0, whose addr plane is not yet valid)
+            level = r % DESCENT
+            first = (r == 0)
+            if WRAP_ROOT_C5_DEFER and level == 0 and not first:
                 # Wrap-repair vector, precomputed just-in-time (short
                 # liveness): tree0 ^ C5 cancels the ^C5 round 10 deferred.
                 body.append(VecElem("^", tree0_xor5_vec, tree0_vec, K5_vec))
+            if PRELOAD_L4_GROUPS > 0 and PRELOAD_L4_JIT and level == 4 \
+                    and (PRELOAD_L4_BOTH_ROUNDS or r >= DESCENT):
+                # Just-in-time level-4 preload for this level-4 round:
+                # vload tree[15..22] / tree[23..30] and broadcast all 16
+                # nodes. The tags free right after this round's selects,
+                # so the 16 granules are live only around rounds 4 and 15.
+                body.append(Const(l4_addr, 15))
+                body.append(Alu("+", l4_addr, l4_addr,
+                                header["forest_values_p"]))
+                body.append(VLoad(l4_pl_a, l4_addr))
+                body.append(Alu("+", l4_addr, l4_addr, eight_const))
+                body.append(VLoad(l4_pl_b, l4_addr))
+                for i in range(8):
+                    body.append(VBroadcast(tree15_30[i], l4_pl_a.lane(i)))
+                for i in range(8):
+                    body.append(VBroadcast(tree15_30[8 + i],
+                                           l4_pl_b.lane(i)))
             for g in range(n_groups):
-                is_wrap = (r == WRAP_ROUND)
+                is_wrap = (level == forest_height)  # leaf; wrap follows
                 # per-group vector symbols of the SoA per-lane planes
                 val_vec  = val[g]
                 addr_vec = addr[g]
@@ -580,24 +658,26 @@ class KernelBuilder:
 
                 # --- node_val gather or preload-select (rounds 0-3 use preloaded) ---
                 nv_op = nv
-                if r in (0, 11):
+                if level == 0:
                     # Level 0: all lanes at idx=0. node_val = tree[0].
-                    # Round 11 with WRAP_ROOT_C5_DEFER: the carried val is
-                    # val^C5 (round 10 deferred the constant), so the entry
-                    # XOR reads tree0^C5 instead of tree0 - the repair is
-                    # free (same shared-vector read as LEVEL0_DIRECT_TREE0).
+                    # First round of a non-first descent with
+                    # WRAP_ROOT_C5_DEFER: the carried val is
+                    # val^C5 (the wrap round deferred the constant), so the
+                    # entry XOR reads tree0^C5 instead of tree0 - the repair
+                    # is free (same shared-vector read as
+                    # LEVEL0_DIRECT_TREE0).
                     t0 = tree0_vec
-                    if WRAP_ROOT_C5_DEFER and r == WRAP_ROUND + 1:
+                    if WRAP_ROOT_C5_DEFER and not first:
                         t0 = tree0_xor5_vec
                     if LEVEL0_DIRECT_TREE0:
                         nv_op = t0   # entry XOR reads the shared const
                     else:
                         body.append(VecElem("^", nv, t0, const_vec_0))
-                elif r in (1, 12):
+                elif level == 1:
                     # Level 1: idx in {1,2}. idx = 1 + d0, so the level-0 path
                     # bit IS the select bit (idx=1 -> tree1, idx=2 -> tree2).
                     body.append(VSelect(nv, path_g[0], tree2_vec, tree1_vec))
-                elif r in (2, 13):
+                elif level == 2:
                     # Level 2: idx in {3,4,5,6} = 3 + 2*d0 + d1. Select among
                     # the 4 preloaded nodes, consuming path bits in order
                     # (d0=path[0] first, then d1=path[1]) so d0 frees early.
@@ -605,7 +685,7 @@ class KernelBuilder:
                     body.append(VSelect(t1, path_g[0], tree5_vec, tree3_vec))  # d0?t5:t3
                     body.append(VSelect(t2, path_g[0], tree6_vec, tree4_vec))  # d0?t6:t4
                     body.append(VSelect(nv, path_g[1], t2, t1))              # d1?(d0=1):(d0=0)
-                elif r in (3, 14):
+                elif level == 3:
                     # Level 3: idx in {7..14} = 7 + 4*d0 + 2*d1 + d2. 3-level
                     # vselect tree consuming path bits in strict order
                     # d0 -> d1 -> d2, so each path bit frees as early as
@@ -635,6 +715,31 @@ class KernelBuilder:
                     body.append(VSelect(t1, path_g[1], t3, t1))                  # d1?s10:s00
                     body.append(VSelect(t2, path_g[1], nv, t2))                  # d1?s11:s01
                     body.append(VSelect(nv, path_g[2], t2, t1))                  # d2?u1:u0
+                elif level == 4 and g < PRELOAD_L4_GROUPS and \
+                        (PRELOAD_L4_BOTH_ROUNDS or r >= DESCENT):
+                    # Level 4 (preloaded): idx in {15..30} = 15 + 2k + d3,
+                    # k = 4*d0 + 2*d1 + d2. Two MSB-first 8-way subtrees
+                    # (even/odd on the d3 split) + final select on d3 -
+                    # 15 vselects, consuming path bits d0 -> d1 -> d2 -> d3
+                    # so each frees as early as possible. Replaces the
+                    # 8-load gather for this group.
+                    E = tree15_30[::2]   # tree[15+2k], k = 0..7
+                    O = tree15_30[1::2]  # tree[16+2k], k = 0..7
+                    body.append(VSelect(t1, path_g[0], E[4], E[0]))
+                    body.append(VSelect(t2, path_g[0], E[5], E[1]))
+                    body.append(VSelect(t3, path_g[0], E[6], E[2]))
+                    body.append(VSelect(t4, path_g[0], E[7], E[3]))
+                    body.append(VSelect(t1, path_g[1], t3, t1))
+                    body.append(VSelect(t2, path_g[1], t4, t2))
+                    body.append(VSelect(t4, path_g[2], t2, t1))    # even(k)
+                    body.append(VSelect(t1, path_g[0], O[4], O[0]))
+                    body.append(VSelect(t2, path_g[0], O[5], O[1]))
+                    body.append(VSelect(t3, path_g[0], O[6], O[2]))
+                    body.append(VSelect(nv, path_g[0], O[7], O[3]))
+                    body.append(VSelect(t1, path_g[1], t3, t1))
+                    body.append(VSelect(t2, path_g[1], nv, t2))
+                    body.append(VSelect(nv, path_g[2], t2, t1))    # odd(k)
+                    body.append(VSelect(nv, path_g[3], nv, t4))    # d3?odd:even
                 else:
                     # Rounds 4+: gather from mem. addr_vec already holds the
                     # tree address (idx + forest_p), so the loads read it
@@ -644,14 +749,16 @@ class KernelBuilder:
                     # nv is then read by the entry XOR below.
                     body.append(Gather(nv, addr_vec))
 
-                # node_val. Skipped on round 11 under WRAP_ROOT_C5_DEFER:
+                # node_val. Skipped on the first round of a non-first
+                # descent under WRAP_ROOT_C5_DEFER:
                 # nv_op is tree0^C5 there (the repair), not tree0.
-                if not (WRAP_ROOT_C5_DEFER and r == WRAP_ROUND + 1):
+                if not (WRAP_ROOT_C5_DEFER and level == 0 and not first):
                     body.append(DebugVCompare(nv_op, keynv))
-                # val before xor. Skipped on round 11 under
-                # WRAP_ROOT_C5_DEFER: the carried val is val^C5 there; the
+                # val before xor. Skipped on the first round of a non-first
+                # descent under WRAP_ROOT_C5_DEFER: the carried val is val^C5
+                # there; the
                 # true val only re-forms at the entry XOR below.
-                if not (WRAP_ROOT_C5_DEFER and r == WRAP_ROUND + 1):
+                if not (WRAP_ROOT_C5_DEFER and level == 0 and not first):
                     body.append(DebugVCompare(val_vec, keyval))
 
                 # --- entry XOR: val_vec = val_vec ^ nv_op  (a) ---
@@ -684,7 +791,7 @@ class KernelBuilder:
                     # update.
                     pdest = path_g[level]
                     body.append(VecElem("&", pdest, val_vec, const_vec_1))
-                    if r == 0:
+                    if first:
                         # idx=0: next_addr = forest_p + 1 + path = (2 - neg_fp1) + path
                         body.append(VecElem("-", t2, const_vec_2, neg_fp1_vec))  # 2 - neg_fp1
                     else:
