@@ -231,14 +231,28 @@ def _neighbors(v, dims, deltas):
                 yield cand
 
 
+KNOB_DELTAS = (-4, -2, -1, 1, 2, 4)
+
+
+def _knob_neighbors(knob, n_groups=32):
+    for kd in KNOB_DELTAS:
+        nk = knob + kd
+        if 0 <= nk <= n_groups:
+            yield nk
+
+
 def phase_finetune(budget, infile, out, top, mode, workers, knob):
     dims = dims_for(mode)
     found = json.load(open(infile))
-    starts = pick_diverse([tuple(r) for r in found], top)
+    # rows may carry their own knob (3-elem, from a previous finetune)
+    starts = pick_diverse([(r[0], r[1]) for r in found], top)
+    knob_of = {(r[0], tuple(r[1])): (r[2] if len(r) > 2 else knob)
+               for r in found}
     print(f"{len(starts)} candidates from {infile}:")
     for cyc, v in starts:
         print(f"  {cyc}  {dict(zip(dims, v))}")
-    cur = [[cyc, list(v)] for cyc, v in starts]
+    cur = [[cyc, list(v), knob_of.get((cyc, tuple(v)), knob)]
+           for cyc, v in starts]
     t0 = time.time()
     dump(out, cur)
     deltas = COARSE_DELTAS
@@ -253,19 +267,24 @@ def phase_finetune(budget, infile, out, top, mode, workers, knob):
             for ci in range(len(cur)):
                 if time.time() - t0 >= budget:
                     break
-                batch = [(cand, mode, knob)
+                batch = [(cand, mode, cur[ci][2])
                          for cand in _neighbors(cur[ci][1], dims, deltas)]
+                # the knob is a finetune coordinate too: (same weights,
+                # G +/- delta) trials ride the same parallel batch
+                batch += [(cur[ci][1], mode, nk)
+                          for nk in _knob_neighbors(cur[ci][2])]
                 results = pool.map(_eval_star, batch, chunksize=1)
                 best = None
-                for cyc, cand in results:
+                for (cand_v, _, nk), (cyc, _) in zip(batch, results):
                     if cyc is not None and (best is None or cyc < best[0]):
-                        best = (cyc, cand)
+                        best = (cyc, cand_v, nk)
                 if best is not None and best[0] < cur[ci][0]:
-                    cur[ci] = [best[0], best[1]]
+                    cur[ci] = list(best)
                     improved_any = True
                     dump(out, sorted(cur, key=lambda r: r[0]))
                     print(f"[{time.time()-t0:6.1f}s] cand {ci}: "
-                          f"{best[0]} cyc  {dict(zip(dims, best[1]))}",
+                          f"{best[0]} cyc (knob {best[2]}) "
+                          f"{dict(zip(dims, best[1]))}",
                           flush=True)
             if not improved_any:
                 if deltas is COARSE_DELTAS:
